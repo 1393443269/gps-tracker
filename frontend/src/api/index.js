@@ -38,12 +38,15 @@ export const authApi = {
 
 // ── 设备 ─────────────────────────────────────────────────────────────────────
 export const deviceApi = {
-  list:           (params)    => http.get('/devices', { params }),
-  get:            (id)        => http.get(`/devices/${id}`),
-  create:         (data)      => http.post('/devices', data),
-  update:         (id, data)  => http.put(`/devices/${id}`, data),
-  summary:        ()          => http.get('/devices/summary'),
-  batchLifecycle: (ids, lifecycle) => http.put('/devices/batch_lifecycle', { ids, lifecycle }),
+  list:              (params)       => http.get('/devices', { params }),
+  get:               (id)           => http.get(`/devices/${id}`),
+  create:            (data)         => http.post('/devices', data),
+  update:            (id, data)     => http.put(`/devices/${id}`, data),
+  summary:           ()             => http.get('/devices/summary'),
+  batchLifecycle:    (ids, lifecycle) => http.put('/devices/batch_lifecycle', { ids, lifecycle }),
+  withCustomer:      (params)       => http.get('/devices/with_customer', { params }),
+  bindCustomer:      (id, customerId) => http.post(`/devices/${id}/bind_customer`, { customer_id: customerId }),
+  unbindCustomer:    (id)           => http.post(`/devices/${id}/unbind_customer`),
 }
 
 // ── 位置 ─────────────────────────────────────────────────────────────────────
@@ -93,6 +96,8 @@ export const customerApi = {
   setPassword:    (id, data)      => http.put(`/customers/${id}/password`, data),
   getDevices:     (id)            => http.get(`/customers/${id}/devices`),
   assignDevices:  (id, phones)    => http.put(`/customers/${id}/devices`, { phones }),
+  // 设备信息页使用：获取所有客户列表（用于绑定选择）
+  listAll:        ()              => http.get('/customers', { params: { size: 500 } }),
 }
 
 // ── 角色判断 ──────────────────────────────────────────────────────────────────

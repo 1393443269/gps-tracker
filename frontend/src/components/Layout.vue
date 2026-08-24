@@ -34,9 +34,13 @@
         </el-menu-item>
 
         <div class="menu-group-label">管理</div>
-        <el-menu-item index="/devices">
+        <el-menu-item index="/device-info">
           <el-icon><Cellphone /></el-icon>
-          <span>设备管理</span>
+          <span>设备信息</span>
+        </el-menu-item>
+        <el-menu-item index="/device-settings">
+          <el-icon><Setting /></el-icon>
+          <span>设备设置</span>
         </el-menu-item>
         <el-menu-item index="/sims">
           <el-icon><Coin /></el-icon><span>SIM卡管理</span>
@@ -126,7 +130,7 @@ import { ElMessage } from 'element-plus'
 import { deviceApi, alarmApi, portalApi, authApi, isAdmin as checkAdmin } from '@/api'
 import {
   DataBoard, MapLocation, Aim, Position, Search,
-  Cellphone, Coin, User,
+  Cellphone, Coin, User, Setting,
   Bell, WalletFilled, TrendCharts, Monitor,
   OfficeBuilding, Operation, ArrowDown
 } from '@element-plus/icons-vue'

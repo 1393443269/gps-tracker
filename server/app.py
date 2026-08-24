@@ -308,6 +308,16 @@ def init_db():
         except Exception:
             pass  # 列已存在，忽略
 
+    # ── customer 表：个人信息扩展（设备信息页使用） ───────────────────────────────
+    for _col in ["gender  TEXT DEFAULT ''",
+                 "age     INTEGER DEFAULT NULL",
+                 "address TEXT DEFAULT ''"]:
+        try:
+            conn.execute(f"ALTER TABLE customer ADD COLUMN {_col}")
+            conn.commit()
+        except Exception:
+            pass
+
     # ── SIM 卡生命周期 ────────────────────────────────────────────────────────────
     for _col in ["expire_date TEXT DEFAULT NULL",       # 套餐到期日 YYYY-MM-DD
                  "monthly_fee REAL DEFAULT 0"]:         # 月租费用（用于成本统计）
@@ -1080,6 +1090,77 @@ def batch_lifecycle():
     return ok({'updated': len(ids)})
 
 
+@app.get('/api/devices/with_customer')
+def devices_with_customer():
+    """设备信息列表：JOIN customer，返回绑定人员信息 + 围栏数"""
+    page   = int(request.args.get('page', 1))
+    size   = int(request.args.get('size', 20))
+    kw     = request.args.get('keyword', '').strip()
+    offset = (page - 1) * size
+    sids   = _org_scope_ids(request)
+
+    conds, params = [], []
+    if kw:
+        like = f'%{kw}%'
+        conds.append("(d.phone LIKE ? OR d.name LIKE ? OR c.name LIKE ? OR c.contact LIKE ?)")
+        params += [like, like, like, like]
+    conds, params = _org_where(sids, conds, params, col='d.org_id')
+
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    count_sql = (
+        "SELECT COUNT(*) FROM device d "
+        "LEFT JOIN customer c ON d.customer_id = c.id " + where
+    )
+    data_sql = (
+        "SELECT d.id, d.phone, d.name, d.terminal_model, d.last_location_time, "
+        "       d.status, d.lifecycle, d.activated_at, d.customer_id, "
+        "       c.name as role_name, c.contact as real_name, c.gender, c.age, "
+        "       c.phone as contact_phone, c.address, c.remark as customer_remark, "
+        "       c.login_name as account, "
+        "       (SELECT COUNT(*) FROM geo_fence gf "
+        "        WHERE gf.devices IS NOT NULL AND gf.devices LIKE '%' || d.phone || '%') "
+        "       as fence_count "
+        "FROM device d "
+        "LEFT JOIN customer c ON d.customer_id = c.id "
+        + where +
+        " ORDER BY d.updated_at DESC LIMIT ? OFFSET ?"
+    )
+    total   = db_scalar(count_sql, params)
+    records = db_query(data_sql, params + [size, offset])
+    return ok({'records': records, 'total': total, 'page': page, 'size': size})
+
+
+@app.post('/api/devices/<int:did>/bind_customer')
+def bind_device_customer(did):
+    """将设备绑定到指定客户（customer_id）"""
+    data = request.get_json() or {}
+    cid  = data.get('customer_id')
+    if not cid:
+        return fail('customer_id 不能为空', 400)
+    dev = db_query_one("SELECT id, phone FROM device WHERE id=?", (did,))
+    if not dev:
+        return fail('设备不存在', 404)
+    cust = db_query_one("SELECT id, name FROM customer WHERE id=?", (cid,))
+    if not cust:
+        return fail('客户不存在', 404)
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    db_exec("UPDATE device SET customer_id=?,updated_at=? WHERE id=?", (cid, now, did))
+    add_op_log('设备绑定', f'设备 {dev["phone"]} 绑定至客户 {cust["name"]}')
+    return ok()
+
+
+@app.post('/api/devices/<int:did>/unbind_customer')
+def unbind_device_customer(did):
+    """解除设备与客户的绑定"""
+    dev = db_query_one("SELECT id, phone, customer_id FROM device WHERE id=?", (did,))
+    if not dev:
+        return fail('设备不存在', 404)
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    db_exec("UPDATE device SET customer_id=NULL,updated_at=? WHERE id=?", (now, did))
+    add_op_log('设备解绑', f'设备 {dev["phone"]} 已解绑')
+    return ok()
+
+
 # ── 位置接口 ──
 
 @app.get('/api/locations/<phone>/latest')
@@ -1428,9 +1509,11 @@ def create_customer():
         conn = get_db()
         try:
             cur = conn.execute(
-                "INSERT INTO customer (name,contact,phone,email,status,reg_date,remark,org_id) VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO customer (name,contact,phone,email,status,reg_date,remark,"
+                "org_id,gender,age,address) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (name, d.get('contact',''), d.get('phone',''), d.get('email',''),
-                 d.get('status','活跃'), d.get('reg_date',''), d.get('remark',''), admin_org_id)
+                 d.get('status','活跃'), d.get('reg_date',''), d.get('remark',''), admin_org_id,
+                 d.get('gender',''), d.get('age') or None, d.get('address',''))
             )
             new_id = cur.lastrowid
             # 同步设置登录账号/密码（若提供）
@@ -1448,9 +1531,11 @@ def create_customer():
 @app.put('/api/customers/<int:cid>')
 def update_customer(cid):
     d = request.get_json() or {}
-    db_exec("UPDATE customer SET name=?,contact=?,phone=?,email=?,status=?,reg_date=?,remark=? WHERE id=?",
+    db_exec("UPDATE customer SET name=?,contact=?,phone=?,email=?,status=?,reg_date=?,remark=?,"
+            "gender=?,age=?,address=? WHERE id=?",
             (d.get('name',''), d.get('contact',''), d.get('phone',''), d.get('email',''),
-             d.get('status','活跃'), d.get('reg_date',''), d.get('remark',''), cid))
+             d.get('status','活跃'), d.get('reg_date',''), d.get('remark',''),
+             d.get('gender',''), d.get('age') or None, d.get('address',''), cid))
     # 同步更新登录账号/密码（若提供）
     login_name = (d.get('login_name') or '').strip()
     password   = (d.get('password')   or '').strip()
