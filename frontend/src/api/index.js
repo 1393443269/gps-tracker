@@ -217,6 +217,15 @@ export const oplogApi = {
   list: (params) => http.get('/oplogs', { params }),
 }
 
+// ── 设备角色（分组） ───────────────────────────────────────────────────────────
+export const roleApi = {
+  list:          ()              => http.get('/roles'),
+  create:        (data)          => http.post('/roles', data),
+  update:        (id, data)      => http.put(`/roles/${id}`, data),
+  remove:        (id)            => http.delete(`/roles/${id}`),
+  assignDevices: (id, phones)    => http.put(`/roles/${id}/assign`, { phones }),
+}
+
 // ── 组织管理 ──────────────────────────────────────────────────────────────────
 export const orgApi = {
   tree:          ()         => http.get('/org/tree'),

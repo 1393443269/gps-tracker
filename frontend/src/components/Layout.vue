@@ -42,6 +42,10 @@
           <el-icon><Setting /></el-icon>
           <span>设备设置</span>
         </el-menu-item>
+        <el-menu-item index="/role-settings">
+          <el-icon><UserFilled /></el-icon>
+          <span>角色设置</span>
+        </el-menu-item>
         <el-menu-item index="/sims">
           <el-icon><Coin /></el-icon><span>SIM卡管理</span>
         </el-menu-item>
@@ -130,7 +134,7 @@ import { ElMessage } from 'element-plus'
 import { deviceApi, alarmApi, portalApi, authApi, isAdmin as checkAdmin } from '@/api'
 import {
   DataBoard, MapLocation, Aim, Position, Search,
-  Cellphone, Coin, User, Setting,
+  Cellphone, Coin, User, Setting, UserFilled,
   Bell, WalletFilled, TrendCharts, Monitor,
   OfficeBuilding, Operation, ArrowDown
 } from '@element-plus/icons-vue'

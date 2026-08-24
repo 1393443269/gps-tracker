@@ -318,6 +318,26 @@ def init_db():
         except Exception:
             pass
 
+    # ── 角色表（设备分组：名称/颜色/图标） ──────────────────────────────────────────
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS device_role (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT    NOT NULL,
+        color       TEXT    DEFAULT '#409EFF',
+        icon_type   TEXT    DEFAULT '圆形',
+        description TEXT    DEFAULT '',
+        org_id      INTEGER DEFAULT 1,
+        created_at  TEXT    DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
+    );
+    """)
+    conn.commit()
+    # device 表加 role_id
+    try:
+        conn.execute("ALTER TABLE device ADD COLUMN role_id INTEGER DEFAULT NULL")
+        conn.commit()
+    except Exception:
+        pass
+
     # ── SIM 卡生命周期 ────────────────────────────────────────────────────────────
     for _col in ["expire_date TEXT DEFAULT NULL",       # 套餐到期日 YYYY-MM-DD
                  "monthly_fee REAL DEFAULT 0"]:         # 月租费用（用于成本统计）
@@ -1109,12 +1129,14 @@ def devices_with_customer():
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     count_sql = (
         "SELECT COUNT(*) FROM device d "
-        "LEFT JOIN customer c ON d.customer_id = c.id " + where
+        "LEFT JOIN customer c ON d.customer_id = c.id "
+        "LEFT JOIN device_role r ON d.role_id = r.id " + where
     )
     data_sql = (
         "SELECT d.id, d.phone, d.name, d.terminal_model, d.last_location_time, "
-        "       d.status, d.lifecycle, d.activated_at, d.customer_id, "
-        "       c.name as role_name, c.contact as real_name, c.gender, c.age, "
+        "       d.status, d.lifecycle, d.activated_at, d.customer_id, d.role_id, "
+        "       r.name as role_name, r.color as role_color, r.icon_type, "
+        "       c.contact as real_name, c.gender, c.age, "
         "       c.phone as contact_phone, c.address, c.remark as customer_remark, "
         "       c.login_name as account, "
         "       (SELECT COUNT(*) FROM geo_fence gf "
@@ -1122,6 +1144,7 @@ def devices_with_customer():
         "       as fence_count "
         "FROM device d "
         "LEFT JOIN customer c ON d.customer_id = c.id "
+        "LEFT JOIN device_role r ON d.role_id = r.id "
         + where +
         " ORDER BY d.updated_at DESC LIMIT ? OFFSET ?"
     )
@@ -1158,6 +1181,90 @@ def unbind_device_customer(did):
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     db_exec("UPDATE device SET customer_id=NULL,updated_at=? WHERE id=?", (now, did))
     add_op_log('设备解绑', f'设备 {dev["phone"]} 已解绑')
+    return ok()
+
+
+# ── 角色（设备分组）接口 ──────────────────────────────────────────────────────────
+
+@app.get('/api/roles')
+def list_roles():
+    sids = _org_scope_ids(request)
+    conds, params = _org_where(sids)
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    # 带设备数统计
+    sql = (
+        "SELECT r.*, "
+        "(SELECT COUNT(*) FROM device d WHERE d.role_id = r.id) as device_count "
+        "FROM device_role r " + where +
+        " ORDER BY r.created_at ASC"
+    )
+    records = db_query(sql, params)
+    return ok({'records': records, 'total': len(records)})
+
+
+@app.post('/api/roles')
+def create_role():
+    admin = _current_admin(request)
+    admin_org_id = (admin.get('org_id') or 1) if admin else 1
+    d = request.get_json() or {}
+    name = (d.get('name') or '').strip()
+    if not name:
+        return fail('角色名称不能为空', 400)
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    db_exec(
+        "INSERT INTO device_role (name,color,icon_type,description,org_id,created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (name, d.get('color', '#409EFF'), d.get('icon_type', '圆形'),
+         d.get('description', ''), admin_org_id, now)
+    )
+    add_op_log('角色新增', f'新增角色 {name}')
+    return ok()
+
+
+@app.put('/api/roles/<int:rid>')
+def update_role(rid):
+    d = request.get_json() or {}
+    name = (d.get('name') or '').strip()
+    if not name:
+        return fail('角色名称不能为空', 400)
+    row = db_query_one("SELECT id FROM device_role WHERE id=?", (rid,))
+    if not row:
+        return fail('角色不存在', 404)
+    db_exec(
+        "UPDATE device_role SET name=?,color=?,icon_type=?,description=? WHERE id=?",
+        (name, d.get('color', '#409EFF'), d.get('icon_type', '圆形'),
+         d.get('description', ''), rid)
+    )
+    add_op_log('角色编辑', f'编辑角色 id={rid}')
+    return ok()
+
+
+@app.delete('/api/roles/<int:rid>')
+def delete_role(rid):
+    row = db_query_one("SELECT name FROM device_role WHERE id=?", (rid,))
+    if not row:
+        return fail('角色不存在', 404)
+    # 解除该角色下所有设备的角色绑定
+    db_exec("UPDATE device SET role_id=NULL WHERE role_id=?", (rid,))
+    db_exec("DELETE FROM device_role WHERE id=?", (rid,))
+    add_op_log('角色删除', f'删除角色 {row["name"]}')
+    return ok()
+
+
+@app.put('/api/roles/<int:rid>/assign')
+def assign_role_devices(rid):
+    """批量将设备（按 phone 列表）分配到该角色"""
+    d = request.get_json() or {}
+    phones = d.get('phones', [])
+    row = db_query_one("SELECT id FROM device_role WHERE id=?", (rid,))
+    if not row:
+        return fail('角色不存在', 404)
+    # 先清除该角色下已分配设备（重新赋值语义）
+    db_exec("UPDATE device SET role_id=NULL WHERE role_id=?", (rid,))
+    if phones:
+        ph = ','.join('?' * len(phones))
+        db_exec(f"UPDATE device SET role_id=? WHERE phone IN ({ph})", [rid] + list(phones))
+    add_op_log('角色分配', f'角色 id={rid} 分配 {len(phones)} 台设备')
     return ok()
 
 

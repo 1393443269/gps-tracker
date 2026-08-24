@@ -29,6 +29,7 @@ const routes = [
       { path: 'devices',        component: () => import('@/views/DeviceList.vue'),     meta: { title: '设备管理'  } },
       { path: 'device-info',    component: () => import('@/views/DeviceInfo.vue'),     meta: { title: '设备信息', adminOnly: true } },
       { path: 'device-settings',component: () => import('@/views/DeviceSettings.vue'), meta: { title: '设备设置', adminOnly: true } },
+      { path: 'role-settings',  component: () => import('@/views/RoleSettings.vue'),   meta: { title: '角色设置', adminOnly: true } },
       { path: 'map',       component: () => import('@/views/RealtimeMap.vue'), meta: { title: '实时地图'  } },
       { path: 'alarms',    component: () => import('@/views/AlarmList.vue'),   meta: { title: '报警管理'  } },
       { path: 'fence',     component: () => import('@/views/GeoFence.vue'),    meta: { title: '电子围栏'  } },

@@ -22,21 +22,36 @@
           <el-tag size="small" type="info">{{ row.fence_count ?? 0 }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column prop="role_name"    label="角色名称"   width="120" />
+      <!-- 角色名称：带颜色色块 -->
+      <el-table-column label="角色名称" width="140">
+        <template #default="{ row }">
+          <div v-if="row.role_name" style="display:flex;align-items:center;gap:6px;">
+            <span :style="{
+              display:'inline-block', width:'12px', height:'12px',
+              borderRadius: row.icon_type === '圆形' ? '50%' : '2px',
+              background: row.role_color || '#409EFF', flexShrink:0
+            }" />
+            <span>{{ row.role_name }}</span>
+          </div>
+          <span v-else style="color:#ccc;font-size:12px;">未分配</span>
+        </template>
+      </el-table-column>
       <el-table-column prop="real_name"    label="姓名"       width="100" />
-      <el-table-column prop="gender"       label="性别"       width="65" align="center" />
+      <el-table-column prop="gender"       label="性别"       width="65" align="center">
+        <template #default="{ row }">{{ row.gender || '—' }}</template>
+      </el-table-column>
       <el-table-column prop="age"          label="年龄"       width="65" align="center">
         <template #default="{ row }">{{ row.age ?? '—' }}</template>
       </el-table-column>
       <el-table-column prop="contact_phone" label="联系方式"  width="130" />
       <el-table-column prop="address"      label="联系地址"   min-width="160" show-overflow-tooltip />
-      <el-table-column prop="customer_remark" label="备注"   width="120" show-overflow-tooltip>
+      <el-table-column label="备注" width="120" show-overflow-tooltip>
         <template #default="{ row }">{{ row.customer_remark || '—' }}</template>
       </el-table-column>
       <el-table-column label="操作" fixed="right" width="70" align="center">
         <template #default="{ row }">
           <el-button
-            size="small" :icon="Edit" circle title="编辑人员信息"
+            size="small" :icon="EditIcon" circle title="编辑人员信息"
             @click="openEdit(row)"
             :disabled="!row.customer_id"
           />
@@ -48,12 +63,9 @@
       :current-page="page" :page-size="pageSize" :total="total"
       layout="total,prev,pager,next" @current-change="loadData" />
 
-    <!-- 编辑人员信息弹窗 -->
+    <!-- 编辑人员信息弹窗（只编辑 customer 里的个人信息，角色在「角色设置」里管理） -->
     <el-dialog v-model="editVisible" title="编辑人员信息" width="480px">
       <el-form :model="editForm" label-width="80px" style="padding-right:20px;">
-        <el-form-item label="角色名称">
-          <el-input v-model="editForm.name" placeholder="客户账号 / 角色组名" />
-        </el-form-item>
         <el-form-item label="姓名">
           <el-input v-model="editForm.contact" placeholder="联系人真实姓名" />
         </el-form-item>
@@ -88,7 +100,7 @@
 
 <script setup>
 import { ref, reactive, onMounted } from 'vue'
-import { Search, Edit } from '@element-plus/icons-vue'
+import { Search, Edit as EditIcon } from '@element-plus/icons-vue'
 import { deviceApi, customerApi } from '@/api'
 import { ElMessage } from 'element-plus'
 
@@ -140,7 +152,6 @@ async function submitEdit() {
   saving.value = true
   try {
     await customerApi.update(editForm.customerId, {
-      name:    editForm.name,
       contact: editForm.contact,
       gender:  editForm.gender,
       age:     editForm.age,
