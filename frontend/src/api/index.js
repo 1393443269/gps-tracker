@@ -61,6 +61,32 @@ export const alarmApi = {
   handle: (id, data) => http.put(`/alarms/${id}/handle`, data),
 }
 
+// ── 报警规则 ──────────────────────────────────────────────────────────────────
+export const alarmRuleApi = {
+  types:  ()          => http.get('/alarm-types'),
+  list:   ()          => http.get('/alarm-rules'),
+  create: (data)      => http.post('/alarm-rules', data),
+  update: (id, data)  => http.put(`/alarm-rules/${id}`, data),
+  remove: (id)        => http.delete(`/alarm-rules/${id}`),
+}
+
+// ── 考勤统计 ──────────────────────────────────────────────────────────────────
+export const attendanceApi = {
+  list:   ()          => http.get('/attendance'),
+  detail: (params)    => http.get('/attendance/detail', { params }),
+}
+
+// ── 健康数据 ──────────────────────────────────────────────────────────────────
+export const healthApi = {
+  list:   (params)    => http.get('/health', { params }),
+}
+
+// ── 平台设置 ──────────────────────────────────────────────────────────────────
+export const platformApi = {
+  get:    ()          => http.get('/platform-setting'),
+  update: (data)      => http.put('/platform-setting', data),
+}
+
 // ── 指令下发 ─────────────────────────────────────────────────────────────────
 export const commandApi = {
   sendText: (phone, text)   => http.post('/commands/text',    { phone, text }),
@@ -170,8 +196,8 @@ export const portalApi = {
   },
 }
 
-// ── 统一角色 API（页面直接用 roleApi，自动选管理员或客户端点） ─────────────────
-export const roleApi = {
+// ── 统一自适应 API（自动选管理员或客户端点；当前未被页面引用，保留备用） ──────────
+export const unifiedApi = {
   deviceList:   (p)    => isAdmin() ? deviceApi.list(p)          : portalApi.deviceList(p),
   summary:      ()     => isAdmin() ? deviceApi.summary()         : portalApi.summary(),
   latest:       (ph)   => isAdmin() ? locationApi.latest(ph)      : portalApi.latest(ph),

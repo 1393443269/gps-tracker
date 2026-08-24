@@ -338,6 +338,69 @@ def init_db():
     except Exception:
         pass
 
+    # ── 报警规则表（按报警类型配级别/开关/通知/响铃） ─────────────────────────────
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS alarm_rule (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        alarm_type   INTEGER NOT NULL,
+        level        TEXT    DEFAULT '普通级别',
+        enabled      INTEGER DEFAULT 1,
+        notify_page  INTEGER DEFAULT 1,
+        notify_sms   INTEGER DEFAULT 0,
+        ring_type    TEXT    DEFAULT '响几声',
+        org_id       INTEGER DEFAULT 1,
+        created_at   TEXT    DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
+    );
+
+    CREATE TABLE IF NOT EXISTS platform_setting (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        org_id        INTEGER UNIQUE DEFAULT 1,
+        bigscreen_title TEXT DEFAULT '资产管理平台',
+        account_title   TEXT DEFAULT '资产管理平台',
+        unit_name     TEXT DEFAULT '',
+        contact_phone TEXT DEFAULT '',
+        email         TEXT DEFAULT '',
+        address       TEXT DEFAULT '',
+        logo_url      TEXT DEFAULT '',
+        enable_batch_cmd INTEGER DEFAULT 1,
+        sms_enabled   INTEGER DEFAULT 0,
+        sms_total     INTEGER DEFAULT 0,
+        sms_used      INTEGER DEFAULT 0,
+        created_at    TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
+    );
+
+    CREATE TABLE IF NOT EXISTS attendance_record (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        fence_id    INTEGER,
+        fence_name  TEXT,
+        phone       TEXT,
+        device_name TEXT,
+        action      TEXT,          -- enter / exit
+        event_time  TEXT,
+        org_id      INTEGER DEFAULT 1,
+        created_at  TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
+    );
+
+    CREATE TABLE IF NOT EXISTS health_record (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id   INTEGER,
+        phone       TEXT NOT NULL,
+        temperature REAL,           -- 体温 ℃
+        wrist_temp  REAL,           -- 腕温 ℃
+        heart_rate  INTEGER,        -- 心率 bpm
+        blood_oxygen INTEGER,       -- 血氧 %
+        systolic    INTEGER,        -- 收缩压 mmHg
+        diastolic   INTEGER,        -- 舒张压 mmHg
+        steps       INTEGER,        -- 计步
+        record_time TEXT,
+        org_id      INTEGER DEFAULT 1,
+        created_at  TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_health_phone ON health_record(phone, record_time);
+    CREATE INDEX IF NOT EXISTS idx_attend_fence ON attendance_record(fence_id, event_time);
+    """)
+    conn.commit()
+
     # ── SIM 卡生命周期 ────────────────────────────────────────────────────────────
     for _col in ["expire_date TEXT DEFAULT NULL",       # 套餐到期日 YYYY-MM-DD
                  "monthly_fee REAL DEFAULT 0"]:         # 月租费用（用于成本统计）
@@ -625,11 +688,13 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
                     "lat,lng,speed,alarm_time,status) VALUES (?,?,?,?,?,?,?,?,0)",
                     (device_id, phone, 100, desc, lat, lng, speed_raw, gps_time)
                 )
-                _sio_emit('alarm', {
+                _emit_alarm('alarm', {
                     'phone': phone, 'alarmType': 100, 'alarmDesc': desc,
                     'lat': lat, 'lng': lng, 'time': gps_time, 'fenceName': f['name'],
-                }, phone)
+                }, phone, 100)
                 log.info("[围栏] %s 进入围栏「%s」", phone, f['name'])
+            # 考勤记录（独立于报警开关，进出都记）
+            _record_attendance(f['id'], f['name'], phone, 'enter', gps_time)
             # 记录进入时刻，重置滞留告警标记
             fence_device_enter_time.setdefault(phone, {})[fid] = now_ts
             fence_device_dwell_alarmed.get(phone, set()).discard(fid)
@@ -643,11 +708,13 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
                     "lat,lng,speed,alarm_time,status) VALUES (?,?,?,?,?,?,?,?,0)",
                     (device_id, phone, 101, desc, lat, lng, speed_raw, gps_time)
                 )
-                _sio_emit('alarm', {
+                _emit_alarm('alarm', {
                     'phone': phone, 'alarmType': 101, 'alarmDesc': desc,
                     'lat': lat, 'lng': lng, 'time': gps_time, 'fenceName': f['name'],
-                }, phone)
+                }, phone, 101)
                 log.info("[围栏] %s 离开围栏「%s」", phone, f['name'])
+            # 考勤记录（独立于报警开关，进出都记）
+            _record_attendance(f['id'], f['name'], phone, 'exit', gps_time)
             # 清除进入时刻和滞留告警标记
             fence_device_enter_time.get(phone, {}).pop(fid, None)
             fence_device_dwell_alarmed.get(phone, set()).discard(fid)
@@ -670,10 +737,10 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
                                 "lat,lng,speed,alarm_time,status) VALUES (?,?,?,?,?,?,?,?,0)",
                                 (device_id, phone, 102, desc, lat, lng, speed_raw, gps_time)
                             )
-                            _sio_emit('alarm', {
+                            _emit_alarm('alarm', {
                                 'phone': phone, 'alarmType': 102, 'alarmDesc': desc,
                                 'lat': lat, 'lng': lng, 'time': gps_time, 'fenceName': f['name'],
-                            }, phone)
+                            }, phone, 102)
                             fence_device_dwell_alarmed.setdefault(phone, set()).add(fid)
                             log.info("[围栏] %s 在「%s」停留超时 %.0f秒", phone, f['name'], elapsed)
 
@@ -686,10 +753,10 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
                     "lat,lng,speed,alarm_time,status) VALUES (?,?,?,?,?,?,?,?,0)",
                     (device_id, phone, 103, desc, lat, lng, speed_raw, gps_time)
                 )
-                _sio_emit('alarm', {
+                _emit_alarm('alarm', {
                     'phone': phone, 'alarmType': 103, 'alarmDesc': desc,
                     'lat': lat, 'lng': lng, 'time': gps_time, 'fenceName': f['name'],
-                }, phone)
+                }, phone, 103)
                 log.info("[围栏] %s 围栏「%s」超速 %.1f>%dkm/h", phone, f['name'], speed_kmh, speed_lim)
 
     fence_device_inside[phone] = new_inside
@@ -705,6 +772,62 @@ ALARM_DEFS = [
     (25, '碰撞报警'),
     (26, '侧翻报警'),
 ]
+
+# 报警类型全集（含围栏类），供报警规则页选择
+ALARM_TYPE_OPTIONS = [
+    (0,   'SOS 紧急报警'),
+    (1,   '超速报警'),
+    (2,   '疲劳驾驶报警'),
+    (8,   '主电源断开'),
+    (25,  '碰撞报警'),
+    (26,  '侧翻报警'),
+    (100, '进入围栏'),
+    (101, '离开围栏'),
+    (102, '停留超时'),
+    (103, '围栏内超速'),
+]
+
+
+def _get_alarm_rule(alarm_type):
+    """返回该报警类型的规则 dict；无规则时返回默认（启用、页面推送、响几声）"""
+    row = db_query_one("SELECT * FROM alarm_rule WHERE alarm_type=? LIMIT 1", (alarm_type,))
+    if row:
+        return row
+    return {'enabled': 1, 'notify_page': 1, 'notify_sms': 0,
+            'ring_type': '响几声', 'level': '普通级别'}
+
+
+def _emit_alarm(event, data, phone, alarm_type):
+    """按报警规则决定是否推送到前端；附带 level/ringType 供前端提示。
+    规则关闭则完全静默（不推送）。"""
+    rule = _get_alarm_rule(alarm_type)
+    if not rule.get('enabled', 1):
+        return   # 该类报警已被规则关闭
+    if rule.get('notify_page', 1):
+        data = dict(data)
+        data['level']    = rule.get('level', '普通级别')
+        data['ringType'] = rule.get('ring_type', '响几声')
+        _sio_emit(event, data, phone)
+    # 短信推送：记录消耗（真实短信网关需另接），此处累加已用条数
+    if rule.get('notify_sms', 0):
+        try:
+            db_exec("UPDATE platform_setting SET sms_used=sms_used+1 WHERE org_id=1 AND sms_enabled=1")
+        except Exception:
+            pass
+
+
+def _record_attendance(fence_id, fence_name, phone, action, event_time):
+    """记录设备进出围栏的考勤事件"""
+    try:
+        dev = db_query_one("SELECT name, org_id FROM device WHERE phone=?", (phone,))
+        db_exec(
+            "INSERT INTO attendance_record (fence_id,fence_name,phone,device_name,action,event_time,org_id) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (fence_id, fence_name, phone, (dev.get('name') if dev else '') or '',
+             action, event_time, (dev.get('org_id') if dev else 1) or 1)
+        )
+    except Exception as e:
+        log.error("[考勤] 记录失败: %s", e)
 
 
 def handle_register(sock, phone, serial, body):
@@ -818,14 +941,14 @@ def handle_location(sock, phone, serial, body):
                     (device_id, canonical, bit, desc, lat, lng, speed, gps_time)
                 )
                 log.warning("[808] 报警! phone=%s type=%d desc=%s", phone, bit, desc)
-                _sio_emit('alarm', {
+                _emit_alarm('alarm', {
                     'phone':     canonical,
                     'alarmType': bit,
                     'alarmDesc': desc,
                     'lat':       lat,
                     'lng':       lng,
                     'time':      gps_time,
-                }, canonical)
+                }, canonical, bit)
 
     # WebSocket 推送位置到前端（仅向该设备所属组织的客户端推送）
     _sio_emit('location_update', {
@@ -1340,6 +1463,200 @@ def handle_alarm_api(aid):
     now  = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     db_exec("UPDATE alarm_record SET status=1, handler=?, handle_note=?, handle_time=? WHERE id=?",
             (data.get('handler', '管理员'), data.get('note', ''), now, aid))
+    return ok()
+
+
+# ── 报警规则接口 ───────────────────────────────────────────────────────────────
+
+@app.get('/api/alarm-types')
+def alarm_types():
+    """返回可配置的报警类型列表"""
+    return ok([{'type': t, 'name': n} for t, n in ALARM_TYPE_OPTIONS])
+
+
+@app.get('/api/alarm-rules')
+def list_alarm_rules():
+    rows = db_query("SELECT * FROM alarm_rule ORDER BY id ASC")
+    name_map = {t: n for t, n in ALARM_TYPE_OPTIONS}
+    for r in rows:
+        r['alarm_type_name'] = name_map.get(r['alarm_type'], f'类型{r["alarm_type"]}')
+    return ok({'records': rows, 'total': len(rows)})
+
+
+@app.post('/api/alarm-rules')
+def create_alarm_rule():
+    admin = _current_admin(request)
+    admin_org_id = (admin.get('org_id') or 1) if admin else 1
+    d = request.get_json() or {}
+    atype = d.get('alarm_type')
+    if atype is None:
+        return fail('报警类型不能为空', 400)
+    db_exec(
+        "INSERT INTO alarm_rule (alarm_type,level,enabled,notify_page,notify_sms,ring_type,org_id) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (int(atype), d.get('level', '普通级别'), 1 if d.get('enabled', True) else 0,
+         1 if d.get('notify_page', True) else 0, 1 if d.get('notify_sms', False) else 0,
+         d.get('ring_type', '响几声'), admin_org_id)
+    )
+    add_op_log('报警规则新增', f'新增报警规则 type={atype}')
+    return ok()
+
+
+@app.put('/api/alarm-rules/<int:rid>')
+def update_alarm_rule(rid):
+    d = request.get_json() or {}
+    row = db_query_one("SELECT id FROM alarm_rule WHERE id=?", (rid,))
+    if not row:
+        return fail('规则不存在', 404)
+    db_exec(
+        "UPDATE alarm_rule SET alarm_type=?,level=?,enabled=?,notify_page=?,notify_sms=?,ring_type=? WHERE id=?",
+        (int(d.get('alarm_type')), d.get('level', '普通级别'),
+         1 if d.get('enabled', True) else 0, 1 if d.get('notify_page', True) else 0,
+         1 if d.get('notify_sms', False) else 0, d.get('ring_type', '响几声'), rid)
+    )
+    add_op_log('报警规则编辑', f'编辑报警规则 id={rid}')
+    return ok()
+
+
+@app.delete('/api/alarm-rules/<int:rid>')
+def delete_alarm_rule(rid):
+    row = db_query_one("SELECT id FROM alarm_rule WHERE id=?", (rid,))
+    if not row:
+        return fail('规则不存在', 404)
+    db_exec("DELETE FROM alarm_rule WHERE id=?", (rid,))
+    add_op_log('报警规则删除', f'删除报警规则 id={rid}')
+    return ok()
+
+
+# ── 考勤统计接口 ───────────────────────────────────────────────────────────────
+
+@app.get('/api/attendance')
+def list_attendance():
+    """按围栏聚合的考勤统计：每个围栏的设备进出次数、设备数"""
+    sids = _org_scope_ids(request)
+    conds, params = _org_where(sids)
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    rows = db_query(
+        "SELECT fence_id, fence_name, "
+        "       COUNT(DISTINCT phone) as device_count, "
+        "       SUM(CASE WHEN action='enter' THEN 1 ELSE 0 END) as enter_count, "
+        "       SUM(CASE WHEN action='exit'  THEN 1 ELSE 0 END) as exit_count, "
+        "       MAX(event_time) as last_time "
+        "FROM attendance_record " + where +
+        " GROUP BY fence_id, fence_name ORDER BY last_time DESC",
+        params
+    )
+    return ok({'records': rows, 'total': len(rows)})
+
+
+@app.get('/api/attendance/detail')
+def attendance_detail():
+    """某围栏的考勤明细（可按日期过滤）"""
+    fence_id = request.args.get('fence_id', '').strip()
+    day      = request.args.get('day', '').strip()
+    page     = int(request.args.get('page', 1))
+    size     = int(request.args.get('size', 50))
+    offset   = (page - 1) * size
+    conds, params = [], []
+    if fence_id:
+        conds.append("fence_id=?"); params.append(int(fence_id))
+    if day and _DATE_RE.match(day):
+        conds.append("date(event_time)=?"); params.append(day)
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    total   = db_scalar(f"SELECT COUNT(*) FROM attendance_record {where}", params)
+    records = db_query(
+        f"SELECT * FROM attendance_record {where} ORDER BY event_time DESC LIMIT ? OFFSET ?",
+        params + [size, offset]
+    )
+    return ok({'records': records, 'total': total, 'page': page})
+
+
+# ── 健康数据接口 ───────────────────────────────────────────────────────────────
+
+@app.get('/api/health')
+def list_health():
+    """健康数据查询：按归属账号/日期/IMEI，返回每设备最新一条"""
+    kw   = request.args.get('keyword', '').strip()
+    day  = request.args.get('day', '').strip()
+    page = int(request.args.get('page', 1))
+    size = int(request.args.get('size', 20))
+    offset = (page - 1) * size
+    sids = _org_scope_ids(request)
+
+    conds, params = [], []
+    if kw:
+        like = f'%{kw}%'
+        conds.append("(h.phone LIKE ? OR d.name LIKE ? OR c.name LIKE ?)")
+        params += [like, like, like]
+    if day and _DATE_RE.match(day):
+        conds.append("date(h.record_time)=?"); params.append(day)
+    conds, params = _org_where(sids, conds, params, col='h.org_id')
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+
+    base = ("FROM health_record h "
+            "LEFT JOIN device d ON h.phone = d.phone "
+            "LEFT JOIN customer c ON d.customer_id = c.id ")
+    total   = db_scalar(f"SELECT COUNT(*) {base} {where}", params)
+    records = db_query(
+        "SELECT h.*, d.name as device_name, c.name as account "
+        + base + where +
+        " ORDER BY h.record_time DESC LIMIT ? OFFSET ?",
+        params + [size, offset]
+    )
+    return ok({'records': records, 'total': total, 'page': page})
+
+
+@app.post('/api/health')
+def create_health():
+    """设备/网关上报健康数据（供 MQTT 或第三方推送写入）"""
+    d = request.get_json() or {}
+    phone = (d.get('phone') or '').strip()
+    if not phone:
+        return fail('phone 不能为空', 400)
+    dev = db_query_one("SELECT id, org_id FROM device WHERE phone=?", (phone,))
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    db_exec(
+        "INSERT INTO health_record (device_id,phone,temperature,wrist_temp,heart_rate,"
+        "blood_oxygen,systolic,diastolic,steps,record_time,org_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (dev['id'] if dev else 0, phone, d.get('temperature'), d.get('wrist_temp'),
+         d.get('heart_rate'), d.get('blood_oxygen'), d.get('systolic'),
+         d.get('diastolic'), d.get('steps'), d.get('record_time') or now,
+         dev['org_id'] if dev else 1)
+    )
+    return ok()
+
+
+# ── 平台设置接口 ───────────────────────────────────────────────────────────────
+
+def _get_platform_setting(org_id=1):
+    row = db_query_one("SELECT * FROM platform_setting WHERE org_id=?", (org_id,))
+    if not row:
+        db_exec("INSERT OR IGNORE INTO platform_setting (org_id) VALUES (?)", (org_id,))
+        row = db_query_one("SELECT * FROM platform_setting WHERE org_id=?", (org_id,))
+    return row
+
+
+@app.get('/api/platform-setting')
+def get_platform_setting():
+    return ok(_get_platform_setting(1))
+
+
+@app.put('/api/platform-setting')
+def update_platform_setting():
+    d = request.get_json() or {}
+    _get_platform_setting(1)   # 确保存在
+    db_exec(
+        "UPDATE platform_setting SET bigscreen_title=?,account_title=?,unit_name=?,"
+        "contact_phone=?,email=?,address=?,logo_url=?,enable_batch_cmd=?,"
+        "sms_enabled=?,sms_total=? WHERE org_id=1",
+        (d.get('bigscreen_title', '资产管理平台'), d.get('account_title', '资产管理平台'),
+         d.get('unit_name', ''), d.get('contact_phone', ''), d.get('email', ''),
+         d.get('address', ''), d.get('logo_url', ''),
+         1 if d.get('enable_batch_cmd', True) else 0,
+         1 if d.get('sms_enabled', False) else 0, int(d.get('sms_total', 0) or 0))
+    )
+    add_op_log('平台设置', '更新平台设置')
     return ok()
 
 

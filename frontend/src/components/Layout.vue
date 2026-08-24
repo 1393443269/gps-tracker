@@ -3,7 +3,8 @@
     <!-- 侧边导航 -->
     <el-aside width="210px" style="background: #001529; display:flex; flex-direction:column;">
       <div class="logo">
-        <span>🛰 资产管理平台</span>
+        <img v-if="platformLogo" :src="platformLogo" style="height:26px;margin-right:6px;vertical-align:middle;" />
+        <span>{{ platformTitle }}</span>
       </div>
       <el-menu
         :default-active="activeMenu"
@@ -63,12 +64,25 @@
           <el-icon><Operation /></el-icon>
           <span>模块授权</span>
         </el-menu-item>
+        <el-menu-item v-if="isAdmin" index="/platform-setting">
+          <el-icon><Tools /></el-icon>
+          <span>平台设置</span>
+        </el-menu-item>
 
         <div class="menu-group-label">运营</div>
         <el-menu-item index="/alarms">
           <el-icon><Bell /></el-icon>
           <span>报警管理</span>
           <el-badge v-if="alarmCount > 0" :value="alarmCount" class="alarm-badge" />
+        </el-menu-item>
+        <el-menu-item v-if="isAdmin" index="/alarm-setting">
+          <el-icon><SetUp /></el-icon><span>报警设置</span>
+        </el-menu-item>
+        <el-menu-item v-if="isAdmin" index="/attendance">
+          <el-icon><Calendar /></el-icon><span>考勤统计</span>
+        </el-menu-item>
+        <el-menu-item v-if="isAdmin" index="/health">
+          <el-icon><FirstAidKit /></el-icon><span>健康数据</span>
         </el-menu-item>
         <el-menu-item index="/recharges">
           <el-icon><WalletFilled /></el-icon><span>充值管理</span>
@@ -131,18 +145,32 @@
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { deviceApi, alarmApi, portalApi, authApi, isAdmin as checkAdmin } from '@/api'
+import { deviceApi, alarmApi, portalApi, authApi, platformApi, isAdmin as checkAdmin } from '@/api'
 import {
   DataBoard, MapLocation, Aim, Position, Search,
   Cellphone, Coin, User, Setting, UserFilled,
   Bell, WalletFilled, TrendCharts, Monitor,
-  OfficeBuilding, Operation, ArrowDown
+  OfficeBuilding, Operation, ArrowDown,
+  Tools, SetUp, Calendar, FirstAidKit
 } from '@element-plus/icons-vue'
 
 const route       = useRoute()
 const router      = useRouter()
 const onlineCount = ref(0)
 const alarmCount  = ref(0)
+
+// 白标：平台标题 / Logo（从平台设置读取）
+const platformTitle = ref('🛰 资产管理平台')
+const platformLogo  = ref('')
+
+async function loadPlatform() {
+  try {
+    const res = await platformApi.get()
+    const d = res.data || {}
+    if (d.account_title) platformTitle.value = d.account_title
+    if (d.logo_url)      platformLogo.value  = d.logo_url
+  } catch {}
+}
 
 const isAdmin = computed(() => checkAdmin())
 
@@ -216,6 +244,7 @@ async function refreshStats() {
 }
 
 onMounted(() => {
+  loadPlatform()
   refreshStats()
   timer = setInterval(refreshStats, 30000)
 })
