@@ -1,0 +1,45 @@
+services:
+
+  # ── MQTT Broker（设备 MQTT 接入） ────────────────────────────────────────────
+  mqtt:
+    image: eclipse-mosquitto:2
+    container_name: tracker-mqtt
+    ports:
+      - "1883:1883"       # MQTT（设备直连）
+      - "9001:9001"       # MQTT over WebSocket（预留）
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped
+
+  # ── Python Flask 后端（REST API + Socket.IO + 808 TCP + MQTT 订阅） ─────────
+  backend:
+    build:
+      context: ./server
+    container_name: tracker-backend
+    ports:
+      - "9090:9090"       # JT/T 808 TCP（设备直连，绕过 Nginx）
+    volumes:
+      - tracker_data:/app/data
+    environment:
+      - DB_PATH=/app/data/tracker.db
+      - MQTT_BROKER=mqtt
+      - MQTT_PORT=1883
+    depends_on:
+      - mqtt
+    restart: unless-stopped
+
+  # ── Nginx 前端（静态资源 + 反向代理） ──────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+    container_name: tracker-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+# SQLite 数据持久化卷
+volumes:
+  tracker_data:
+    driver: local

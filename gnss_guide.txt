@@ -1,0 +1,1068 @@
+=== PAGE 1 ===
+ 
+EC200N-CN&EC800M-CN& 
+EG915N 系列 GNSS 应用指导 
+ LTE Standard 模块系列 
+ 版本：1.0.0 
+ 日期：2022-07-18 
+ 状态：临时文件
+
+=== PAGE 2 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         1 / 27 
+ 
+ 
+上海移远通信技术股份有限公司（以下简称“移远通信”）始终以为客户提供最及时、最全面的服务为宗
+旨。如需任何帮助，请随时联系我司上海总部，联系方式如下： 
+ 
+上海移远通信技术股份有限公司 
+上海市闵行区田林路 1016 号科技绿洲 3 期（B 区）5 号楼   邮编：200233 
+电话：+86 21 5108 6236     邮箱：info@quectel.com 
+ 
+或联系我司当地办事处，详情请登录：http://www.quectel.com/cn/support/sales.htm。 
+ 
+如需技术支持或反馈我司技术文档中的问题，请随时登陆网址：  
+http://www.quectel.com/cn/support/technical.htm 或发送邮件至：support@quectel.com。 
+ 
+前言 
+移远通信提供该文档内容以支持客户的产品设计。客户须按照文档中提供的规范、参数来设计产品。同时，
+您理解并同意，移远通信提供的参考设计仅作为示例。您同意在设计您目标产品时使用您独立的分析、评
+估和判断。在使用本文档所指导的任何硬软件或服务之前，请仔细阅读本声明。您在此承认并同意，尽管
+移远通信采取了商业范围内的合理努力来提供尽可能好的体验，但本文档和其所涉及服务是在“可用”基
+础上提供给您的。移远通信可在未事先通知的情况下，自行决定随时增加、修改或重述本文档。 
+ 
+使用和披露限制 
+许可协议 
+除非移远通信特别授权，否则我司所提供硬软件、材料和文档的接收方须对接收的内容保密，不得将其用
+于除本项目的实施与开展以外的任何其他目的。 
+ 
+版权声明 
+移远通信产品和本协议项下的第三方产品可能包含受移远通信或第三方材料、硬软件和文档版权保护的相
+关资料。除非事先得到书面同意，否则您不得获取、使用、向第三方披露我司所提供的文档和信息，或对
+此类受版权保护的资料进行复制、转载、抄袭、出版、展示、翻译、分发、合并、修改，或创造其衍生作
+品。移远通信或第三方对受版权保护的资料拥有专有权，不授予或转让任何专利、版权、商标或服务商标
+权的许可。为避免歧义，除了正常的非独家、免版税的产品使用许可，任何形式的购买都不可被视为授予
+许可。对于任何违反保密义务、未经授权使用或以其他非法形式恶意使用所述文档和信息的违法侵权行为，
+移远通信有权追究法律责任。 
+ 
+商标 
+除另行规定，本文档中的任何内容均不授予在广告、宣传或其他方面使用移远通信 或第三方的任何商标、
+商号及名称，或其缩略语，或其仿冒品的权利。 
+ 
+第三方权利 
+您理解本文档可能涉及一个或多个属于第三方的硬软件和文档（“第三方材料”）。您对此类第三方材料
+的使用应受本文档的所有限制和义务约束。 
+ 
+ 
+=== PAGE 3 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         2 / 27 
+ 
+ 
+移远通信针对第三方材料不做任何明示或暗示的保证或陈述，包括但不限于任何暗示或法定的适销性或特
+定用途的适用性、平静受益权、系统集成、信息准确性以及与许可技术或被许可人使用许可技术相关的不
+侵犯任何第三方知识产权的保证。本协议中的任何内容都不构成移远通信对任何移远通信产品或任何其他
+硬软件、设备、工具、信息或产品的开发、增强、修改、分销、营销、销售、提供销售或以其他方式维持
+生产的陈述或保证。此外，移远通信免除因交易过程、使用或贸易而产生的任何和所有保证。 
+ 
+隐私声明 
+为实现移远通信产品功能，特定设备数据将会上传至移远通信或第三方服务器（包括运营商 、芯片供应商
+或您指定的服务器）。移远通信严格遵守相关法律法规，仅为实现产品功能之目的或在适用法律允许的情
+况下保留、使用、披露或以其他方式处理相关数据。当您与第三方进行数据交互前，请自行了解其隐私保
+护和数据安全政策。 
+ 
+免责声明 
+1) 移远通信不承担任何因未能遵守有关操作或设计规范而造成损害的责任。 
+2) 移远通信不承担因本文档中的任何因不准确、遗漏、或使用本文档中的信息而产生的任何责任。 
+3) 移远通信尽力确保开发中功能的完整性、准确性、及时性，但不排除上述功能错误或遗漏的可能。除
+非另有协议规定，否则移远通信对开发中功能的使用不做任何暗示或法定的保证。在适用法律允许的
+最大范围内，移远通信不对任何因使用开发中功能而遭受的损害承担责任，无论此类损害是否可以预
+见。 
+4) 移远通信对第三方网站及第三方资源的信息、内容、广告、商业报价、产品、服务和材料的可访问性、
+安全性、准确性、可用性、合法性和完整性不承担任何法律责任。 
+ 
+版权所有 ©上海移远通信技术股份有限公司 2022，保留一切权利。 
+Copyright © Quectel Wireless Solutions Co., Ltd. 2022. 
+ 
+=== PAGE 4 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         3 / 27 
+ 
+ 
+文档历史 
+ 
+修订记录 
+ 
+版本 日期 作者 变更表述 
+- 2021-06-11 Evan MENG/ 
+Yang LIU 文档创建 
+1.0.0 2022-07-18 Yang LIU 临时版本 
+=== PAGE 5 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         4 / 27 
+ 
+ 
+目录 
+文档历史 ........................................................................................................................................................ 3 
+目录 ............................................................................................................................................................... 4 
+表格索引 ........................................................................................................................................................ 5 
+1 引言 ........................................................................................................................................................ 6 
+1.1. 打开/关闭 GNSS 步骤 ................................................................................................................. 6 
+1.2. 支持的 NMEA 语句类型 ............................................................................................................... 6 
+2 GNSS AT 命令 ....................................................................................................................................... 8 
+2.1. AT 命令说明 ................................................................................................................................ 8 
+2.1.1. 定义 .................................................................................................................................. 8 
+2.1.2. AT 命令语句 ..................................................................................................................... 8 
+2.2. AT 示例声明 ................................................................................................................................ 9 
+2.3. AT 命令详解 ................................................................................................................................ 9 
+2.3.1. AT+QGPSCFG  配置 GNSS .......................................................................................... 9 
+2.3.1.1. AT+QGPSCFG="outport"  配置 NMEA 语句输出端口 ....................................... 9 
+2.3.1.2. AT+QGPSCFG="nmeasrc"  启用/禁用通过 AT+QGPSGNMEA 获取 NMEA 语句
+  ............................................................................................................................ 10 
+2.3.1.3. AT+QGPSCFG="gpsnmeatype"  配置 NMEA 语句的输出类型 ....................... 11 
+2.3.1.4. AT+QGPSCFG="gnssconfig"  配置支持的 GNSS 卫星导航系统 ..................... 12 
+2.3.1.5. AT+QGPSCFG="autogps"  启用/禁用 GNSS 自启动 ....................................... 13 
+2.3.1.6. AT+QGPSCFG="apflash"  启用/禁用 AP-Flash 快速热启动功能 ..................... 14 
+2.3.2. AT+QGPSDEL  删除辅助数据 ...................................................................................... 14 
+2.3.3. AT+QGPS  打开 GNSS ................................................................................................ 15 
+2.3.4. AT+QGPSEND  关闭 GNSS ........................................................................................ 16 
+2.3.5. AT+QGPSLOC  获取定位信息 ..................................................................................... 17 
+2.3.6. AT+QGPSGNMEA  获取指定的 NMEA 语句 ............................................................... 19 
+2.3.7. AT+QCFG="usb/nema"  启用/禁用 NMEA 口 .............................................................. 21 
+2.3.8. AT+QAGPS  启用/禁用 AGPS ...................................................................................... 22 
+3 举例 ...................................................................................................................................................... 23 
+3.1. 打开与关闭 GNSS ..................................................................................................................... 23 
+3.2. GNSS 参数<NMEA_src>的应用 ............................................................................................... 23 
+3.3. AGPS 功能应用 ......................................................................................................................... 24 
+4 错误码 .................................................................................................................................................. 25 
+5 附录 参考文档及术语缩写 ................................................................................................................... 26 
+ 
+=== PAGE 6 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         5 / 27 
+ 
+ 
+表格索引 
+表 1：AT 命令类型 ....................................................................................................................................... 8 
+表 2：错误码列表 ....................................................................................................................................... 25 
+表 3：术语缩写 ........................................................................................................................................... 26 
+ 
+ 
+=== PAGE 7 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         6 / 27 
+ 
+ 
+1 引言 
+ 
+移远通信 EC200N-CN、EC800M-CN 和 EG915N 系列模块内部集成 GNSS 引擎， 支持GPS、BeiDou、
+Galileo 和 GLONASS 系统。高性能 GNSS 引擎适用于各类有低成本、精确定位需求的应用场所，这使
+EC200N-CN、EC800M-CN 和 EG915N 系列模块广泛应用于如下领域：逐向道路导航、资产跟踪、人员跟
+踪、位置感知游戏以及家庭和车队管理。 
+ 
+1.1. 打开/关闭 GNSS 步骤 
+ 
+EC200N-CN、EC800M-CN 和 EG915N 系列模块的 GNSS 支持位置计算功能，且无需网络协助。打
+开/关闭 GNSS 的步骤如下： 
+ 
+步骤 1：通过 AT+QGPSCFG 配置 GNSS 参数。 
+步骤 2：通过 AT+QGPS=1 打开 GNSS。 
+步骤 3：打开 GNSS，定位成功后，可通过以下三种方式获取定位信息： 
+1) NMEA 语句默认不输出，可通过 AT+QGPSCFG="outport"选择 NMEA 语句输出端口。 
+2) 通过 AT+QGPSLOC 可直接获取定位信息，例如纬度、经度、高度、GNSS 定位模 
+  式、时间、卫星数量等。 
+3) 通过 设置 AT+QGPSCFG="nmeasrc",1 启用 通过 AT+QGPSGNMEA 获取指定的
+NMEA 语句；如果设置 AT+QGPSCFG="nmeasrc",0， 则不能通过 AT+QGPSGNMEA
+获取指定的 NMEA 语句。 
+步骤 4：执行 AT+QGPS=0 或 AT+QGPSEND 关闭 GNSS。 
+ 
+1.2. 支持的 NMEA 语句类型 
+ 
+模块默认支持的 NMEA 语句与 NMEA-0183 协议兼容。另外，可以通过三种前缀区分不同卫星系统的
+NMEA 语句，如下所示： 
+ 
+GPS NMEA 语句的前缀为“GP”，如下所示： 
+⚫ GPGGA – 全球定位系统定位数据，如时间、定位等 
+⚫ GPRMC – 推荐的最小具体 GNSS 数据 
+⚫ GPGSV – 可见的 GPS 卫星，例如可见的卫星数、卫星 ID 号等 
+⚫ GPGSA – 参与定位的 GPS 卫星 ID 号、精度因子等 
+⚫ GPVTG – 矢量跟踪与对地速度 
+=== PAGE 8 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         7 / 27 
+ 
+ 
+⚫ GPGLL – 经度与纬度 
+ 
+BeiDou NMEA 语句的前缀为“GB”，如下所示： 
+⚫ GBGGA – 全球定位系统定位数据，如时间、定位等 
+⚫ GBRMC – 推荐的最小具体 GNSS 数据 
+⚫ GBGSV – 可见的 BeiDou 卫星，例如可见的卫星数、卫星 ID 号等 
+⚫ GBGSA – 参与定位的 BeiDou 卫星 ID 号、精度因子等 
+⚫ GBVTG – 矢量跟踪与对地速度 
+⚫ GBGLL – 经度与纬度 
+ 
+Galileo NMEA 语句的前缀为“GA”，如下所示： 
+⚫ GAGGA – 全球定位系统定位数据，如时间、定位等 
+⚫ GARMC – 推荐的最小具体 GNSS 数据 
+⚫ GAGSV – 可见的 Galileo 卫星，例如可见的卫星数、卫星 ID 号等 
+⚫ GAGSA – 参与定位的 Galileo 卫星 ID 号、精度因子等 
+ 
+GLONASS NMEA 语句的前缀为“GL”，如下所示： 
+⚫ GLGGA – 全球定位系统定位数据，如时间、定位等 
+⚫ GLRMC – 推荐的最小具体 GNSS 数据 
+⚫ GLGSV – 可见的 GLONASS 卫星，例如可见的卫星数、卫星 ID 号等 
+⚫ GLGSA – 参与定位的 GLONASS 卫星 ID 号、精度因子等 
+ 
+GNSS 组合系统 NMEA 语句的前缀为“GN”，如下所示： 
+⚫ GNGGA – 全球定位系统定位数据，如时间、定位等 
+⚫ GNRMC – 推荐的最小具体 GNSS 数据 
+⚫ GNGSA – 参与定位的 GNSS 卫星 ID 号、精度因子等 
+⚫ GNVTG – 矢量跟踪与对地速度 
+⚫ GNGLL – 经度与纬度 
+备注 
+ 
+EC200N-CN 模块暂不支持 GLONASS 和 Galileo 系统。 
+=== PAGE 9 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         8 / 27 
+ 
+ 
+2 GNSS AT 命令 
+ 
+2.1. AT 命令说明 
+2.1.1. 定义 
+⚫ <CR>  回车符。 
+⚫ <LF>  换行符。 
+⚫ <…>  参数名称。实际命令行中不包含尖括号。 
+⚫ […]   可选参数或 TA 信息响应的可选部分。实际命令行中不包含方括号。若无特别说明，
+   配置命令中的可选参数被省略时，将默认使用其之前已设置的值或其默认值。  
+⚫ 下划线  参数的默认设置。 
+ 
+2.1.2. AT 命令语句 
+前缀 AT 或 at 必须加在每个命令行的开头。输入 <CR> 将终止命令行。通常，命令后面跟随形式为
+<CR><LF><response><CR><LF> 的响应。在本文档中表现命令和响应的表格中，省略了 <CR><LF>，
+仅显示命令和响应。 
+ 
+表 1：AT 命令类型 
+ 
+ 
+ 
+AT 命令类型 语句 描述 
+测试命令 AT+<cmd>=? 测试是否存在相应的设置命令，并返回有关其参
+数的类型、值或范围的信息。 
+查询命令 AT+<cmd>? 查询相应设置命令的当前参数值。 
+设置命令 AT+<cmd>=<p1>[,<p2>[,<p3>[...]]] 设置用户可定义的参数值。 
+执行命令 AT+<cmd> 返回特定的参数信息或执行特定的操作。 
+=== PAGE 10 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         9 / 27 
+ 
+ 
+2.2. AT 示例声明 
+ 
+本文中的示例仅为方便用户了解 AT 命令的使用方法，不构成移远通信对终端流程设计的建议或意见，
+也不代表模块应被设置成相应示例中的状态。 某些AT 命令存在多个示例， 这些示例之间不存在承接关系或
+连续性。 
+ 
+2.3. AT 命令详解 
+2.3.1. AT+QGPSCFG  配置 GNSS 
+该命令用于查询和配置 GNSS 不同的设置，包括 NMEA 语句输出端口、NMEA 语句的输出类型等。 
+ 
+2.3.1.1. AT+QGPSCFG="outport"  配置 NMEA 语句输出端口 
+该命令用于配置 NMEA 语句输出端口。 
+AT+QGPSCFG  配置 GNSS 
+测试命令 
+AT+QGPSCFG=? 
+响应 
++QGPSCFG: "outport",( 支持的<out_port>列表) 
++QGPSCFG: "nmeasrc",( 支持的<NMEA_src>列表) 
++QGPSCFG: "gpsnmeatype",( 支持的<GPS_NMEA_type>范围) 
++QGPSCFG: "gnssconfig",( 支持的<GNSS_config>列表) 
++QGPSCFG: "autogps",( 支持的<autoGPS>列表) 
++QGPSCDF: " apflash",(支持的<AP_flash_mode>列表) 
+ 
+OK 
+AT+QGPSCFG="outport"  配置 NMEA 语句输出端口 
+设置命令 
+AT+QGPSCFG="outport"[,<out_port
+>] 
+响应 
+若省略可选参数，则查询当前配置： 
++QGPSCFG: "outport",<out_port> 
+ 
+OK 
+ 
+若指定可选参数，则配置 NMEA 语句输出端口： 
+OK 
+或者 
+ERROR 
+ 
+=== PAGE 11 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         10 / 27 
+ 
+ 
+参数 
+ 
+2.3.1.2. AT+QGPSCFG="nmeasrc"  启用/禁用通过 AT+QGPSGNMEA 获取 NMEA 语句 
+该命令用于启用或禁用通过 AT+QGPSGNMEA 获取 NMEA 语句。 
+参数 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+最大响应时间 300 毫秒 
+特性说明 该命令立即生效； 
+参数配置自动保存至 NVRAM。 
+<out_port> 字符串类型。配置 NMEA 语句输出端口。 
+"none"  关闭 NMEA 语句输出 
+"usbnmea" 通过 USB NMEA 口输出 
+"uartdebug" 通过调试串口输出 
+<errcode> 错误码。详细信息可参考第 4 章。 
+AT+QGPSCFG="nmeasrc"  启用/禁用通过 AT+QGPSGNMEA 获取 NMEA 语句 
+设置命令 
+AT+QGPSCFG="nmeasrc"[,<NMEA_
+src>] 
+响应 
+若省略可选参数，则查询当前配置： 
++QGPSCFG: "nmeasrc",<NMEA_src> 
+ 
+OK 
+ 
+若指定可选参数，则配置是否启用通过 AT+QGPSGNMEA 获
+取 NMEA 语句： 
+OK 
+或者 
+ERROR 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+最大响应时间 300 毫秒 
+特性说明 该命令立即生效； 
+参数配置自动保存。 
+=== PAGE 12 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         11 / 27 
+ 
+ 
+ 
+2.3.1.3. AT+QGPSCFG="gpsnmeatype"  配置 NMEA 语句的输出类型 
+该命令用于配置 GPS、BeiDou、Galileo、GLONASS 和 GNSS 组合系统 NMEA 语句的输出类型。 
+参数 
+<NMEA_src> 整型。 启用 / 禁 用 通 过 AT+QGPSGNMEA 获取 NMEA 语句 。 使 能 后 ， 执 行
+AT+QGPSGNMEA，NMEA 语句将以命令返回值的形式通过 AT 口输出。 
+0 禁用 
+1 启用 
+<errcode> 错误码。详细信息可参考第 4 章。 
+AT+QGPSCFG="gpsnmeatype"  配置 NMEA 语句的输出类型 
+设置命令 
+AT+QGPSCFG="gpsnmeatype"[,<GP
+S_NMEA_type>] 
+响应 
+若省略可选参数，则查询当前配置： 
++QGPSCFG: "gpsnmeatype",<GPS_NMEA_type> 
+ 
+OK 
+ 
+若指定可选参数， 则配置GPS、BeiDou、Galileo、GLONASS
+和 GNSS 组合系统 NMEA 语句的输出类型： 
+OK 
+或者 
+ERROR 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+最大响应时间 300 毫秒 
+特性说明 该命令立即生效； 
+参数配置自动保存至 NVRAM。 
+<GPS_NMEA_type> 整型。 设置输出的NMEA 语句类型。 取值为异或运算格式。范围：0~63。默认值：
+31。 
+0 禁止输出 NMEA 语句 
+1 GGA 
+2 RMC 
+4 GSV 
+8 GSA 
+16 VTG 
+32 GLL 
+63 输出以上所有类型的语句 
+=== PAGE 13 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         12 / 27 
+ 
+ 
+备注 
+ 
+2.3.1.4. AT+QGPSCFG="gnssconfig"  配置支持的 GNSS 卫星导航系统 
+该命令用于配置模块支持的 GNSS 卫星导航系统。 
+参数 
+<errcode> 操作错误码。详细信息可参考第 4 章。 
+GNSS 未打开时，也可执行该命令配置 NMEA 语句输出类型，该配置在模块启动后生效。 
+AT+QGPSCFG="gnssconfig"  配置支持的 GNSS 卫星导航系统 
+设置命令 
+AT+QGPSCFG="gnssconfig"[,<GNS
+S_config>] 
+响应 
+若省略可选参数，则查询当前配置： 
++QGPSCFG: "gnssconfig",<GNSS_config> 
+ 
+OK 
+ 
+若省略可选参数，则配置支持的 GNSS 卫星导航系统： 
+OK 
+或者 
+ERROR 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+最大响应时间 300 毫秒 
+特性说明 该命令立即生效； 
+参数配置自动保存。 
+<GNSS_config> 整型。模块支持的 GNSS 卫星导航系统。 
+EC200N-CN 模块仅支持如下配置，若配置为其他值，则命令不生效： 
+0 GPS 
+5 GPS + BeiDou 
+7 BeiDou 
+ 
+EC800M-CN 和 EG915N 系列模块： 
+0 GPS 
+1 GPS + BeiDou 
+3 GPS + GLONASS + Galileo 
+=== PAGE 14 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         13 / 27 
+ 
+ 
+备注 
+ 
+2.3.1.5. AT+QGPSCFG="autogps"  启用/禁用 GNSS 自启动 
+该命令用于配置模块启动时，是否自动启动 GNSS。 
+参数 
+ 
+4 GPS + GLONASS 
+5 GPS + BeiDou + Galileo 
+6 GPS + Galileo 
+7 BeiDou 
+<errcode> 错误码。详细信息可参考第 4 章。 
+未打开 GNSS 且从未进行相关配置时，通过该命令读取的配置信息为 0，无实际意义。 
+AT+QGPSCFG="autogps"  启用/禁用 GNSS 自启动 
+设置命令 
+AT+QGPSCFG="autogps"[,<autoGP
+S>] 
+响应 
+若省略可选参数，则查询当前配置： 
++QGPSCFG: "autogps",<autoGPS> 
+ 
+OK 
+ 
+若指定可选参数，则配置是否启用 GNSS 自启动： 
+OK 
+或者 
+ERROR 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+最大响应时间 300 毫秒 
+特性说明 该命令在模块重启后生效； 
+参数配置自动保存。 
+<autoGPS> 整型。启用/禁用 GNSS 自启动。 
+0 禁用 
+1 启用 
+<errcode> 错误码。详细信息可参考第 4 章。 
+=== PAGE 15 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         14 / 27 
+ 
+ 
+2.3.1.6. AT+QGPSCFG="apflash"  启用/禁用 AP-Flash 快速热启动功能 
+该命令用于启用或禁用 GNSS 的 AP-Flash 快速热启动功能。在打开 GNSS 后，通过把星历数据导入
+到 GNSS 模块内，加速定位时间。 
+参数 
+ 
+2.3.2. AT+QGPSDEL  删除辅助数据 
+该命令用于删除辅助数据，以便进行GNSS 冷启动、热启动和温启动操作， 且仅可在 GNSS 打开时执
+行。 
+AT+QGPSCFG="apflash"  启用/禁用 AP-Flash 快速热启动功能 
+设置命令 
+AT+QGPSCFG="apflash"[,<AP_flash_m
+ode>] 
+响应 
+若省略可选参数，则查询当前配置： 
++QGPSCFG: "apflash",<AP_flash_mode> 
+ 
+OK 
+ 
+若指定可选参数，则启用或禁用 AP-Flash 快速热启动功能： 
+OK 
+或者 
+ERROR 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+最大响应时间 300 毫秒 
+特性说明 该命令立即生效； 
+参数配置自动保存。 
+<AP_flash_mode> 整型。启用/禁用 AP-Flash 快速热启动功能。 
+0 禁用 
+1 启用 
+<errcode> 错误码。详细信息可参考第 4 章。 
+AT+QGPSDEL  删除辅助数据 
+测试命令 
+AT+QGPSDEL=? 
+响应 
++QGPSDEL: (支持的<delete_type>范围) 
+ 
+OK 
+=== PAGE 16 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         15 / 27 
+ 
+ 
+参数 
+ 
+2.3.3. AT+QGPS  打开 GNSS 
+该命令用于打开 GNSS 功能。 
+设置命令 
+AT+QGPSDEL=<delete_type> 
+响应 
+OK 
+或者 
+ERROR 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+最大响应时间 300 毫秒 
+特性说明 / 
+<delete_type> 整型。待删除的 GNSS 辅助数据类型。 
+0 删除所有辅助数据。开启 GNSS 后，强制冷启动。 
+1 不删除数据。开启 GNSS 后，条件允许时进行热启动。 
+2 删除部分相关数据，开启 GNSS 后，条件允许时进行温启动。 
+<errcode> 错误码。详细信息可参考第 4 章。 
+AT+QGPS  打开 GNSS 
+测试命令 
+AT+QGPS=? 
+响应 
++QGPS: (支持的<GNSS_state>列表) 
+ 
+OK 
+查询命令 
+AT+QGPS? 
+响应 
++QGPS: <GNSS_state> 
+ 
+OK 
+设置命令 
+AT+QGPS=<GNSS_state> 
+响应 
+OK 
+或者 
+ERROR 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+最大响应时间 300 毫秒 
+特性说明 该命令立即生效； 
+=== PAGE 17 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         16 / 27 
+ 
+ 
+参数 
+ 
+2.3.4. AT+QGPSEND  关闭 GNSS 
+该命令用于关闭 GNSS 功能。 
+参数 
+ 
+ 
+ 
+ 
+ 
+参数配置不保存。 
+<GNSS_state> 整型。打开或关闭 GNSS。 
+0 关闭 GNSS 
+1 打开 GNSS 
+<errcode> 错误码。详细信息可参考第 4 章。 
+AT+QGPSEND  关闭 GNSS 
+测试命令 
+AT+QGPSEND=? 
+响应 
+OK 
+或者 
+ERROR 
+查询命令 
+AT+QGPSEND? 
+响应 
+OK 
+或者 
+ERROR 
+执行命令 
+AT+QGPSEND 
+响应 
+OK 
+或者 
+ERROR 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+最大响应时间 300 毫秒 
+特性说明 / 
+<errcode> 错误码。详细信息可参考第 4 章。 
+=== PAGE 18 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         17 / 27 
+ 
+ 
+2.3.5. AT+QGPSLOC  获取定位信息 
+该命令用于获取定位信息。执行该命令前，必须通过 AT+QGPS 打开 GNSS。如果定位失败，将根据
+对应情况返回+CME ERROR: <errcode>。 
+参数 
+AT+QGPSLOC  获取定位信息 
+测试命令 
+AT+QGPSLOC=? 
+响应 
++QGPSLOC: <UTC>,<latitude>,<longitude>,< HDOP>,<alt
+itude>,(支持的<fix>范围),<COG>,<spkm>,<spkn>,<date>,
+<nsat> 
+ 
+OK 
+设置命令 
+AT+QGPSLOC=<mode> 
+响应 
++QGPSLOC: <UTC>,<latitude>,<longitude>,< HDOP>,<alt
+itude>,<fix>,<COG>,<spkm>,<spkn>,<date>,<nsat> 
+ 
+OK 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+最大响应时间 300 毫秒 
+特性说明 /、 
+<mode> 整型。纬度和经度显示格式。 
+0 <latitude>,<longitude>格式：ddmm.mmmmN/S,dddmm.mmmmE/W 
+1 <latitude>,<longitude>格式：ddmm.mmmmmm,N/S,dddmm.mmmmmm,E/W 
+2 <latitude>,<longitude>格式：(-)dd.ddddd,(-)ddd.ddddd 
+<UTC> 字符串类型。UTC 时间。格式：hhmmss.ss（引自 GPGGA 语句）。 
+<latitude> 字符串类型。纬度。 
+若<mode>为 0： 
+格式：ddmm.mmmmN/S（引自 GPGGA 语句） 
+dd    度。范围：00~89 
+mm.mmmm  分。范围：00.0000~59.9999  
+N/S    北纬/南纬 
+ 
+若<mode>为 1： 
+格式：ddmm.mmmmmm,N/S 
+dd    度。范围：00~89 
+mm.mmmmmm  分。范围：00.000000~59.999999 
+N/S    北纬/南纬 
+=== PAGE 19 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         18 / 27 
+ 
+ 
+ 
+ 
+ 
+ 
+若<mode>为 2： 
+格式：(-)dd.ddddd 
+dd.ddddd  度。范围：-89.99999~89.99999 
+-    南纬 
+<longitude> 字符串类型。经度。 
+若<mode>为 0： 
+格式：dddmm.mmmmE/W（引自 GPGGA 语句）  
+ddd    度。范围：000~179 
+mm.mmmm  分。范围：00.0000~59.9999 
+E/W    东经/西经 
+ 
+若<mode>为 1： 
+格式：dddmm.mmmmmm,E/W（引自 GPGGA 语句） 
+ddd    度。范围：000~179 
+mm.mmmmmm  分。范围：00.000000~59.999999 
+E/W    东经/西经 
+ 
+若<mode>为 2： 
+格式：(-)ddd.ddddd（引自 GPGGA 语句） 
+ddd.ddddd  度。范围：-179.99999~179.99999 
+-    西经 
+<HDOP> 水平精度因子。 
+<altitude> 天线的海拔高度。单位：米（引自 GPGGA 语句）。 
+<fix> 整型。GNSS 定位模式（引自 GPGSA 语句）。 
+1 未定位 
+2 2D 定位 
+3 3D 定位 
+<COG> 字符串类型。以真北方向为基准的地面航向。测速失败或静态场景速度极小时， 输出为空。
+（引自 GPVTG 语句）。 
+<spkm> 地面速率。单位：千米/时（引自 GPVTG 语句）。 
+<spkn> 地面速率。单位：节（引自 GPVTG 语句）。 
+<date> UTC 日期。格式：ddmmyy（引自 GPRMC 语句）。 
+dd    日 
+mm    月 
+yy    年 
+<nsat> 本系统可见卫星数量。固定两位数，前导位数不足则补 0（引自 GPGGA 语句）。 
+<errcode> 错误码。详细信息可参考第 4 章。 
+=== PAGE 20 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         19 / 27 
+ 
+ 
+2.3.6. AT+QGPSGNMEA  获取指定的 NMEA 语句 
+该命令用于获取指定的 NMEA 语句。使用该命令前，必须通过 AT+QGPS 打开 GNSS，并将参数
+<NMEA_src>设置为 1，然后通过 AT+QGPSGNMEA 获取指定的 NMEA 语句。 
+ 
+用户可以通过 AT+QGPSCFG="gpsnmeatype",0 禁用语句输出，即不再输出更新的语句，保存的是
+GNSS 激活后禁用语句输出前已获取的 NMEA 语句。如果保存的 NMEA 语句包含 AT+QGPSGNMEA 指定
+的语句类型，则依然可通过 AT+QGPSGNMEA 获取指定的 NMEA 语句。 
+AT+QGPSGNMEA  获取指定的 NMEA 语句 
+测试命令 
+AT+QGPSGNMEA=? 
+响应 
++QGPSGNMEA: ( 支持的<NMEA_type>列表) 
+ 
+OK 
+设置命令 
+查询 GGA 语句 
+AT+QGPSGNMEA="GGA" 
+响应 
+[+QGPSGNMEA: <GGA_sentence>] 
+[…] 
+ 
+OK 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+设置命令 
+查询 RMC 语句 
+AT+QGPSGNMEA="RMC" 
+响应 
+[+QGPSGNMEA: <RMC_sentence>] 
+[…] 
+ 
+OK 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+设置命令 
+查询 GSV 信息 
+AT+QGPSGNMEA="GSV" 
+响应 
+[+QGPSGNMEA: <GSV_sentence>] 
+[…] 
+ 
+OK 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+设置命令 
+查询 GSA 语句 
+AT+QGPSGNMEA="GSA" 
+响应 
+[+QGPSGNMEA: <GSA_sentence>] 
+[…] 
+ 
+OK 
+=== PAGE 21 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         20 / 27 
+ 
+ 
+参数 
+ 
+ 
+ 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+设置命令 
+查询 VTG 语句 
+AT+QGPSGNMEA="VTG" 
+响应 
+[+QGPSGNMEA: <VTG_sentence>] 
+[…] 
+ 
+OK 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+设置命令 
+查询 GLL 语句 
+AT+QGPSGNMEA="GLL" 
+响应 
+[+QGPSGNMEA: <GLL_sentence>] 
+[…] 
+ 
+OK 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+最大响应时间 300 毫秒 
+特性说明 / 
+<NMEA_type> 
+ 
+ 
+ 
+ 
+ 
+ 
+<GGA_sentence> 
+<RMC_sentence> 
+<GSV_sentence> 
+<GSA_sentence> 
+<VTG_sentence> 
+<GLL_sentence> 
+字符串类型。NMEA 语句类型。 
+"GGA" GGA 语句 
+"RMC" RMC 语句 
+"GSV" GSV 语句 
+"GSA" GSA 语句 
+"VTG" VTG 语句 
+"GLL" GLL 语句 
+字符串类型。GGA 语句。 
+字符串类型。RMC 语句。 
+字符串类型。GSV 语句。 
+字符串类型。GSA 语句。 
+字符串类型。VTG 语句。 
+字符串类型。GLL 语句。 
+<errcode> 错误码。详细信息可参考第 4 章。 
+=== PAGE 22 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         21 / 27 
+ 
+ 
+2.3.7. AT+QCFG="usb/nema"  启用/禁用 NMEA 口 
+该命令用于启用或禁用 NMEA 口。 
+参数 
+备注 
+举例 
+AT+QCFG="usb/nema",1  //启用 NMEA 口。 
+OK 
+AT+QCFG="usb/nema"  //查询 NMEA 口当前配置。 
++QCFG: "usb/nema",1 
+ 
+OK 
+ 
+AT+QCFG="usb/nema"  启用/禁用 NMEA 口 
+设置命令 
+AT+QCFG="usb/nema"[,<enable>] 
+响应 
+若省略可选参数，则查询当前配置： 
++QCFG: "usb/nema",<enable> 
+ 
+OK 
+ 
+若指定可选参数，则启用或禁用 NMEA 口： 
+OK 
+或者 
+ERROR 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+最大响应时间 300 毫秒 
+特性说明 该命令在模块重启后生效； 
+参数配置自动保存。 
+<enable> 整型。启用/禁用 NEMA 口。 
+0 禁用 
+1 启用 
+<errcode> 错误码。详细信息可参考第 4 章。 
+EC800M-CN 模块不支持该命令。 
+=== PAGE 23 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         22 / 27 
+ 
+ 
+2.3.8. AT+QAGPS  启用/禁用 AGPS 
+该命令用于启用或禁用 GNSS 的 AGPS 功能。 
+参数 
+备注 
+ 
+AT+QAGPS  启用/禁用 AGPS 功能 
+查询命令 
+AT+QAGPS? 
+响应 
++QAGPS: <enable> 
+ 
+OK 
+设置命令 
+AT+QAGPS=<enable> 
+响应 
+OK 
+ 
+若错误与 ME 功能相关： 
++CME ERROR: <errcode> 
+最大响应时间 300 毫秒 
+特性说明 该命令在模块重启后生效； 
+参数配置自动保存。 
+<enable> 整型。启用或禁用 AGPS 功能。 
+0 禁用 
+1 启用 
+<errcode> 错误码。详细信息可参考第 4 章。 
+EC800M-CN 模块不支持该命令。 
+=== PAGE 24 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         23 / 27 
+ 
+ 
+3 举例 
+ 
+3.1. 打开与关闭 GNSS 
+ 
+该示例使用默认参数来打开 GNSS。打开 GNSS 后，通过 AT+QGPSEND 可关闭 GNSS。 
+AT+QGPS=1      //打开 GNSS。 
+OK 
+AT+QGPSLOC=0    //获取定位信息。 
++QGPSLOC: 063416.40,3143.2951N,11713.0655E,0.6,224.9,2,162.57,17.6,9.5,110620,07 
+ 
+OK 
+AT+QGPSEND     //关闭 GNSS。 
+OK 
+ 
+3.2. GNSS 参数<NMEA_src>的应用 
+ 
+打开 GNSS 并将参数<NMEA_src>设为 1 后，可直接通过 AT+QGPSGNMEA 获取 NMEA 语句。 
+AT+QGPSCFG="nmeasrc",1    //将<NMEA_src>设为 1，使能通过 AT+QGPSGNMEA 
+          获取 NMEA 语句。 
+OK 
+AT+QGPSGNMEA="GGA"    //获取 GGA 语句。 
++QGPSGNMEA: $GPGGA,103647.000,3150.721154,N,11711.925873,E,1,02,4.7,59.8,M,-2.0,M,,*77 
+ 
+OK 
+AT+QGPSCFG="nmeasrc",0    //将<NMEA_src>设为 0，禁用通过 AT+QGPSGNMEA 
+          获取 NMEA 语句。 
+OK 
+AT+QGPSGNMEA="GGA"    //获取 GGA 语句。 
++CME ERROR: 507      //禁用通过 AT+QGPSGNMEA 获取 NMEA 语句，因此无法
+          获取 GGA 语句。 
+ 
+=== PAGE 25 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         24 / 27 
+ 
+ 
+3.3. AGPS 功能应用 
+AT+QAGPS=1 启用 AGPS 功能。在联网正常的前提下，每次模块开机并打开GNSS 后均能自动获取
+星历数据，实现快速定位。 
+AT+QAGPS=1     //开启 AGPS 功能。 
+OK 
+AT+QGPS=1      //打开 GNSS。 
+OK 
+ 
+ 
+=== PAGE 26 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         25 / 27 
+ 
+ 
+4 错误码 
+ 
+<errcode>表示与 GNSS 操作相关的错误，详细的<errcode>参数值，见下表。 
+ 
+表 2：错误码列表 
+ 
+ 
+<errcode> 错误码 中文解释 
+501 Invalid parameter(S) 无效参数 
+502 Operation not supported 操作不支持 
+503 GNSS subsystem busy GNSS 子系统繁忙 
+504 Session is ongoing 会话仍在进行 
+505 Session not active 会话未激活 
+506 Operation timeout 操作超时 
+507 Function not enabled 功能未使能 
+508 Time information error 时间信息错误 
+512 Validity time is out of range 已过有效期 
+513 Internal resource error 内部资源错误 
+514 GNSS locked GNSS 锁住 
+515 End by E911 由 E911 结束 
+516 Not fixed now 当前未定位 
+517 CMUX port is not opened CMUX 端口未打开 
+549 Unknown error 未知错误 
+=== PAGE 27 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         26 / 27 
+ 
+ 
+5 附录 参考文档及术语缩写 
+ 
+表 3：术语缩写 
+缩写 英文全称 中文全称 
+AGPS Assisted GPS (Global Positioning System) 辅助全球定位系统 
+BeiDou BeiDou Navigation Satellite System 北斗卫星导航系统 
+DOP Dilution of Precision 精度因子 
+Galileo Galileo Satellite Navigation System 伽利略卫星导航系统 
+GGA Global Positioning System Fix Data 全球定位系统修正数据 
+GLONASS Global Navigation Satellite System 格洛纳斯卫星导航系统 
+GNSS Global Navigation Satellite System 全球导航卫星系统 
+GPS Global Positioning System 全球位置测定系统 
+GSA GPS DOP and Active Satellites 当前卫星信息 
+GSV Satellites in View 可见卫星 
+ME Mobile Equipment 移动设备 
+MS Mobile Station 移动电台 
+NMEA NMEA (National Marine Electronics Association) 
+0183 Interface Standard 
+NMEA（美国国家海洋电子协会）
+0183 接口标准 
+NVRAM Non-Volatile Random Access Memory 非易失性随机存取存储器 
+RAM Random Access Memory 随机存取存储器 
+RMC Recommended Minimum Specific GNSS Data 推荐的最少专用 GNSS 数据 
+UART Universal Asynchronous Receiver & Transmitter 通用费同步收发传输器 
+USB Universal Serial Bus 通用串行总线 
+=== PAGE 28 ===
+                                                                        
+                                      EC200N-CN&EC800M-CN&EG915N 系列 GNSS 应用指导 
+ 
+上海移远通信技术股份有限公司                                                         27 / 27 
+ 
+ 
+ 
+ 
+ 
+UTC Universal Time Code 国际标准时间码 
+VTG Course Over Ground and Ground Speed 地面速度信息 
