@@ -598,33 +598,7 @@ function renderFences() {
       }
     } catch (err) { /* 发光效果失败静默跳过 */ }
 
-    // 3. 围栏名称 HTML Marker（独立于 GL 图层，不怕字体缺失）
-    if (centroidLng != null && centroidLat != null) {
-      try {
-        const el = document.createElement('div')
-        el.style.cssText = [
-          'background:rgba(200,20,20,0.90)',
-          'color:#fff',
-          'padding:3px 10px',
-          'border-radius:12px',
-          'font-size:12px',
-          'font-weight:700',
-          'white-space:nowrap',
-          'pointer-events:none',
-          'box-shadow:0 2px 8px rgba(0,0,0,0.4)',
-          'border:1.5px solid rgba(255,200,200,0.6)',
-          'letter-spacing:.5px',
-        ].join(';')
-        el.textContent = f.name
-        fenceNameMarkers.push(
-          new maplibregl.Marker({ element: el, anchor: 'center' })
-            .setLngLat([centroidLng, centroidLat])
-            .addTo(map)
-        )
-      } catch (err) {
-        console.error(`[围栏标注] ${sid} Marker 添加失败:`, err)
-      }
-    }
+    // 围栏名称不在地图上显示（名称见左侧列表与点击弹窗）
   })
 
   // GL 层已加（用于 click hit-test），再用 2D canvas 绘制可见视觉效果

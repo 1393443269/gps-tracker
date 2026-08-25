@@ -315,6 +315,17 @@ async function loadDevices() {
   } catch {} finally { devLoading.value = false }
 }
 
+// 按设备状态/角色生成标记样式：报警红优先，否则用角色颜色+形状（圆/方/星/菱）
+function markerCss(d) {
+  const alarm = d.status === 2
+  const color = alarm ? '#f56c6c' : (d.status === 0 ? '#ccc' : (d.role_color || '#67c23a'))
+  const shape = d.role_icon || '圆形'
+  let form = 'border-radius:50%;'
+  if (shape === '方形')      form = 'border-radius:2px;'
+  else if (shape === '菱形') form = 'clip-path:polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);'
+  else if (shape === '星形') form = 'clip-path:polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);'
+  return `width:12px;height:12px;background:${color};border:2px solid #fff;box-shadow:0 0 6px rgba(0,0,0,.4);cursor:pointer;${form}`
+}
 function renderMarkers(list) {
   const phones = new Set(list.map(d => d.phone))
   Object.keys(markers).forEach(ph => {
@@ -322,13 +333,12 @@ function renderMarkers(list) {
   })
   list.forEach(d => {
     if (!d.last_lat || !d.last_lng) return
-    const color = d.status===2?'#f56c6c':d.status===1?'#67c23a':'#ccc'
     if (markers[d.phone]) {
       markers[d.phone].setLngLat([d.last_lng, d.last_lat])
-      markers[d.phone].getElement().style.background = color
+      markers[d.phone].getElement().style.cssText = markerCss(d)
     } else {
       const el = document.createElement('div')
-      el.style.cssText = `width:12px;height:12px;border-radius:50%;background:${color};border:2px solid #fff;box-shadow:0 0 6px rgba(0,0,0,.4);cursor:pointer;`
+      el.style.cssText = markerCss(d)
       markers[d.phone] = new maplibregl.Marker({ element: el })
         .setLngLat([d.last_lng, d.last_lat]).addTo(realtimeMap)
       el.addEventListener('click', () => selectDevice(d))

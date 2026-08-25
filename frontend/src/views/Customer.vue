@@ -53,11 +53,13 @@
         </template>
       </el-table-column>
       <el-table-column prop="remark" label="备注" min-width="100" />
-      <el-table-column label="操作" width="200" fixed="right">
+      <el-table-column label="操作" width="230" fixed="right">
         <template #default="{ row }">
-          <el-button size="small" @click="openModal(row)">编辑</el-button>
-          <el-button size="small" type="primary" plain @click="openDeviceAssign(row)">分配设备</el-button>
-          <el-button size="small" type="danger" @click="remove(row)">删除</el-button>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:nowrap;">
+            <el-button size="small" @click="openModal(row)">编辑</el-button>
+            <el-button size="small" type="primary" plain @click="openDeviceAssign(row)">分配设备</el-button>
+            <el-button size="small" type="danger" @click="remove(row)">删除</el-button>
+          </div>
         </template>
       </el-table-column>
     </el-table>
@@ -86,11 +88,13 @@
         </template>
       </el-table-column>
       <el-table-column prop="remark" label="备注" min-width="120" />
-      <el-table-column label="操作" width="200" fixed="right">
+      <el-table-column label="操作" width="230" fixed="right">
         <template #default="{ row }">
-          <el-button size="small" @click="openModal(row)">编辑</el-button>
-          <el-button size="small" type="primary" plain @click="openDeviceAssign(row)">分配设备</el-button>
-          <el-button size="small" type="danger" @click="remove(row)">删除</el-button>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:nowrap;">
+            <el-button size="small" @click="openModal(row)">编辑</el-button>
+            <el-button size="small" type="primary" plain @click="openDeviceAssign(row)">分配设备</el-button>
+            <el-button size="small" type="danger" @click="remove(row)">删除</el-button>
+          </div>
         </template>
       </el-table-column>
     </el-table>

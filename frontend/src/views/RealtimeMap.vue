@@ -13,7 +13,7 @@
         @click="item.hasLoc ? flyTo(item.phone) : null"
         :style="item.hasLoc ? 'cursor:pointer' : 'cursor:default;opacity:.7'"
       >
-        <el-icon :color="item.alarm ? '#f56c6c' : '#67c23a'" style="flex-shrink:0;"><Location /></el-icon>
+        <el-icon :color="item.alarm ? '#f56c6c' : (item.roleColor || '#67c23a')" style="flex-shrink:0;"><Location /></el-icon>
         <span class="phone">{{ item.phone }}</span>
         <span class="devname">{{ item.name || '—' }}</span>
         <span v-if="!item.hasLoc" style="font-size:10px;color:#aaa;margin-left:4px">无坐标</span>
@@ -47,7 +47,8 @@ const onlineDevices = computed(() => {
   const phones  = new Set(withLoc.map(d => d.phone))
   const noLoc   = allOnlineDevices.value
     .filter(d => !phones.has(String(d.phone)))
-    .map(d => ({ phone: String(d.phone), name: d.name || '', alarm: d.status === 2, hasLoc: false }))
+    .map(d => ({ phone: String(d.phone), name: d.name || '', alarm: d.status === 2, hasLoc: false,
+                 roleName: d.role_name, roleColor: d.role_color, roleIcon: d.role_icon }))
   return [...withLoc, ...noLoc]
 })
 
@@ -57,17 +58,29 @@ let map
 let socket
 let onlineTimer = null
 
-// ── 标记元素 ──────────────────────────────────────────────────────────────────
-function makeMarkerEl(alarm) {
-  const el = document.createElement('div')
-  const color = alarm ? '#f56c6c' : '#409eff'
+// ── 标记元素（按角色颜色+形状渲染，报警时红色高亮） ─────────────────────────────
+function applyMarkerStyle(el, info) {
+  const alarm = info.alarm
+  // 报警时统一红色高亮；否则用角色颜色，无角色回落默认蓝
+  const color = alarm ? '#f56c6c' : (info.roleColor || '#409eff')
+  const shape = info.roleIcon || '圆形'
   el.className = alarm ? 'dev-marker dev-marker-alarm' : 'dev-marker'
-  el.style.cssText = [
-    'width:14px', 'height:14px', 'border-radius:50%',
+  const css = [
+    'width:14px', 'height:14px',
     `background:${color}`, 'border:2px solid #fff',
     'box-shadow:0 0 6px rgba(0,0,0,.4)', 'cursor:pointer',
-  ].join(';')
+    'clip-path:none', 'border-radius:0',
+  ]
+  // 菱形/星形用 clip-path（不用 transform:rotate——会被 maplibre 定位的 transform 覆盖）
+  if (shape === '圆形')      css.push('border-radius:50%')
+  else if (shape === '菱形') css.push('clip-path:polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)')
+  else if (shape === '星形') css.push('clip-path:polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%)')
+  else                       css.push('border-radius:2px')  // 方形
+  el.style.cssText = css.join(';')
   return el
+}
+function makeMarkerEl(info) {
+  return applyMarkerStyle(document.createElement('div'), info)
 }
 
 // HTML 转义，防止 XSS（phone/time 等字段来自服务端）
@@ -77,8 +90,11 @@ function _esc(s) {
 }
 
 function popupHtml(info) {
+  const roleLine = info.roleName
+    ? `角色: <span style="color:${_esc(info.roleColor || '#409eff')}">${_esc(info.roleName)}</span><br>`
+    : ''
   return `<b>${_esc(info.phone)}</b><br>
-    纬度: ${Number(info.lat).toFixed(6)}<br>
+    ${roleLine}纬度: ${Number(info.lat).toFixed(6)}<br>
     经度: ${Number(info.lng).toFixed(6)}<br>
     速度: ${_esc(info.speed)} km/h<br>
     时间: ${_esc(info.time)}<br>
@@ -92,22 +108,24 @@ function updateMarker(info) {
 
   if (markerStore[phone]) {
     const { marker, popup } = markerStore[phone]
-    const merged = { ...info, name: info.name ?? markerStore[phone].info?.name ?? '' }
-
+    const prev = markerStore[phone].info || {}
+    // 合并：新推送可能不含角色字段（如报警事件），沿用已有的
+    const merged = {
+      ...prev, ...info,
+      name:      info.name      ?? prev.name      ?? '',
+      roleName:  info.roleName  ?? prev.roleName,
+      roleColor: info.roleColor ?? prev.roleColor,
+      roleIcon:  info.roleIcon  ?? prev.roleIcon,
+    }
     marker.setLngLat([lng, lat])
-
-    // 更新颜色和动画类
-    const el = marker.getElement()
-    el.style.background = merged.alarm ? '#f56c6c' : '#409eff'
-    el.className = merged.alarm ? 'dev-marker dev-marker-alarm' : 'dev-marker'
-
+    applyMarkerStyle(marker.getElement(), merged)   // 按角色颜色+形状重绘
     popup.setHTML(popupHtml(merged))
     markerStore[phone].info = merged
   } else {
     const popup = new maplibregl.Popup({ closeButton: true, maxWidth: '240px' })
       .setHTML(popupHtml(info))
 
-    const marker = new maplibregl.Marker({ element: makeMarkerEl(info.alarm) })
+    const marker = new maplibregl.Marker({ element: makeMarkerEl(info) })
       .setLngLat([lng, lat])
       .setPopup(popup)
       .addTo(map)
@@ -141,6 +159,9 @@ async function loadInitialPositions() {
           speed: d.last_speed != null ? (d.last_speed / 10).toFixed(1) : '0.0',
           alarm: d.status === 2,
           time:  d.last_location_time || '',
+          roleName:  d.role_name,
+          roleColor: d.role_color,
+          roleIcon:  d.role_icon,
         })
       }
     }
@@ -177,6 +198,9 @@ function connectSocket() {
       speed: String(data.speed),
       alarm: data.alarm,
       time:  data.time,
+      roleName:  data.roleName,
+      roleColor: data.roleColor,
+      roleIcon:  data.roleIcon,
     })
   })
 

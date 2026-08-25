@@ -36,6 +36,14 @@ export const authApi = {
   changePassword: (data) => http.post('/auth/change_password', data),
 }
 
+// ── 文件上传（头像等） ─────────────────────────────────────────────────────────
+// el-upload 用：上传地址 + 鉴权头
+export const UPLOAD_AVATAR_URL = '/api/upload/avatar'
+export function uploadHeaders() {
+  const token = localStorage.getItem('admin_token')
+  return token ? { 'X-Admin-Token': token } : {}
+}
+
 // ── 设备 ─────────────────────────────────────────────────────────────────────
 export const deviceApi = {
   list:              (params)       => http.get('/devices', { params }),
@@ -63,8 +71,9 @@ export const locationApi = {
 
 // ── 报警 ─────────────────────────────────────────────────────────────────────
 export const alarmApi = {
-  list:   (params)   => http.get('/alarms', { params }),
-  handle: (id, data) => http.put(`/alarms/${id}/handle`, data),
+  list:        (params)     => http.get('/alarms', { params }),
+  handle:      (id, data)   => http.put(`/alarms/${id}/handle`, data),
+  batchHandle: (ids, data)  => http.post('/alarms/batch_handle', { ids, ...data }),
 }
 
 // ── 报警规则 ──────────────────────────────────────────────────────────────────

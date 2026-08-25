@@ -23,7 +23,7 @@
     <!-- 顶栏 -->
     <el-row :gutter="12" style="margin-bottom:14px;" align="middle">
       <el-col :span="7">
-        <el-input v-model="keyword" placeholder="ICCID / IMSI / 运营商" clearable @change="load">
+        <el-input v-model="keyword" placeholder="ICCID / IMSI / 运营商 / 设备IMEI" clearable @change="load">
           <template #prefix><el-icon><Search /></el-icon></template>
         </el-input>
       </el-col>
@@ -46,9 +46,20 @@
     </el-row>
 
     <!-- 表格 -->
-    <el-table :data="list" border stripe v-loading="loading" size="small">
-      <el-table-column prop="iccid"     label="ICCID"  width="195" />
-      <el-table-column prop="operator"  label="运营商" width="90" />
+    <el-table :data="list" border stripe v-loading="loading" size="small"
+      :empty-text="admin ? '暂无 SIM 卡，点右上角「新增 SIM 卡」录入' : '当前账号下暂无 SIM 卡'">
+      <el-table-column label="ICCID" min-width="195">
+        <template #default="{ row }"><span v-html="highlight(row.iccid)" /></template>
+      </el-table-column>
+      <el-table-column label="绑定设备" min-width="150">
+        <template #default="{ row }">
+          <span v-if="row.device_phone" v-html="highlight(row.device_phone)" />
+          <span v-else style="color:#ccc;font-size:12px;">未绑定</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="运营商" min-width="90">
+        <template #default="{ row }"><span v-html="highlight(row.operator)" /></template>
+      </el-table-column>
       <el-table-column prop="plan"      label="套餐"   width="110" />
       <el-table-column label="余额" width="90">
         <template #default="{ row }">
@@ -77,13 +88,14 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column prop="device_phone" label="绑定设备" width="130" />
-      <el-table-column label="操作" width="210" fixed="right">
+      <el-table-column label="操作" width="260" fixed="right">
         <template #default="{ row }">
-          <el-button size="small" @click="openModal(row)">编辑</el-button>
-          <el-button v-if="admin" size="small" @click="openBind(row)">绑定</el-button>
-          <el-button size="small" type="primary" @click="openRecharge(row)">充值</el-button>
-          <el-button v-if="admin" size="small" type="danger" @click="remove(row)">删除</el-button>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:nowrap;">
+            <el-button size="small" @click="openModal(row)">编辑</el-button>
+            <el-button v-if="admin" size="small" @click="openBind(row)">绑定</el-button>
+            <el-button size="small" type="primary" @click="openRecharge(row)">充值</el-button>
+            <el-button v-if="admin" size="small" type="danger" @click="remove(row)">删除</el-button>
+          </div>
         </template>
       </el-table-column>
     </el-table>
@@ -138,12 +150,19 @@
     </el-dialog>
 
     <!-- 绑定设备弹窗 -->
-    <el-dialog v-model="bindVisible" title="绑定设备" width="400px">
-      <el-form label-width="90px">
-        <el-form-item label="设备手机号">
-          <el-input v-model="bindPhone" placeholder="输入808设备手机号，空则解绑" />
-        </el-form-item>
-      </el-form>
+    <el-dialog v-model="bindVisible" title="绑定设备" width="440px">
+      <div style="margin-bottom:12px;font-size:13px;color:#606266;">
+        SIM 卡 <b>{{ currentSim?.iccid }}</b> 绑定至设备：
+      </div>
+      <el-select v-model="bindPhone" placeholder="请选择设备（清空则解绑）"
+        filterable clearable style="width:100%" :loading="deviceLoading">
+        <el-option
+          v-for="d in deviceOptions"
+          :key="d.phone"
+          :label="`${d.name ? d.name + ' — ' : ''}${d.phone}${d.terminal_model ? ' (' + d.terminal_model + ')' : ''}`"
+          :value="d.phone"
+        />
+      </el-select>
       <template #footer>
         <el-button @click="bindVisible = false">取消</el-button>
         <el-button type="primary" @click="doBind">确认</el-button>
@@ -176,7 +195,7 @@
 import { ref, onMounted } from 'vue'
 import { Plus, Search } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { simApi, rechargeApi, portalApi, isAdmin } from '@/api'
+import { simApi, rechargeApi, portalApi, deviceApi, isAdmin } from '@/api'
 
 const admin = isAdmin()
 
@@ -203,14 +222,31 @@ const form = ref({
 })
 
 // bind
-const bindVisible = ref(false)
-const bindPhone   = ref('')
-const currentSim  = ref(null)
+const bindVisible   = ref(false)
+const bindPhone     = ref('')
+const currentSim    = ref(null)
+const deviceOptions = ref([])
+const deviceLoading = ref(false)
 
 // recharge
 const rechargeVisible = ref(false)
 const rechargeAmount  = ref(100)
 const rechargeMethod  = ref('支付宝')
+
+// ── 关键词高亮（先转义防 XSS，再包裹命中片段）────────────────────────────────
+function _esc(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;')
+}
+function highlight(text) {
+  const safe = _esc(text)
+  const kw = keyword.value.trim()
+  if (!kw) return safe
+  // 转义正则特殊字符，避免用户输入含 . * 等导致匹配异常
+  const escKw = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return safe.replace(new RegExp(escKw, 'gi'),
+    m => `<mark style="background:#ffe58f;color:inherit;padding:0 1px;border-radius:2px;">${m}</mark>`)
+}
 
 // ── 样式辅助 ─────────────────────────────────────────────────────────────────
 function balanceStyle(bal) {
@@ -248,7 +284,22 @@ async function load() {
     const res = admin
       ? await simApi.list(params)
       : await portalApi.sims.list(params)
-    list.value  = res.data?.records || []
+    let records = res.data?.records || []
+    // 有关键词时按匹配精度置顶：完全相等 > 开头匹配 > 包含
+    const kw = keyword.value.trim().toLowerCase()
+    if (kw) {
+      const rank = (row) => {
+        const fields = [row.iccid, row.imsi, row.operator, row.device_phone]
+          .map(v => String(v ?? '').toLowerCase())
+        if (fields.some(f => f === kw))            return 0   // 完全匹配
+        if (fields.some(f => f.startsWith(kw)))    return 1   // 开头匹配
+        return 2                                              // 包含匹配
+      }
+      records = records.map((r, i) => ({ r, i }))
+        .sort((a, b) => rank(a.r) - rank(b.r) || a.i - b.i)   // 同级保持原顺序
+        .map(x => x.r)
+    }
+    list.value  = records
     total.value = res.data?.total   || 0
   } finally {
     loading.value = false
@@ -286,10 +337,22 @@ async function remove(row) {
   loadExpiring()
 }
 
-function openBind(row) {
+async function openBind(row) {
   currentSim.value = row
   bindPhone.value  = row.device_phone || ''
   bindVisible.value = true
+  await loadDevices()
+}
+
+async function loadDevices() {
+  if (deviceOptions.value.length) return
+  deviceLoading.value = true
+  try {
+    const res = await deviceApi.list({ size: 500 })
+    deviceOptions.value = res.data?.records || []
+  } catch {} finally {
+    deviceLoading.value = false
+  }
 }
 
 async function doBind() {

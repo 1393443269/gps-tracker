@@ -1,15 +1,17 @@
 <template>
   <el-container style="height: 100vh;">
     <!-- 侧边导航 -->
-    <el-aside width="210px" style="background: #001529; display:flex; flex-direction:column;">
+    <el-aside width="210px" style="background: #ffffff; display:flex; flex-direction:column; border-right:1px solid #e6e8eb;">
       <div class="logo">
-        <img v-if="platformLogo" :src="platformLogo" style="height:26px;margin-right:6px;vertical-align:middle;" />
-        <span>{{ platformTitle }}</span>
+        <span v-if="platformLogo" class="logo-badge">
+          <img :src="platformLogo" />
+        </span>
+        <span class="logo-title">{{ platformTitle }}</span>
       </div>
       <el-menu
         :default-active="activeMenu"
-        background-color="#001529"
-        text-color="#c0c4cc"
+        background-color="#ffffff"
+        text-color="#4a5568"
         active-text-color="#409eff"
         style="flex:1; overflow-y:auto; border-right:none;"
         router
@@ -29,6 +31,9 @@
         </el-menu-item>
         <el-menu-item index="/fence">
           <el-icon><Position /></el-icon><span>电子围栏</span>
+        </el-menu-item>
+        <el-menu-item v-if="isAdmin" index="/health">
+          <el-icon><FirstAidKit /></el-icon><span>健康数据</span>
         </el-menu-item>
         <el-menu-item index="/query">
           <el-icon><Search /></el-icon><span>设备查询</span>
@@ -80,9 +85,6 @@
         </el-menu-item>
         <el-menu-item v-if="isAdmin" index="/attendance">
           <el-icon><Calendar /></el-icon><span>考勤统计</span>
-        </el-menu-item>
-        <el-menu-item v-if="isAdmin" index="/health">
-          <el-icon><FirstAidKit /></el-icon><span>健康数据</span>
         </el-menu-item>
         <el-menu-item index="/recharges">
           <el-icon><WalletFilled /></el-icon><span>充值管理</span>
@@ -168,7 +170,10 @@ async function loadPlatform() {
     const res = await platformApi.get()
     const d = res.data || {}
     if (d.account_title) platformTitle.value = d.account_title
-    if (d.logo_url)      platformLogo.value  = d.logo_url
+    if (d.logo_url) {
+      platformLogo.value = /^https?:\/\//.test(d.logo_url)
+        ? d.logo_url : (window.location.origin + d.logo_url)
+    }
   } catch {}
 }
 
@@ -257,20 +262,59 @@ onUnmounted(() => clearInterval(timer))
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #fff;
+  gap: 8px;
+  color: #1d2f45;
   font-size: 15px;
   font-weight: 600;
-  border-bottom: 1px solid #1d2f45;
+  border-bottom: 1px solid #e6e8eb;
   flex-shrink: 0;
+  padding: 0 10px;
+}
+/* 浅色侧边栏下 Logo 白底天然融入，无需卡片 */
+.logo-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 34px;
+  flex-shrink: 0;
+}
+.logo-badge img {
+  height: 30px;
+  max-width: 100px;
+  object-fit: contain;
+  display: block;
+}
+.logo-title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #1d2f45;
 }
 .menu-group-label {
   padding: 12px 20px 4px;
   font-size: 11px;
-  color: #4a5568;
+  color: #909399;
   letter-spacing: 0.05em;
   text-transform: uppercase;
 }
 .alarm-badge {
   margin-left: 8px;
+}
+
+/* 浅色侧边栏：菜单项悬停/选中态 */
+:deep(.el-menu-item:hover) {
+  background-color: #f0f2f5 !important;
+}
+:deep(.el-menu-item.is-active) {
+  background-color: #ecf5ff !important;
+  font-weight: 600;
+}
+/* 选中项左侧蓝色高亮条 */
+:deep(.el-menu-item.is-active)::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: #409eff;
 }
 </style>

@@ -18,7 +18,14 @@
           }" />
         </template>
       </el-table-column>
-      <el-table-column prop="icon_type" label="角色图标" width="90" align="center" />
+      <el-table-column label="角色图标" width="100" align="center">
+        <template #default="{ row }">
+          <span style="display:inline-flex;align-items:center;gap:6px;justify-content:center;">
+            <span :style="iconStyle(row.color, row.icon_type, 14)" />
+            <span style="font-size:12px;">{{ row.icon_type }}</span>
+          </span>
+        </template>
+      </el-table-column>
       <el-table-column prop="device_count" label="设备数" width="80" align="center">
         <template #default="{ row }">
           <el-tag size="small" :type="row.device_count > 0 ? 'primary' : 'info'">
@@ -52,8 +59,12 @@
         </el-form-item>
         <el-form-item label="角色图标">
           <el-select v-model="form.icon_type" style="width:100%">
-            <el-option label="圆形" value="圆形" />
-            <el-option label="方形" value="方形" />
+            <el-option v-for="opt in ICON_TYPES" :key="opt" :label="opt" :value="opt">
+              <span style="display:flex;align-items:center;gap:8px;">
+                <span :style="iconStyle(form.color || '#409EFF', opt)" />
+                {{ opt }}
+              </span>
+            </el-option>
           </el-select>
         </el-form-item>
         <el-form-item label="角色描述">
@@ -75,11 +86,7 @@
             <el-option v-for="r in list" :key="r.id"
               :label="r.name" :value="r.id">
               <span style="display:flex;align-items:center;gap:8px;">
-                <span :style="{
-                  display:'inline-block',width:'10px',height:'10px',
-                  borderRadius: r.icon_type==='圆形'?'50%':'2px',
-                  background:r.color
-                }" />
+                <span :style="iconStyle(r.color, r.icon_type, 10)" />
                 {{ r.name }}
               </span>
             </el-option>
@@ -122,6 +129,30 @@ import { ref, reactive, computed, onMounted, nextTick } from 'vue'
 import { Plus, Grid, Edit as EditIcon, Delete } from '@element-plus/icons-vue'
 import { roleApi, deviceApi } from '@/api'
 import { ElMessage, ElMessageBox } from 'element-plus'
+
+// ── 角色图标形状 ──────────────────────────────────────────────────────────────
+const ICON_TYPES = ['圆形', '方形', '星形', '菱形']
+
+// 根据颜色和形状生成小色块样式（供下拉/列表/分配处统一复用）
+function iconStyle(color, type, size = 12) {
+  const base = {
+    display: 'inline-block',
+    width: `${size}px`,
+    height: `${size}px`,
+    background: color || '#409EFF',
+    flexShrink: 0,
+  }
+  if (type === '圆形') return { ...base, borderRadius: '50%' }
+  if (type === '菱形') return { ...base, transform: 'rotate(45deg)', borderRadius: '2px' }
+  if (type === '星形') {
+    return {
+      ...base,
+      clipPath: 'polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%)',
+    }
+  }
+  // 方形（默认）
+  return { ...base, borderRadius: '2px' }
+}
 
 // ── 列表 ─────────────────────────────────────────────────────────────────────
 const list    = ref([])

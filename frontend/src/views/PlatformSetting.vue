@@ -32,7 +32,27 @@
             </el-col>
             <el-col :span="12">
               <el-form-item label="平台Logo">
-                <el-input v-model="setting.logo_url" placeholder="Logo 图片 URL" />
+                <el-upload
+                  :action="UPLOAD_AVATAR_URL"
+                  :headers="uploadHeaders()"
+                  :show-file-list="false"
+                  accept="image/*"
+                  :before-upload="beforeLogoUpload"
+                  :on-success="onLogoSuccess"
+                  :on-error="onLogoError">
+                  <img v-if="setting.logo_url" :src="logoSrc(setting.logo_url)"
+                    style="height:64px;max-width:180px;object-fit:contain;border:1px solid #eee;border-radius:6px;" />
+                  <div v-else class="logo-uploader-empty">
+                    <el-icon><Plus /></el-icon>
+                    <span style="font-size:12px;margin-top:4px;">上传Logo</span>
+                  </div>
+                </el-upload>
+                <el-button v-if="setting.logo_url" link type="danger" size="small"
+                  style="margin-top:6px;" @click="setting.logo_url = ''">移除</el-button>
+                <div style="font-size:12px;color:#909399;margin-top:4px;line-height:1.5;">
+                  建议横版图，尺寸 ≤ {{ LOGO_MAX_W }}×{{ LOGO_MAX_H }} 像素、≤ {{ LOGO_MAX_MB }}MB；<br>
+                  推荐透明底 PNG，显示更佳
+                </div>
               </el-form-item>
             </el-col>
             <el-col :span="24">
@@ -99,12 +119,63 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted, watch } from 'vue'
-import { platformApi, oplogApi } from '@/api'
+import { Plus } from '@element-plus/icons-vue'
+import { platformApi, oplogApi, UPLOAD_AVATAR_URL, uploadHeaders } from '@/api'
 import { ElMessage } from 'element-plus'
 
 const activeTab = ref('info')
 const loading   = ref(false)
 const saving    = ref(false)
+
+// Logo 相对路径 → 完整可访问地址
+function logoSrc(url) {
+  if (!url) return ''
+  return /^https?:\/\//.test(url) ? url : (window.location.origin + url)
+}
+// ── Logo 上传回调 ──
+// Logo 尺寸限制（显示区域很小，超大图纯属浪费带宽）
+const LOGO_MAX_MB = 1        // 文件 ≤ 1MB
+const LOGO_MAX_W  = 1000     // 宽 ≤ 1000px
+const LOGO_MAX_H  = 400      // 高 ≤ 400px
+
+function beforeLogoUpload(file) {
+  if (!file.type.startsWith('image/')) {
+    ElMessage.error('只能上传图片'); return false
+  }
+  if (file.size / 1024 / 1024 >= LOGO_MAX_MB) {
+    ElMessage.error(`图片不能超过 ${LOGO_MAX_MB}MB`); return false
+  }
+  // 校验像素尺寸（异步读图）
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const img = new Image()
+    img.onload = () => {
+      URL.revokeObjectURL(url)
+      if (img.width > LOGO_MAX_W || img.height > LOGO_MAX_H) {
+        ElMessage.error(`图片尺寸不能超过 ${LOGO_MAX_W}×${LOGO_MAX_H} 像素（当前 ${img.width}×${img.height}）`)
+        reject()
+      } else {
+        resolve()
+      }
+    }
+    img.onerror = () => {
+      URL.revokeObjectURL(url)
+      ElMessage.error('图片读取失败'); reject()
+    }
+    img.src = url
+  })
+}
+function onLogoSuccess(res) {
+  if (res?.code === 200 && res.data?.url) {
+    setting.logo_url = res.data.url
+    ElMessage.success('Logo 已上传，别忘了点保存')
+  } else {
+    ElMessage.error(res?.msg || '上传失败')
+  }
+}
+function onLogoError() {
+  ElMessage.error('上传失败，请重试')
+}
 
 const setting = reactive({
   bigscreen_title: '资产管理平台', account_title: '资产管理平台',
@@ -173,3 +244,23 @@ watch(activeTab, (v) => {
 
 onMounted(() => loadSetting())
 </script>
+
+<style scoped>
+.logo-uploader-empty {
+  width: 120px;
+  height: 64px;
+  border: 1px dashed #d9d9d9;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: #8c939d;
+  cursor: pointer;
+  transition: border-color .2s;
+}
+.logo-uploader-empty:hover {
+  border-color: #409eff;
+  color: #409eff;
+}
+</style>

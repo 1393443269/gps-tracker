@@ -21,7 +21,7 @@ import base64
 import time as _time_mod
 
 from datetime import datetime
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file as _send_abs
 import re as _re
 from flask_socketio import SocketIO, join_room
 from flask_cors import CORS
@@ -49,6 +49,11 @@ if _db_dir:
     os.makedirs(_db_dir, exist_ok=True)
 TCP_PORT = 9090
 HTTP_PORT = 8080
+
+# 上传文件目录（头像等），支持环境变量指定（Docker 挂载卷持久化）
+UPLOAD_DIR = os.environ.get('UPLOAD_DIR', os.path.join(BASE_DIR, 'uploads'))
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+_ALLOWED_IMG_EXT = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
 
 def _hash_pw(pwd: str) -> str:
     return hashlib.sha256(pwd.encode('utf-8')).hexdigest()
@@ -301,7 +306,7 @@ def init_db():
         pass
 
     # ── 组织隔离：给业务表加 org_id（DEFAULT 1 = 根组织，存量数据自动归根） ──────
-    for _tbl in ('device', 'customer', 'geo_fence', 'alarm_record'):
+    for _tbl in ('device', 'customer', 'geo_fence', 'alarm_record', 'op_log', 'alarm_rule'):
         try:
             conn.execute(f"ALTER TABLE {_tbl} ADD COLUMN org_id INTEGER DEFAULT 1")
             conn.commit()
@@ -311,7 +316,8 @@ def init_db():
     # ── customer 表：个人信息扩展（设备信息页使用） ───────────────────────────────
     for _col in ["gender  TEXT DEFAULT ''",
                  "age     INTEGER DEFAULT NULL",
-                 "address TEXT DEFAULT ''"]:
+                 "address TEXT DEFAULT ''",
+                 "avatar  TEXT DEFAULT ''"]:
         try:
             conn.execute(f"ALTER TABLE customer ADD COLUMN {_col}")
             conn.commit()
@@ -788,9 +794,15 @@ ALARM_TYPE_OPTIONS = [
 ]
 
 
-def _get_alarm_rule(alarm_type):
-    """返回该报警类型的规则 dict；无规则时返回默认（启用、页面推送、响几声）"""
-    row = db_query_one("SELECT * FROM alarm_rule WHERE alarm_type=? LIMIT 1", (alarm_type,))
+def _get_alarm_rule(alarm_type, org_id=1):
+    """返回该报警类型在指定组织下的规则 dict；先查本组织，再回退根组织，最后默认。"""
+    row = db_query_one(
+        "SELECT * FROM alarm_rule WHERE alarm_type=? AND org_id=? LIMIT 1",
+        (alarm_type, org_id))
+    if not row and org_id != 1:
+        row = db_query_one(
+            "SELECT * FROM alarm_rule WHERE alarm_type=? AND org_id=1 LIMIT 1",
+            (alarm_type,))
     if row:
         return row
     return {'enabled': 1, 'notify_page': 1, 'notify_sms': 0,
@@ -799,8 +811,10 @@ def _get_alarm_rule(alarm_type):
 
 def _emit_alarm(event, data, phone, alarm_type):
     """按报警规则决定是否推送到前端；附带 level/ringType 供前端提示。
-    规则关闭则完全静默（不推送）。"""
-    rule = _get_alarm_rule(alarm_type)
+    规则关闭则完全静默（不推送）。按设备所属组织取规则。"""
+    dev = db_query_one("SELECT org_id FROM device WHERE phone=?", (phone,))
+    org_id = (dev.get('org_id') if dev else 1) or 1
+    rule = _get_alarm_rule(alarm_type, org_id)
     if not rule.get('enabled', 1):
         return   # 该类报警已被规则关闭
     if rule.get('notify_page', 1):
@@ -950,6 +964,15 @@ def handle_location(sock, phone, serial, body):
                     'time':      gps_time,
                 }, canonical, bit)
 
+    # 查该设备的角色颜色/形状，随推送带给前端地图渲染
+    role_row = db_query_one(
+        "SELECT r.name AS role_name, r.color AS role_color, r.icon_type AS role_icon "
+        "FROM device LEFT JOIN device_role r ON device.role_id = r.id WHERE device.phone=?",
+        (canonical,))
+    role_name  = role_row.get('role_name')  if role_row else None
+    role_color = role_row.get('role_color') if role_row else None
+    role_icon  = role_row.get('role_icon')  if role_row else None
+
     # WebSocket 推送位置到前端（仅向该设备所属组织的客户端推送）
     _sio_emit('location_update', {
         'phone':     canonical,
@@ -961,6 +984,9 @@ def handle_location(sock, phone, serial, body):
         'alarm':     bool(alarm_flag),
         'alarmFlag': alarm_flag,
         'time':      gps_time,
+        'roleName':  role_name,
+        'roleColor': role_color,
+        'roleIcon':  role_icon,
     }, canonical)
 
     log.debug("[808] 位置: phone=%s lat=%.6f lng=%.6f speed=%.1fkm/h alarm=%d",
@@ -1126,24 +1152,30 @@ def list_devices():
     conds, params = [], []
     if kw:
         like = f'%{kw}%'
-        conds.append("(phone LIKE ? OR name LIKE ? OR plate_no LIKE ?)")
+        conds.append("(device.phone LIKE ? OR device.name LIKE ? OR device.plate_no LIKE ?)")
         params += [like, like, like]
     if lc != '':
         try:
-            conds.append("lifecycle=?"); params.append(int(lc))
+            conds.append("device.lifecycle=?"); params.append(int(lc))
         except ValueError:
             pass
     if st != '':
         try:
-            conds.append("status=?"); params.append(int(st))
+            conds.append("device.status=?"); params.append(int(st))
         except ValueError:
             pass
-    conds, params = _org_where(sids, conds, params)
+    # org 过滤用带表名的列，避免 JOIN 后 org_id 歧义
+    conds, params = _org_where(sids, conds, params, col='device.org_id')
 
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
-    total   = db_scalar(f"SELECT COUNT(*) FROM device {where}", params)
-    records = db_query(f"SELECT * FROM device {where} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
-                       params + [size, offset])
+    # JOIN 角色表，带出角色颜色/形状供地图与列表按角色渲染
+    base = "FROM device LEFT JOIN device_role r ON device.role_id = r.id"
+    total   = db_scalar(f"SELECT COUNT(*) {base} {where}", params)
+    records = db_query(
+        f"SELECT device.*, r.name AS role_name, r.color AS role_color, "
+        f"r.icon_type AS role_icon {base} "
+        f"{where} ORDER BY device.updated_at DESC LIMIT ? OFFSET ?",
+        params + [size, offset])
     return ok({'records': records, 'total': total, 'page': page, 'size': size})
 
 @app.post('/api/devices')
@@ -1308,7 +1340,7 @@ def devices_with_customer():
         "SELECT d.id, d.phone, d.name, d.terminal_model, d.last_location_time, "
         "       d.status, d.lifecycle, d.activated_at, d.customer_id, d.role_id, "
         "       r.name as role_name, r.color as role_color, r.icon_type, "
-        "       c.contact as real_name, c.gender, c.age, "
+        "       c.contact as real_name, c.gender, c.age, c.avatar, "
         "       c.phone as contact_phone, c.address, c.remark as customer_remark, "
         "       c.login_name as account, "
         "       (SELECT COUNT(*) FROM geo_fence gf "
@@ -1645,6 +1677,24 @@ def handle_alarm_api(aid):
     return ok()
 
 
+@app.post('/api/alarms/batch_handle')
+def batch_handle_alarms():
+    """批量处理报警（ids 列表）"""
+    data = request.get_json() or {}
+    ids  = data.get('ids', [])
+    if not ids:
+        return fail('ids 不能为空', 400)
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    ph  = ','.join('?' * len(ids))
+    db_exec(
+        f"UPDATE alarm_record SET status=1, handler=?, handle_note=?, handle_time=? "
+        f"WHERE id IN ({ph}) AND status=0",
+        [data.get('handler', '管理员'), data.get('note', ''), now] + list(ids)
+    )
+    add_op_log('批量处理报警', f'批量处理 {len(ids)} 条报警')
+    return ok({'handled': len(ids)})
+
+
 # ── 报警规则接口 ───────────────────────────────────────────────────────────────
 
 @app.get('/api/alarm-types')
@@ -1655,7 +1705,10 @@ def alarm_types():
 
 @app.get('/api/alarm-rules')
 def list_alarm_rules():
-    rows = db_query("SELECT * FROM alarm_rule ORDER BY id ASC")
+    sids = _org_scope_ids(request)
+    conds, params = _org_where(sids)   # 只看本组织范围内的报警规则
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    rows = db_query(f"SELECT * FROM alarm_rule {where} ORDER BY id ASC", params)
     name_map = {t: n for t, n in ALARM_TYPE_OPTIONS}
     for r in rows:
         r['alarm_type_name'] = name_map.get(r['alarm_type'], f'类型{r["alarm_type"]}')
@@ -1907,8 +1960,21 @@ def location_track():
 
 # ── 辅助：记操作日志 ───────────────────────────────────────────────────────────
 
-def add_op_log(action, detail, ip='127.0.0.1'):
-    db_exec("INSERT INTO op_log (action,detail,ip) VALUES (?,?,?)", (action, detail, ip))
+def add_op_log(action, detail, ip=None):
+    # 记录操作人所属组织与真实 IP，供操作日志按组织隔离
+    org_id = 1
+    try:
+        admin = _current_admin(request)
+        if admin:
+            org_id = admin.get('org_id') or 1
+        if ip is None:
+            ip = (request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+                  or request.remote_addr or '127.0.0.1')
+    except Exception:
+        if ip is None:
+            ip = '127.0.0.1'
+    db_exec("INSERT INTO op_log (action,detail,ip,org_id) VALUES (?,?,?,?)",
+            (action, detail, ip, org_id))
 
 
 # ── SIM 卡接口 ─────────────────────────────────────────────────────────────────
@@ -1935,9 +2001,9 @@ def list_sims():
     offset  = (page - 1) * size
     conds, params = [], []
     if kw:
-        conds.append("(iccid LIKE ? OR imsi LIKE ? OR operator LIKE ?)")
+        conds.append("(iccid LIKE ? OR imsi LIKE ? OR operator LIKE ? OR device_phone LIKE ?)")
         like = f'%{kw}%'
-        params += [like, like, like]
+        params += [like, like, like, like]
     if status:
         conds.append("status=?"); params.append(status)
     if expiring:
@@ -2094,6 +2160,7 @@ def list_customers():
     # 补充 has_children（树形展开用）和 parent_name（搜索模式显示归属用）
     parent_cache = {}
     for r in records:
+        r.pop('password_hash', None)   # 绝不把密码哈希返回给前端
         r['has_children'] = db_scalar(
             "SELECT COUNT(*) FROM customer WHERE parent_id=?", (r['id'],)) > 0
         pid = r.get('parent_id')
@@ -2148,11 +2215,23 @@ def create_customer():
 @app.put('/api/customers/<int:cid>')
 def update_customer(cid):
     d = request.get_json() or {}
+    # 设备信息页的编辑弹窗只提交部分字段；未提交的字段保留原值，避免被清空
+    cur = db_query_one(
+        "SELECT name,email,status,reg_date,avatar FROM customer WHERE id=?", (cid,))
+    if not cur:
+        return fail('客户不存在', 404)
+    pick = lambda k, col: d[k] if (k in d) else (cur.get(col) or '')
+    name     = pick('name', 'name')
+    email    = pick('email', 'email')
+    status   = d.get('status') if ('status' in d) else (cur.get('status') or '活跃')
+    reg_date = pick('reg_date', 'reg_date')
+    avatar   = pick('avatar', 'avatar')
     db_exec("UPDATE customer SET name=?,contact=?,phone=?,email=?,status=?,reg_date=?,remark=?,"
-            "gender=?,age=?,address=? WHERE id=?",
-            (d.get('name',''), d.get('contact',''), d.get('phone',''), d.get('email',''),
-             d.get('status','活跃'), d.get('reg_date',''), d.get('remark',''),
-             d.get('gender',''), d.get('age') or None, d.get('address',''), cid))
+            "gender=?,age=?,address=?,avatar=? WHERE id=?",
+            (name, d.get('contact',''), d.get('phone',''), email,
+             status, reg_date, d.get('remark',''),
+             d.get('gender',''), d.get('age') or None, d.get('address',''),
+             avatar, cid))
     # 同步更新登录账号/密码（若提供）
     login_name = (d.get('login_name') or '').strip()
     password   = (d.get('password')   or '').strip()
@@ -2169,6 +2248,36 @@ def update_customer(cid):
             db_exec("UPDATE customer SET login_name=? WHERE id=?", (login_name, cid))
     add_op_log('客户编辑', f'编辑客户 id={cid}')
     return ok()
+
+
+@app.post('/api/upload/avatar')
+def upload_avatar():
+    """上传头像图片，返回可访问的 URL。仅接受图片类型。"""
+    f = request.files.get('file')
+    if not f or not f.filename:
+        return fail('未收到文件', 400)
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in _ALLOWED_IMG_EXT:
+        return fail('仅支持 jpg/png/gif/webp 图片', 400)
+    # 用时间戳+随机串命名，避免覆盖和路径穿越
+    fname = f'avatar_{uuid.uuid4().hex}{ext}'
+    fpath = os.path.join(UPLOAD_DIR, fname)
+    f.save(fpath)
+    url = f'/uploads/{fname}'
+    return ok({'url': url})
+
+
+@app.get('/uploads/<path:filename>')
+def serve_upload(filename):
+    """提供上传文件（头像等）的访问。防路径穿越。"""
+    safe = os.path.normpath(filename).replace('\\', '/')
+    if safe.startswith('..') or safe.startswith('/'):
+        return fail('非法路径', 400)
+    fpath = os.path.join(UPLOAD_DIR, safe)
+    if not os.path.isfile(fpath):
+        return fail('文件不存在', 404)
+    return _send_abs(fpath)
+
 
 @app.delete('/api/customers/<int:cid>')
 def delete_customer(cid):
@@ -2372,8 +2481,12 @@ def list_oplogs():
     page   = int(request.args.get('page', 1))
     size   = int(request.args.get('size', 20))
     offset = (page - 1) * size
-    total   = db_scalar("SELECT COUNT(*) FROM op_log")
-    records = db_query("SELECT * FROM op_log ORDER BY created_at DESC LIMIT ? OFFSET ?", (size, offset))
+    sids   = _org_scope_ids(request)
+    conds, params = _org_where(sids)   # 按当前管理员组织范围过滤
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    total   = db_scalar(f"SELECT COUNT(*) FROM op_log {where}", params)
+    records = db_query(f"SELECT * FROM op_log {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                       params + [size, offset])
     return ok({'records': records, 'total': total, 'page': page})
 
 
@@ -2506,14 +2619,35 @@ def _get_device_org(phone: str) -> int:
     _device_org_cache[phone] = oid
     return oid
 
+def _customer_ancestors(cid):
+    """返回客户 cid 及其所有上级客户 id（上级能看下级设备，故推送要覆盖整条链）"""
+    result = []
+    seen = set()
+    cur = cid
+    while cur and cur not in seen:
+        seen.add(cur)
+        result.append(cur)
+        row = db_query_one("SELECT parent_id FROM customer WHERE id=?", (cur,))
+        cur = row.get('parent_id') if row else None
+    return result
+
 def _sio_emit(event: str, data: dict, phone: str):
     """
-    向设备所在组织的管理员和超级管理员推送 Socket.IO 事件。
-    超管加入 'broadcast' 房间；普通管理员/客户加入 'org_{id}' 房间。
+    推送 Socket.IO 事件：
+    - 管理员/超管：按设备 org_id 推到 org_{id} 房间 + broadcast（超管）
+    - 客户：只推到设备归属客户及其上级客户的 cust_{id} 房间（严格按 customer 隔离，
+      不再按 org 广播，避免同组织其他客户收到不属于自己的设备轨迹）
     """
-    org_id = _get_device_org(phone)
-    socketio.emit(event, data, room=f'org_{org_id}')  # 该组织管理员/客户
+    # customer_id 会随绑定变化，实时查库不缓存；org_id 用缓存
+    row = db_query_one("SELECT org_id, customer_id FROM device WHERE phone=?", (phone,))
+    org_id = int(row.get('org_id') or 1) if row else 1
+    cid    = row.get('customer_id') if row else None
+    socketio.emit(event, data, room=f'org_{org_id}')   # 该组织管理员
     socketio.emit(event, data, room='broadcast')        # 超级管理员
+    # 归属客户及其上级客户
+    if cid:
+        for c in _customer_ancestors(cid):
+            socketio.emit(event, data, room=f'cust_{c}')
 
 
 @socketio.on('connect')
@@ -2542,10 +2676,11 @@ def on_connect():
     # ── 客户门户 token ──
     cid = _verify_token(token)
     if cid:
-        cust = db_query_one("SELECT org_id FROM customer WHERE id=?", (cid,))
+        cust = db_query_one("SELECT id FROM customer WHERE id=?", (cid,))
         if not cust:
             return False
-        join_room(f'org_{int(cust.get("org_id") or 1)}')
+        # 只加入自己的客户房间（不再按 org 广播，避免收到同组织其他客户的设备轨迹）
+        join_room(f'cust_{cid}')
         log.debug("[WS] 客户 %d 已连接", cid)
         return True
 
@@ -2607,6 +2742,8 @@ def debug_routes():
 # ── 管理员登录接口 ─────────────────────────────────────────────────────────────
 
 _ADMIN_SECRET = os.environ.get('ADMIN_SECRET', 'admin_secret_quectel_2024')
+if _ADMIN_SECRET == 'admin_secret_quectel_2024':
+    log.warning("[安全] 正在使用默认 ADMIN_SECRET，生产环境务必设置环境变量 ADMIN_SECRET！")
 
 def _make_admin_token(admin_id: int) -> str:
     ts  = int(_time_mod.time())
@@ -2701,6 +2838,8 @@ def admin_change_password():
 # ── 客户门户：账号 / Token 工具 ────────────────────────────────────────────────
 
 _PORTAL_SECRET = os.environ.get('PORTAL_SECRET', 'portal_secret_quectel_2024')
+if _PORTAL_SECRET == 'portal_secret_quectel_2024':
+    log.warning("[安全] 正在使用默认 PORTAL_SECRET，生产环境务必设置环境变量 PORTAL_SECRET！")
 
 def _make_token(customer_id: int) -> str:
     ts  = int(_time_mod.time())
@@ -2917,21 +3056,23 @@ def portal_device_list():
     size    = int(request.args.get('size', 20))
     keyword = request.args.get('keyword', '').strip()
     offset  = (page - 1) * size
-    base_cols = ("SELECT id, phone, name, plate_no, manufacturer, terminal_model, "
-                 "last_lat, last_lng, last_speed, last_location_time, status, customer_id "
-                 "FROM device")
+    base_cols = ("SELECT device.id, device.phone, device.name, device.plate_no, "
+                 "device.manufacturer, device.terminal_model, device.last_lat, device.last_lng, "
+                 "device.last_speed, device.last_location_time, device.status, device.customer_id, "
+                 "r.name AS role_name, r.color AS role_color, r.icon_type AS role_icon "
+                 "FROM device LEFT JOIN device_role r ON device.role_id = r.id")
     all_cids = _get_all_descendant_cids(cid)
     cid_ph   = ','.join('?' * len(all_cids))
     if keyword:
         kw      = f'%{keyword}%'
         total   = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND (name LIKE ? OR phone LIKE ?)",
                             all_cids + [kw, kw])
-        records = db_query(f"{base_cols} WHERE customer_id IN ({cid_ph}) AND (name LIKE ? OR phone LIKE ?) "
-                           f"ORDER BY id LIMIT ? OFFSET ?",
+        records = db_query(f"{base_cols} WHERE device.customer_id IN ({cid_ph}) AND (device.name LIKE ? OR device.phone LIKE ?) "
+                           f"ORDER BY device.id LIMIT ? OFFSET ?",
                            all_cids + [kw, kw, size, offset])
     else:
         total   = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph})", all_cids)
-        records = db_query(f"{base_cols} WHERE customer_id IN ({cid_ph}) ORDER BY id LIMIT ? OFFSET ?",
+        records = db_query(f"{base_cols} WHERE device.customer_id IN ({cid_ph}) ORDER BY device.id LIMIT ? OFFSET ?",
                            all_cids + [size, offset])
     return ok({'records': records, 'total': total, 'page': page})
 
@@ -3256,8 +3397,8 @@ def portal_list_sims():
     args    = phones[:]
     if keyword:
         kw    = f'%{keyword}%'
-        cond += " AND (iccid LIKE ? OR imsi LIKE ? OR operator LIKE ?)"
-        args += [kw, kw, kw]
+        cond += " AND (iccid LIKE ? OR imsi LIKE ? OR operator LIKE ? OR device_phone LIKE ?)"
+        args += [kw, kw, kw, kw]
     if status:
         cond += " AND status=?"
         args.append(status)
@@ -3529,6 +3670,11 @@ def org_children():
 
 @app.get('/api/org/<int:oid>/children')
 def org_children_of(oid):
+    # 组织范围校验：只能查看自己权限范围内组织的子级，防止跨组织结构探测
+    admin = _current_admin(request)
+    scope = _scope_path(admin)
+    if not _org_in_scope(scope, oid):
+        return fail('无权访问该组织', 403)
     rows = db_query("SELECT * FROM sys_org WHERE parent_id=? ORDER BY sort_order, id", (oid,))
     return ok([_org_to_camel(r) for r in rows])
 
@@ -3753,13 +3899,23 @@ def update_sys_user(uid):
 
 @app.put('/api/sys/users/<int:uid>/password')
 def reset_sys_user_password(uid):
-    if not db_query_one("SELECT id FROM admin_user WHERE id=?", (uid,)):
+    admin  = _current_admin(request)
+    scope  = _scope_path(admin)
+    target = db_query_one("SELECT id, username, user_type, org_id FROM admin_user WHERE id=?", (uid,))
+    if not target:
         return fail('用户不存在', 404)
+    # 组织范围校验：只能重置自己权限范围内组织的用户密码（补齐此前遗漏的越权点）
+    if not _org_in_scope(scope, target['org_id']):
+        return fail('无权重置该用户密码', 403)
+    # 内置超管只有超管本人能改，防止低权限管理员接管
+    if target['user_type'] == 9 and target['username'] == 'admin' and not (admin and admin.get('user_type') == 9):
+        return fail('无权重置超级管理员密码', 403)
     d       = request.get_json() or {}
     new_pwd = (d.get('newPassword') or d.get('new_password') or '').strip()
     if not new_pwd or len(new_pwd) < 6:
         return fail('新密码不能少于 6 位', 400)
     db_exec("UPDATE admin_user SET password_hash=? WHERE id=?", (_hash_pw(new_pwd), uid))
+    add_op_log('重置密码', f'重置用户 {target["username"]}（id={uid}）密码')
     return ok()
 
 
@@ -3978,8 +4134,6 @@ def start_mqtt_subscriber():
 
 # ── 前端静态文件托管（生产 build / 演示用） ────────────────────────────────────
 _DIST = os.path.normpath(os.path.join(BASE_DIR, '..', 'frontend', 'dist'))
-
-from flask import send_file as _send_abs
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')

@@ -4,8 +4,9 @@
     <!-- ── 顶部标题栏（半透明浮层） ── -->
     <div class="bs-header">
       <div class="bs-header-left">
-        <span class="bs-logo-icon">🛰</span>
-        <span class="bs-logo-text">资产管理平台</span>
+        <span v-if="platformLogo" class="bs-logo-badge"><img :src="platformLogo" /></span>
+        <span v-else class="bs-logo-icon">🛰</span>
+        <span class="bs-logo-text">{{ platformTitle }}</span>
       </div>
       <div class="bs-header-center">
         <div class="bs-title">设备分布数据大屏</div>
@@ -36,15 +37,15 @@
           <div class="kpi-lbl">设备总数</div>
         </div>
         <div class="kpi-card">
-          <div class="kpi-val" style="color:#00ff88;">{{ deviceOnline }}</div>
+          <div class="kpi-val" style="color:#1aae5a;">{{ deviceOnline }}</div>
           <div class="kpi-lbl">在线</div>
         </div>
         <div class="kpi-card">
-          <div class="kpi-val" style="color:#5a7a9a;">{{ deviceOffline }}</div>
+          <div class="kpi-val" style="color:#8a96a8;">{{ deviceOffline }}</div>
           <div class="kpi-lbl">离线</div>
         </div>
         <div class="kpi-card">
-          <div class="kpi-val" style="color:#ff6b6b;">{{ deviceAlarm }}</div>
+          <div class="kpi-val" style="color:#e04a4a;">{{ deviceAlarm }}</div>
           <div class="kpi-lbl">告警</div>
         </div>
       </div>
@@ -116,12 +117,27 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import * as echarts from 'echarts'
-import { deviceApi, alarmApi, reportApi } from '@/api'
+import { deviceApi, alarmApi, reportApi, platformApi } from '@/api'
 
 // ── refs ──────────────────────────────────────────────────────────────────────
 const bsEl   = ref(null)
 const mapEl  = ref(null)
 const lineEl = ref(null)
+
+// ── 白标：大屏标题 / Logo（读平台设置） ──────────────────────────────────────────
+const platformTitle = ref('资产管理平台')
+const platformLogo  = ref('')
+async function loadPlatform() {
+  try {
+    const res = await platformApi.get()
+    const d = res.data || {}
+    if (d.bigscreen_title) platformTitle.value = d.bigscreen_title
+    if (d.logo_url) {
+      platformLogo.value = /^https?:\/\//.test(d.logo_url)
+        ? d.logo_url : (window.location.origin + d.logo_url)
+    }
+  } catch {}
+}
 
 // ── state ──────────────────────────────────────────────────────────────────────
 const currentTime    = ref('')
@@ -216,12 +232,12 @@ function nearestCityFromFeatures(lng, lat, features) {
 
 // ── 仪表盘 CSS 圆环（conic-gradient） ─────────────────────────────────────────
 const activeRingStyle = computed(() => ringStyle(activePct.value, '#ff6633'))
-const onlineRingStyle = computed(() => ringStyle(onlinePct.value, '#00e5ff'))
+const onlineRingStyle = computed(() => ringStyle(onlinePct.value, '#409eff'))
 
 function ringStyle(pct, color) {
   const deg = Math.round(pct * 3.6)
   return {
-    background: `conic-gradient(${color} 0deg ${deg}deg, rgba(0,50,80,0.4) ${deg}deg 360deg)`,
+    background: `conic-gradient(${color} 0deg ${deg}deg, rgba(64,158,255,0.12) ${deg}deg 360deg)`,
     boxShadow: `0 0 18px ${color}55, 0 0 4px ${color}`,
   }
 }
@@ -254,13 +270,13 @@ async function buildMap(el, provinceData) {
       data: scatter,
       symbolSize: 10,
       rippleEffect: { period: 1.5, scale: 3.5, brushType: 'stroke' },
-      itemStyle: { color: '#00ff88', shadowBlur: 10, shadowColor: '#00ff8888' },
+      itemStyle: { color: '#1aae5a', shadowBlur: 10, shadowColor: '#1aae5a88' },
       label: {
         show: true,
         formatter: p => p.data.label || '',
         position: 'right',
         fontSize: 10,
-        color: '#b0d8ff',
+        color: '#5a7a9a',
       },
       tooltip: {
         trigger: 'item',
@@ -284,13 +300,13 @@ async function buildMap(el, provinceData) {
         formatter: p => p.seriesType === 'map'
           ? `${p.name}<br/>设备数：${Number.isFinite(+p.value) ? +p.value : 0}`
           : undefined,
-        backgroundColor: 'rgba(0,15,40,0.88)',
-        borderColor: '#00e5ff',
-        textStyle: { color: '#b0d8ff', fontSize: 13 },
+        backgroundColor: 'rgba(255,255,255,0.95)',
+        borderColor: '#409eff',
+        textStyle: { color: '#333', fontSize: 13 },
       },
       visualMap: {
         show: false, min: 0, max: Math.max(max, 1),
-        inRange: { color: ['#0a1a3a', '#0a3a6a', '#0070c0', '#00a0e0', '#00e5ff'] },
+        inRange: { color: ['#e8f2fc', '#b0d4f5', '#6cb0ff', '#3a8ee0', '#1a6ec0'] },
         seriesIndex: 0,
       },
       series: [{
@@ -299,16 +315,16 @@ async function buildMap(el, provinceData) {
         label: {
           show: true,
           fontSize: mapName === 'china' ? 9 : 10,
-          color: 'rgba(160,210,255,0.75)',
+          color: '#5a7a9a',
         },
         emphasis: {
-          label: { show: true, color: '#fff', fontSize: 12 },
-          itemStyle: { areaColor: 'rgba(0,229,200,0.35)' },
+          label: { show: true, color: '#333', fontSize: 12 },
+          itemStyle: { areaColor: 'rgba(64,158,255,0.25)' },
         },
         itemStyle: {
-          borderColor: '#00e5ff',
+          borderColor: '#7ab0e0',
           borderWidth: mapName === 'china' ? 0.8 : 1,
-          areaColor: 'rgba(4,18,50,0.5)',
+          areaColor: 'rgba(64,158,255,0.08)',
         },
         data: data,
       }, ...scatterSeries],
@@ -318,6 +334,8 @@ async function buildMap(el, provinceData) {
   const scatter = devicePoints.map(d => ({
     value: [d.last_lng, d.last_lat, d.phone],
     label: d.name || d.phone || '',
+    // 报警红优先，否则按角色颜色，无角色回落绿
+    itemStyle: { color: d.status === 2 ? '#e04a4a' : (d.role_color || '#1aae5a') },
   }))
   applyMapOption('china', mapData, maxVal, scatter)
 
@@ -360,10 +378,11 @@ async function buildMap(el, provinceData) {
     const cityData = Object.entries(cityCounts).map(([name, value]) => ({ name, value }))
     const maxCity  = Math.max(...cityData.map(d => d.value), 1)
 
-    // 散点（保留设备名称标注）
+    // 散点（保留设备名称标注 + 角色颜色）
     const provinceScatter = inProvince.map(d => ({
       value: [d.last_lng, d.last_lat, d.phone],
       label: d.name || d.phone || '',
+      itemStyle: { color: d.status === 2 ? '#e04a4a' : (d.role_color || '#1aae5a') },
     }))
 
     applyMapOption(mapKey, cityData, maxCity, provinceScatter)
@@ -382,13 +401,14 @@ async function backToChina() {
   const scatter = devicePoints.map(d => ({
     value: [d.last_lng, d.last_lat, d.phone],
     label: d.name || d.phone || '',
+    itemStyle: { color: d.status === 2 ? '#e04a4a' : (d.role_color || '#1aae5a') },
   }))
   const scatterSeries = scatter.length ? [{
     type: 'effectScatter', coordinateSystem: 'geo',
     data: scatter, symbolSize: 10,
     rippleEffect: { period: 1.5, scale: 3.5, brushType: 'stroke' },
-    itemStyle: { color: '#00ff88' },
-    label: { show: true, formatter: p => p.data.label, position: 'right', fontSize: 10, color: '#b0d8ff' },
+    itemStyle: { color: '#1aae5a' },
+    label: { show: true, formatter: p => p.data.label, position: 'right', fontSize: 10, color: '#5a7a9a' },
     zlevel: 2,
   }] : []
   c.setOption({
@@ -396,8 +416,8 @@ async function backToChina() {
       itemStyle: { areaColor: 'transparent', borderColor: 'transparent' }, label: { show: false } }],
     series: [{
       type: 'map', map: 'china', roam: false,
-      label: { fontSize: 9, color: 'rgba(160,210,255,0.75)' },
-      itemStyle: { borderColor: '#00e5ff', borderWidth: 0.8, areaColor: 'rgba(4,18,50,0.5)' },
+      label: { fontSize: 9, color: '#5a7a9a' },
+      itemStyle: { borderColor: '#7ab0e0', borderWidth: 0.8, areaColor: 'rgba(64,158,255,0.08)' },
       data: mapData,
     }, ...scatterSeries],
     visualMap: { min: 0, max: maxVal },
@@ -420,28 +440,28 @@ function buildLine(el, trend) {
     grid: { left: 32, right: 12, top: 8, bottom: 22 },
     xAxis: {
       type: 'category', data: days,
-      axisLine: { lineStyle: { color: '#1a3355' } },
+      axisLine: { lineStyle: { color: '#d0d8e0' } },
       axisTick: { show: false },
-      axisLabel: { color: '#4a6080', fontSize: 10 },
+      axisLabel: { color: '#8a96a8', fontSize: 10 },
     },
     yAxis: {
       type: 'value',
       axisLine: { show: false }, axisTick: { show: false },
-      axisLabel: { color: '#4a6080', fontSize: 10 },
-      splitLine: { lineStyle: { color: '#1a3355', type: 'dashed' } },
+      axisLabel: { color: '#8a96a8', fontSize: 10 },
+      splitLine: { lineStyle: { color: '#e0e6ed', type: 'dashed' } },
       minInterval: 1,
     },
     series: [{
       type: 'line', data: counts, smooth: true,
       symbol: 'circle', symbolSize: 5,
-      lineStyle: { color: '#00e5ff', width: 2 },
-      itemStyle: { color: '#00e5ff' },
+      lineStyle: { color: '#409eff', width: 2 },
+      itemStyle: { color: '#409eff' },
       areaStyle: {
         color: {
           type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
           colorStops: [
-            { offset: 0, color: 'rgba(0,229,255,0.30)' },
-            { offset: 1, color: 'rgba(0,229,255,0)' },
+            { offset: 0, color: 'rgba(64,158,255,0.25)' },
+            { offset: 1, color: 'rgba(64,158,255,0)' },
           ],
         },
       },
@@ -541,6 +561,7 @@ function toggleFullscreen() {
 }
 
 onMounted(async () => {
+  loadPlatform()
   updateTime()
   clockTimer = setInterval(updateTime, 1000)
   await loadData()
@@ -565,32 +586,18 @@ onUnmounted(() => {
   position: fixed;
   inset: 0;
   z-index: 9999;
-  background:
-    radial-gradient(ellipse at 15% 40%, rgba(0,60,160,0.25) 0%, transparent 50%),
-    radial-gradient(ellipse at 85% 20%, rgba(0,120,200,0.18) 0%, transparent 45%),
-    radial-gradient(ellipse at 60% 80%, rgba(0,40,100,0.20) 0%, transparent 50%),
-    #030d1c;
-  color: #b0c4de;
+  background: linear-gradient(135deg, #eef2f7 0%, #e3e9f2 100%);
+  color: #33465c;
   font-family: 'PingFang SC', 'Helvetica Neue', sans-serif;
   overflow: hidden;
 }
 
-/* ── 星点背景 ── */
+/* ── 星点背景（浅底不需要） ── */
 .bigscreen::before {
   content: '';
   position: absolute;
   inset: 0;
-  background-image:
-    radial-gradient(1px 1px at 10% 15%, rgba(255,255,255,0.5) 0%, transparent 100%),
-    radial-gradient(1px 1px at 25% 35%, rgba(255,255,255,0.35) 0%, transparent 100%),
-    radial-gradient(1px 1px at 40% 10%, rgba(255,255,255,0.45) 0%, transparent 100%),
-    radial-gradient(1px 1px at 55% 50%, rgba(255,255,255,0.3) 0%, transparent 100%),
-    radial-gradient(1px 1px at 70% 25%, rgba(255,255,255,0.4) 0%, transparent 100%),
-    radial-gradient(1px 1px at 80% 60%, rgba(255,255,255,0.35) 0%, transparent 100%),
-    radial-gradient(1px 1px at 90% 10%, rgba(255,255,255,0.5) 0%, transparent 100%),
-    radial-gradient(1px 1px at 15% 70%, rgba(255,255,255,0.3) 0%, transparent 100%),
-    radial-gradient(1px 1px at 35% 80%, rgba(255,255,255,0.4) 0%, transparent 100%),
-    radial-gradient(1px 1px at 65% 90%, rgba(255,255,255,0.35) 0%, transparent 100%);
+  background-image: none;
   pointer-events: none;
   z-index: 0;
 }
@@ -605,36 +612,51 @@ onUnmounted(() => {
   align-items: center;
   justify-content: space-between;
   padding: 0 24px;
-  background: linear-gradient(180deg, rgba(3,15,40,0.90) 0%, rgba(3,15,40,0.60) 100%);
+  background: rgba(255,255,255,0.85);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
-  border-bottom: 1px solid rgba(0,229,255,0.18);
+  border-bottom: 1px solid rgba(64,158,255,0.25);
 }
 .bs-header::after {
   content: '';
   position: absolute;
   bottom: 0; left: 0; right: 0; height: 1px;
-  background: linear-gradient(90deg, transparent, #00e5ff88, transparent);
+  background: linear-gradient(90deg, transparent, #409eff88, transparent);
 }
 .bs-header-left  { display: flex; align-items: center; gap: 8px; }
 .bs-header-center{ position: absolute; left: 50%; transform: translateX(-50%); }
 .bs-header-right { display: flex; align-items: center; gap: 12px; }
 
 .bs-logo-icon { font-size: 20px; }
-.bs-logo-text { font-size: 13px; color: #4a90c0; letter-spacing: 1px; }
-.bs-title {
-  font-size: 22px; font-weight: 700; color: #00e5ff;
-  letter-spacing: 4px;
-  text-shadow: 0 0 24px rgba(0,229,255,0.7), 0 0 8px rgba(0,229,255,0.4);
+/* Logo 徽标位：浅底上直接融入，白 Logo 无需白卡片 */
+.bs-logo-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 30px;
+  padding: 3px 6px;
+  background: transparent;
+  border-radius: 6px;
+  box-shadow: none;
+  vertical-align: middle;
 }
-.bs-time { font-size: 13px; color: #4a6888; font-variant-numeric: tabular-nums; }
+.bs-logo-badge img {
+  height: 24px; max-width: 110px; object-fit: contain; display: block;
+}
+.bs-logo-text { font-size: 13px; color: #5a7a9a; letter-spacing: 1px; }
+.bs-title {
+  font-size: 22px; font-weight: 700; color: #1a4a7a;
+  letter-spacing: 4px;
+  text-shadow: 0 0 12px rgba(64,158,255,0.25);
+}
+.bs-time { font-size: 13px; color: #8a96a8; font-variant-numeric: tabular-nums; }
 .bs-btn {
-  background: rgba(0,80,160,0.25);
-  color: #7ec8e3; border: 1px solid rgba(0,180,255,0.3);
+  background: rgba(64,158,255,0.10);
+  color: #409eff; border: 1px solid rgba(64,158,255,0.35);
   border-radius: 4px; padding: 4px 14px; cursor: pointer; font-size: 12px;
   transition: all .2s;
 }
-.bs-btn:hover { background: rgba(0,150,255,0.40); color: #00e5ff; }
+.bs-btn:hover { background: rgba(64,158,255,0.20); color: #409eff; }
 
 /* ── 地图铺满全屏 ── */
 .map-fullscreen {
@@ -649,9 +671,9 @@ onUnmounted(() => {
   top: 66px;
   right: 20px;
   z-index: 20;
-  background: rgba(0,80,160,0.35);
-  color: #00e5ff;
-  border: 1px solid rgba(0,229,255,0.35);
+  background: rgba(64,158,255,0.10);
+  color: #409eff;
+  border: 1px solid rgba(64,158,255,0.35);
   border-radius: 4px;
   padding: 5px 16px;
   font-size: 13px;
@@ -660,7 +682,7 @@ onUnmounted(() => {
   -webkit-backdrop-filter: blur(6px);
   transition: all .2s;
 }
-.back-btn:hover { background: rgba(0,150,255,0.50); }
+.back-btn:hover { background: rgba(64,158,255,0.20); }
 
 /* ── 左侧面板 ── */
 .panel-left {
@@ -671,10 +693,10 @@ onUnmounted(() => {
   padding: 20px 18px 16px;
   display: flex;
   flex-direction: column;
-  background: linear-gradient(135deg, rgba(3,12,35,0.78) 0%, rgba(3,20,50,0.68) 100%);
+  background: rgba(255,255,255,0.82);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
-  border-right: 1px solid rgba(0,229,255,0.10);
+  border-right: 1px solid rgba(64,158,255,0.18);
   overflow: hidden;
 }
 
@@ -685,10 +707,10 @@ onUnmounted(() => {
   width: 300px;
   z-index: 10;
   padding: 14px 16px 12px;
-  background: linear-gradient(135deg, rgba(3,12,35,0.78) 0%, rgba(3,20,50,0.68) 100%);
+  background: rgba(255,255,255,0.82);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
-  border: 1px solid rgba(0,229,255,0.10);
+  border: 1px solid rgba(64,158,255,0.18);
   border-radius: 6px;
 }
 
@@ -698,16 +720,16 @@ onUnmounted(() => {
   align-items: center;
   gap: 8px;
   font-size: 13px;
-  color: #7ec8e3;
+  color: #409eff;
   letter-spacing: 1px;
   margin-bottom: 10px;
 }
 .section-bar {
   display: inline-block;
   width: 3px; height: 14px;
-  background: #00e5ff;
+  background: #409eff;
   border-radius: 2px;
-  box-shadow: 0 0 8px #00e5ff;
+  box-shadow: 0 0 8px #409eff;
   flex-shrink: 0;
 }
 
@@ -719,8 +741,8 @@ onUnmounted(() => {
   margin-bottom: 18px;
 }
 .kpi-card {
-  background: rgba(0,40,100,0.28);
-  border: 1px solid rgba(0,229,255,0.12);
+  background: rgba(64,158,255,0.08);
+  border: 1px solid rgba(64,158,255,0.15);
   border-radius: 6px;
   padding: 10px 6px 8px;
   text-align: center;
@@ -728,14 +750,13 @@ onUnmounted(() => {
 .kpi-val {
   font-size: 26px;
   font-weight: 700;
-  color: #00e5ff;
+  color: #1a6ec0;
   line-height: 1.1;
   font-variant-numeric: tabular-nums;
-  text-shadow: 0 0 12px currentColor;
 }
 .kpi-lbl {
   font-size: 10px;
-  color: #4a6888;
+  color: #8a96a8;
   margin-top: 4px;
   letter-spacing: 1px;
 }
@@ -758,30 +779,30 @@ onUnmounted(() => {
 .gauge-inner {
   width: 82px; height: 82px;
   border-radius: 50%;
-  background: rgba(3,12,35,0.90);
+  background: #ffffff;
   display: flex; flex-direction: column;
   align-items: center; justify-content: center;
 }
 .gauge-pct {
-  font-size: 18px; font-weight: 700; color: #00ff88;
+  font-size: 18px; font-weight: 700; color: #1aae5a;
   line-height: 1.1;
 }
 .gauge-label {
-  font-size: 10px; color: #6a9ab8; margin-top: 2px;
+  font-size: 10px; color: #8a96a8; margin-top: 2px;
   text-align: center; white-space: nowrap;
 }
 
 /* ── 告警 TOP5 ── */
 .alarm-total-line {
   display: flex; align-items: center; gap: 6px;
-  font-size: 12px; color: #4a6888;
+  font-size: 12px; color: #8a96a8;
   padding: 6px 0 8px;
-  border-bottom: 1px solid rgba(0,120,180,0.15);
+  border-bottom: 1px solid rgba(64,158,255,0.15);
   margin-bottom: 8px;
 }
-.alarm-dot        { color: #00e5ff; font-size: 10px; }
+.alarm-dot        { color: #409eff; font-size: 10px; }
 .alarm-total-lbl  { flex: 1; }
-.alarm-total-val  { font-size: 18px; font-weight: 700; color: #00e5ff; }
+.alarm-total-val  { font-size: 18px; font-weight: 700; color: #409eff; }
 
 .alarm-list { display: flex; flex-direction: column; gap: 0; flex: 1; overflow: hidden; }
 .alarm-item { padding: 6px 0; }
@@ -789,32 +810,32 @@ onUnmounted(() => {
   display: flex; justify-content: space-between; align-items: center;
   margin-bottom: 5px;
 }
-.alarm-name  { font-size: 12px; color: #8ab0cc; }
-.alarm-count { font-size: 14px; font-weight: 600; color: #b0d4ee; }
+.alarm-name  { font-size: 12px; color: #33465c; }
+.alarm-count { font-size: 14px; font-weight: 600; color: #1a6ec0; }
 .alarm-bar-bg {
   height: 3px;
-  background: rgba(0,80,150,0.25);
+  background: rgba(64,158,255,0.12);
   border-radius: 2px;
   overflow: hidden;
 }
 .alarm-bar-fill {
   height: 100%;
-  background: linear-gradient(90deg, #0060c0, #00e5ff);
+  background: linear-gradient(90deg, #409eff, #6cb0ff);
   border-radius: 2px;
   transition: width 0.8s ease;
 }
-.alarm-empty { font-size: 12px; color: #3a5070; padding: 16px 0; text-align: center; }
+.alarm-empty { font-size: 12px; color: #8a96a8; padding: 16px 0; text-align: center; }
 
 /* ── 右下图例 + 折线图 ── */
 .legend-row {
   display: flex; align-items: center; gap: 8px;
   font-size: 11px;
 }
-.legend-txt { color: #7ec8e3; font-size: 12px; margin-right: 4px; }
-.legend-lbl { color: #4a6888; }
+.legend-txt { color: #409eff; font-size: 12px; margin-right: 4px; }
+.legend-lbl { color: #8a96a8; }
 .legend-bar {
   flex: 1; height: 5px;
-  background: linear-gradient(90deg, #061428, #0070c0, #00e5ff);
+  background: linear-gradient(90deg, #409eff, #6cb0ff);
   border-radius: 3px;
 }
 .line-chart { height: 110px; }

@@ -60,15 +60,17 @@
         <template #default="{ row }">
           <el-button link type="primary" style="padding:0;height:auto;" @click="openRole(row)">
             <div v-if="row.role_name" style="display:flex;align-items:center;gap:6px;">
-              <span :style="{
-                display:'inline-block', width:'12px', height:'12px',
-                borderRadius: row.icon_type === '圆形' ? '50%' : '2px',
-                background: row.role_color || '#409EFF', flexShrink:0
-              }" />
+              <span :style="roleIconStyle(row.role_color, row.icon_type)" />
               <span>{{ row.role_name }}</span>
             </div>
             <span v-else style="color:#909399;">未分配</span>
           </el-button>
+        </template>
+      </el-table-column>
+      <el-table-column label="头像" width="70" align="center">
+        <template #default="{ row }">
+          <el-avatar v-if="row.avatar" :size="36" :src="avatarSrc(row.avatar)" shape="square" />
+          <span v-else style="color:#ccc;font-size:12px;">—</span>
         </template>
       </el-table-column>
       <el-table-column prop="real_name"    label="姓名"       width="100" />
@@ -105,11 +107,7 @@
         <el-option label="（清除角色）" :value="null" />
         <el-option v-for="r in roleList" :key="r.id" :value="r.id" :label="r.name">
           <span style="display:flex;align-items:center;gap:6px;">
-            <span :style="{
-              display:'inline-block', width:'12px', height:'12px',
-              borderRadius: r.icon_type === '圆形' ? '50%' : '2px',
-              background: r.color || '#409EFF'
-            }" />
+            <span :style="roleIconStyle(r.color, r.icon_type)" />
             <span>{{ r.name }}</span>
           </span>
         </el-option>
@@ -123,6 +121,24 @@
     <!-- 编辑人员信息弹窗 -->
     <el-dialog v-model="editVisible" title="编辑人员信息" width="480px">
       <el-form :model="editForm" label-width="80px" style="padding-right:20px;">
+        <el-form-item label="头像">
+          <el-upload
+            :action="UPLOAD_AVATAR_URL"
+            :headers="uploadHeaders()"
+            :show-file-list="false"
+            accept="image/*"
+            :before-upload="beforeAvatarUpload"
+            :on-success="onAvatarSuccess"
+            :on-error="onAvatarError">
+            <el-avatar v-if="editForm.avatar" :size="72" :src="avatarSrc(editForm.avatar)" shape="square" />
+            <div v-else class="avatar-uploader-empty">
+              <el-icon><Plus /></el-icon>
+              <span style="font-size:12px;margin-top:4px;">上传头像</span>
+            </div>
+          </el-upload>
+          <el-button v-if="editForm.avatar" link type="danger" size="small"
+            style="margin-left:10px;" @click="editForm.avatar = ''">移除</el-button>
+        </el-form-item>
         <el-form-item label="姓名">
           <el-input v-model="editForm.contact" placeholder="联系人真实姓名" />
         </el-form-item>
@@ -157,9 +173,30 @@
 
 <script setup>
 import { ref, reactive, onMounted } from 'vue'
-import { Search, Edit as EditIcon, Download } from '@element-plus/icons-vue'
-import { deviceApi, customerApi, roleApi } from '@/api'
+import { Search, Edit as EditIcon, Download, Plus } from '@element-plus/icons-vue'
+import { deviceApi, customerApi, roleApi, UPLOAD_AVATAR_URL, uploadHeaders } from '@/api'
 import { ElMessage } from 'element-plus'
+
+// 头像相对路径 → 完整可访问地址（后端返回 /uploads/xxx）
+function avatarSrc(url) {
+  if (!url) return ''
+  return /^https?:\/\//.test(url) ? url : (window.location.origin + url)
+}
+
+// 角色图标色块样式（圆形/方形/星形/菱形）
+function roleIconStyle(color, type, size = 12) {
+  const base = {
+    display: 'inline-block', width: `${size}px`, height: `${size}px`,
+    background: color || '#409EFF', flexShrink: 0,
+  }
+  if (type === '圆形') return { ...base, borderRadius: '50%' }
+  if (type === '菱形') return { ...base, transform: 'rotate(45deg)', borderRadius: '2px' }
+  if (type === '星形') return {
+    ...base,
+    clipPath: 'polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%)',
+  }
+  return { ...base, borderRadius: '2px' }
+}
 
 const list      = ref([])
 const loading   = ref(false)
@@ -240,7 +277,7 @@ const roleChoice  = ref(null)
 const editVisible = ref(false)
 const saving      = ref(false)
 const editForm    = reactive({
-  customerId: null, contact: '', gender: '', age: null, phone: '', address: '', remark: ''
+  customerId: null, contact: '', gender: '', age: null, phone: '', address: '', remark: '', avatar: ''
 })
 
 async function loadData(p = page.value) {
@@ -330,6 +367,7 @@ function openEdit(row) {
     phone:   row.contact_phone   || '',
     address: row.address         || '',
     remark:  row.customer_remark || '',
+    avatar:  row.avatar          || '',
   })
   editVisible.value = true
 }
@@ -340,6 +378,7 @@ async function submitEdit() {
     await customerApi.update(editForm.customerId, {
       contact: editForm.contact, gender: editForm.gender, age: editForm.age,
       phone: editForm.phone, address: editForm.address, remark: editForm.remark,
+      avatar: editForm.avatar,
     })
     ElMessage.success('保存成功')
     editVisible.value = false
@@ -347,6 +386,26 @@ async function submitEdit() {
   } finally {
     saving.value = false
   }
+}
+
+// ── 头像上传回调 ──
+function beforeAvatarUpload(file) {
+  const isImg = file.type.startsWith('image/')
+  const okSize = file.size / 1024 / 1024 < 2
+  if (!isImg) { ElMessage.error('只能上传图片'); return false }
+  if (!okSize) { ElMessage.error('图片不能超过 2MB'); return false }
+  return true
+}
+function onAvatarSuccess(res) {
+  if (res?.code === 200 && res.data?.url) {
+    editForm.avatar = res.data.url
+    ElMessage.success('头像已上传')
+  } else {
+    ElMessage.error(res?.msg || '上传失败')
+  }
+}
+function onAvatarError() {
+  ElMessage.error('上传失败，请重试')
 }
 
 // ── 导出 ──
@@ -383,3 +442,23 @@ onMounted(() => {
   loadModelOptions()
 })
 </script>
+
+<style scoped>
+.avatar-uploader-empty {
+  width: 72px;
+  height: 72px;
+  border: 1px dashed #d9d9d9;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: #8c939d;
+  cursor: pointer;
+  transition: border-color .2s;
+}
+.avatar-uploader-empty:hover {
+  border-color: #409eff;
+  color: #409eff;
+}
+</style>
