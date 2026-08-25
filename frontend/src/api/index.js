@@ -47,6 +47,12 @@ export const deviceApi = {
   withCustomer:      (params)       => http.get('/devices/with_customer', { params }),
   bindCustomer:      (id, customerId) => http.post(`/devices/${id}/bind_customer`, { customer_id: customerId }),
   unbindCustomer:    (id)           => http.post(`/devices/${id}/unbind_customer`),
+  batchBind:         (ids, customerId) => http.post('/devices/batch_bind', { ids, customer_id: customerId }),
+  batchUnbind:       (ids)          => http.post('/devices/batch_unbind', { ids }),
+  batchCommand:      (phones, text) => http.post('/devices/batch_command', { phones, text }),
+  exportAll:         ()             => http.get('/devices/export'),
+  setRole:           (id, roleId)   => http.put(`/devices/${id}/role`, { role_id: roleId }),
+  batchRole:         (ids, roleId)  => http.post('/devices/batch_role', { ids, role_id: roleId }),
 }
 
 // ── 位置 ─────────────────────────────────────────────────────────────────────

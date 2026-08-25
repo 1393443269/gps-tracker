@@ -10,6 +10,12 @@ import random
 import sys
 import os
 
+# Windows 终端默认 GBK，强制 stdout 用 UTF-8，避免打印中文/符号时崩溃
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
 sys.path.insert(0, os.path.dirname(__file__))
 import protocol as p
 
@@ -154,7 +160,7 @@ def main():
             report_count += 1
 
             if alarm:
-                print(f"[模拟器] ⚠ 第{report_count}次上报 [SOS报警]: lat={lat:.6f} lng={lng:.6f} speed={speed}km/h")
+                print(f"[模拟器] [!] 第{report_count}次上报 [SOS报警]: lat={lat:.6f} lng={lng:.6f} speed={speed}km/h")
             else:
                 print(f"[模拟器] 第{report_count}次上报: lat={lat:.6f} lng={lng:.6f} speed={speed}km/h")
 

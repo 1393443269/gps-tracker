@@ -1,25 +1,66 @@
 <template>
   <el-card>
-    <!-- 搜索栏 -->
-    <el-row :gutter="12" style="margin-bottom:14px;" align="middle">
-      <el-col :span="7">
-        <el-input v-model="keyword" placeholder="IMEI / 设备名称 / 归属账号" clearable
-          @change="loadData(1)">
-          <template #prefix><el-icon><Search /></el-icon></template>
-        </el-input>
-      </el-col>
-      <el-col :span="5">
-        <el-select v-model="bindFilter" placeholder="绑定状态" clearable @change="loadData(1)" style="width:100%">
-          <el-option label="已绑定" value="bound" />
-          <el-option label="未绑定" value="unbound" />
-        </el-select>
-      </el-col>
-      <el-col :span="12" style="text-align:right;">
-        <el-button type="primary" :icon="Search" @click="loadData(1)">搜索</el-button>
-      </el-col>
-    </el-row>
+    <!-- 搜索栏：账号 / 设备型号 / 设备IMEI（选择即查询，无需按钮） -->
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
+      <span style="font-size:14px;color:#606266;white-space:nowrap;">账号</span>
+      <el-cascader
+        v-model="queryCustomerPath"
+        :options="customerTree"
+        :props="cascaderProps"
+        placeholder="请选择账号"
+        clearable filterable
+        style="width:220px;"
+        @change="onCustomerChange" />
 
-    <el-table :data="list" v-loading="loading" stripe border size="small">
+      <span style="font-size:14px;color:#606266;white-space:nowrap;margin-left:6px;">设备型号</span>
+      <el-select v-model="queryModel" placeholder="请选择型号" filterable clearable
+        style="width:180px;" @change="loadData(1)">
+        <el-option v-for="m in modelOptions" :key="m" :label="m" :value="m" />
+      </el-select>
+
+      <span style="font-size:14px;color:#606266;white-space:nowrap;margin-left:6px;">设备IMEI</span>
+      <el-input v-model="queryImei" placeholder="请输入设备IMEI" clearable
+        style="width:220px;" @change="loadData(1)" @clear="loadData(1)">
+        <template #append>
+          <el-button :icon="Search" @click="loadData(1)" />
+        </template>
+      </el-input>
+
+      <el-dropdown @command="onBatchCommand" trigger="click" style="margin-left:6px;">
+        <el-button type="warning">
+          批量操作<el-icon class="el-icon--right"><ArrowDown /></el-icon>
+        </el-button>
+        <template #dropdown>
+          <el-dropdown-menu>
+            <el-dropdown-item command="bind">批量绑定</el-dropdown-item>
+            <el-dropdown-item command="unbind">批量解绑</el-dropdown-item>
+            <el-dropdown-item command="transfer">转移设备</el-dropdown-item>
+            <el-dropdown-item command="cmd">批量下发指令</el-dropdown-item>
+          </el-dropdown-menu>
+        </template>
+      </el-dropdown>
+
+      <el-button :icon="Download" @click="exportAll" :loading="exporting">导出</el-button>
+
+      <div style="flex:1;"></div>
+      <el-select v-model="bindFilter" placeholder="绑定状态" clearable
+        @change="loadData(1)" style="width:120px;">
+        <el-option label="已绑定" value="bound" />
+        <el-option label="未绑定" value="unbound" />
+      </el-select>
+    </div>
+
+    <!-- 已选提示 -->
+    <div v-if="selected.length"
+      style="margin-bottom:12px;background:#f0f7ff;border:1px solid #d0e8ff;border-radius:6px;
+             padding:8px 12px;font-size:13px;color:#409EFF;">
+      已选 <b>{{ selected.length }}</b> 台设备
+      <el-button size="small" text @click="clearSelection" style="margin-left:8px;">取消选择</el-button>
+    </div>
+
+    <el-table ref="tableRef" :data="list" v-loading="loading" stripe border size="small"
+      @selection-change="onSelectionChange">
+      <el-table-column type="selection" width="45" />
       <el-table-column type="index" label="#" width="50" />
       <el-table-column prop="name"           label="姓名"       width="120" />
       <el-table-column prop="phone"          label="设备IMEI"   width="160" />
@@ -45,11 +86,9 @@
       </el-table-column>
       <el-table-column label="操作" fixed="right" width="120" align="center">
         <template #default="{ row }">
-          <!-- 已绑定：显示解绑按钮 -->
           <el-button v-if="row.customer_id"
             size="small" type="danger" plain
             :icon="Minus" @click="doUnbind(row)">解绑</el-button>
-          <!-- 未绑定：显示绑定按钮 -->
           <el-button v-else
             size="small" type="primary" plain
             :icon="Link" @click="openBind(row)">绑定</el-button>
@@ -61,10 +100,15 @@
       :current-page="page" :page-size="pageSize" :total="total"
       layout="total,prev,pager,next" @current-change="loadData" />
 
-    <!-- 绑定客户弹窗 -->
-    <el-dialog v-model="bindVisible" title="绑定设备至客户" width="440px">
+    <!-- 绑定 / 转移客户弹窗（单个 + 批量共用） -->
+    <el-dialog v-model="bindVisible" :title="bindTitle" width="460px">
       <div style="margin-bottom:12px;font-size:13px;color:#606266;">
-        设备 <b>{{ bindTarget?.phone }}</b> 绑定至：
+        <template v-if="bindMode === 'single'">
+          设备 <b>{{ bindTarget?.phone }}</b> 绑定至：
+        </template>
+        <template v-else>
+          将选中的 <b>{{ selected.length }}</b> 台设备{{ bindMode === 'transfer' ? '转移' : '绑定' }}至：
+        </template>
       </div>
       <el-select v-model="bindCustomerId" placeholder="请选择客户账号" style="width:100%"
         filterable clearable>
@@ -78,15 +122,28 @@
       <template #footer>
         <el-button @click="bindVisible = false">取消</el-button>
         <el-button type="primary" @click="doBindConfirm" :loading="bindSaving"
-          :disabled="!bindCustomerId">确认绑定</el-button>
+          :disabled="!bindCustomerId">确认</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 批量下发指令弹窗 -->
+    <el-dialog v-model="cmdVisible" title="批量下发指令" width="440px">
+      <div style="margin-bottom:10px;font-size:13px;color:#606266;">
+        向选中的 <b>{{ selected.length }}</b> 台设备下发文本指令（仅在线设备生效）：
+      </div>
+      <el-input v-model="cmdText" type="textarea" :rows="3" placeholder="输入指令内容" />
+      <template #footer>
+        <el-button @click="cmdVisible = false">取消</el-button>
+        <el-button type="primary" @click="doBatchCommand" :loading="cmdSaving"
+          :disabled="!cmdText.trim()">发送</el-button>
       </template>
     </el-dialog>
   </el-card>
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
-import { Search, Minus, Link } from '@element-plus/icons-vue'
+import { ref, computed, onMounted } from 'vue'
+import { Search, Minus, Link, ArrowDown, Download } from '@element-plus/icons-vue'
 import { deviceApi, customerApi } from '@/api'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -95,14 +152,68 @@ const loading     = ref(false)
 const page        = ref(1)
 const pageSize    = ref(20)
 const total       = ref(0)
-const keyword     = ref('')
 const bindFilter  = ref(null)
+const exporting   = ref(false)
+
+// 三种查询条件
+const queryCustomerId   = ref(null)   // ① 账户（含子账户）
+const queryCustomerPath = ref([])     // 级联选中路径
+const queryModel        = ref(null)   // ② 设备型号
+const queryImei         = ref('')     // ③ IMEI 号
+const modelOptions      = ref([])     // 型号下拉选项
+const customerTree      = ref([])      // 树形客户（级联用）
+
+// 级联配置：可选任意层级、非叶子也可选
+const cascaderProps = {
+  value: 'id', label: 'label', children: 'children',
+  checkStrictly: true, emitPath: true,
+}
+function onCustomerChange(path) {
+  queryCustomerId.value = (path && path.length) ? path[path.length - 1] : null
+  loadData(1)
+}
+function buildCustomerTree(flat) {
+  const map = {}
+  flat.forEach(c => {
+    map[c.id] = {
+      id: c.id,
+      label: `${c.name}${c.login_name ? ' (' + c.login_name + ')' : ''}`,
+      children: [],
+    }
+  })
+  const roots = []
+  flat.forEach(c => {
+    const node = map[c.id], pid = c.parent_id
+    if (pid && map[pid]) map[pid].children.push(node)
+    else roots.push(node)
+  })
+  const prune = (nodes) => nodes.forEach(n => {
+    if (n.children.length) prune(n.children)
+    else delete n.children
+  })
+  prune(roots)
+  return roots
+}
+
+const tableRef  = ref(null)
+const selected  = ref([])
 
 const bindVisible    = ref(false)
 const bindSaving     = ref(false)
 const bindTarget     = ref(null)
 const bindCustomerId = ref(null)
+const bindMode       = ref('single')   // single | batch | transfer
 const customerList   = ref([])
+
+const cmdVisible = ref(false)
+const cmdSaving  = ref(false)
+const cmdText    = ref('')
+
+const bindTitle = computed(() => {
+  if (bindMode.value === 'transfer') return '转移设备'
+  if (bindMode.value === 'batch')    return '批量绑定'
+  return '绑定设备至客户'
+})
 
 async function loadData(p = page.value) {
   loading.value = true
@@ -110,11 +221,12 @@ async function loadData(p = page.value) {
   try {
     const params = {
       page: p, size: pageSize.value,
-      keyword: keyword.value || undefined,
+      customer_id:    queryCustomerId.value ?? undefined,
+      terminal_model: queryModel.value || undefined,
+      imei:           queryImei.value.trim() || undefined,
     }
     const res = await deviceApi.withCustomer(params)
     let records = res.data?.records || []
-    // 前端过滤绑定状态
     if (bindFilter.value === 'bound')   records = records.filter(r => r.customer_id)
     if (bindFilter.value === 'unbound') records = records.filter(r => !r.customer_id)
     list.value  = records
@@ -125,12 +237,33 @@ async function loadData(p = page.value) {
 }
 
 async function loadCustomers() {
+  if (customerList.value.length) return
   try {
     const res = await customerApi.listAll()
     customerList.value = res.data?.records || []
+    customerTree.value = buildCustomerTree(customerList.value)
   } catch {}
 }
 
+// 从后端导出接口提取全部型号（去重），作为型号下拉选项
+async function loadModelOptions() {
+  try {
+    const res = await deviceApi.exportAll()
+    const models = (res.data?.records || [])
+      .map(r => r.terminal_model)
+      .filter(Boolean)
+    modelOptions.value = [...new Set(models)].sort()
+  } catch {}
+}
+
+// ── 多选 ──
+function onSelectionChange(rows) { selected.value = rows }
+function clearSelection() {
+  tableRef.value?.clearSelection()
+  selected.value = []
+}
+
+// ── 单个绑定 / 解绑 ──
 async function doUnbind(row) {
   try {
     await ElMessageBox.confirm(
@@ -144,6 +277,7 @@ async function doUnbind(row) {
 }
 
 async function openBind(row) {
+  bindMode.value       = 'single'
   bindTarget.value     = row
   bindCustomerId.value = null
   bindVisible.value    = true
@@ -154,14 +288,104 @@ async function doBindConfirm() {
   if (!bindCustomerId.value) return
   bindSaving.value = true
   try {
-    await deviceApi.bindCustomer(bindTarget.value.id, bindCustomerId.value)
-    ElMessage.success('绑定成功')
+    if (bindMode.value === 'single') {
+      await deviceApi.bindCustomer(bindTarget.value.id, bindCustomerId.value)
+    } else {
+      const ids = selected.value.map(d => d.id)
+      await deviceApi.batchBind(ids, bindCustomerId.value)
+    }
+    ElMessage.success('操作成功')
     bindVisible.value = false
+    clearSelection()
     loadData()
   } finally {
     bindSaving.value = false
   }
 }
 
-onMounted(() => loadData(1))
+// ── 批量操作分发 ──
+async function onBatchCommand(cmd) {
+  if (!selected.value.length) {
+    ElMessage.warning('请先勾选设备')
+    return
+  }
+  if (cmd === 'bind' || cmd === 'transfer') {
+    bindMode.value       = cmd === 'transfer' ? 'transfer' : 'batch'
+    bindCustomerId.value = null
+    bindVisible.value    = true
+    await loadCustomers()
+  } else if (cmd === 'unbind') {
+    doBatchUnbind()
+  } else if (cmd === 'cmd') {
+    cmdText.value    = ''
+    cmdVisible.value = true
+  }
+}
+
+async function doBatchUnbind() {
+  try {
+    await ElMessageBox.confirm(
+      `确认批量解绑选中的 ${selected.value.length} 台设备？`,
+      '批量解绑', { type: 'warning', confirmButtonText: '解绑', cancelButtonText: '取消' }
+    )
+  } catch { return }
+  const ids = selected.value.map(d => d.id)
+  await deviceApi.batchUnbind(ids)
+  ElMessage.success(`已解绑 ${ids.length} 台设备`)
+  clearSelection()
+  loadData()
+}
+
+async function doBatchCommand() {
+  if (!cmdText.value.trim()) return
+  cmdSaving.value = true
+  try {
+    const phones = selected.value.map(d => d.phone)
+    const res = await deviceApi.batchCommand(phones, cmdText.value.trim())
+    const { sent = 0, offline = 0 } = res.data || {}
+    ElMessage.success(`下发完成：成功 ${sent} 台，离线跳过 ${offline} 台`)
+    cmdVisible.value = false
+    clearSelection()
+  } finally {
+    cmdSaving.value = false
+  }
+}
+
+// ── 导出全部设备 ──
+async function exportAll() {
+  exporting.value = true
+  try {
+    const res = await deviceApi.exportAll()
+    const rows = res.data?.records || []
+    if (!rows.length) { ElMessage.warning('暂无设备可导出'); return }
+    const statusMap = { 0: '离线', 1: '在线', 2: '报警' }
+    const lcMap = { 0: '未激活', 1: '已激活', 2: '已停用', 3: '已报废' }
+    const headers = ['设备IMEI', '设备名称', '设备型号', '在线状态', '生命周期',
+      '归属账号', '姓名', '联系方式', '角色', '最后通信', '激活时间']
+    const data = rows.map(r => [
+      r.phone, r.name || '', r.terminal_model || '',
+      statusMap[r.status] ?? '', lcMap[r.lifecycle] ?? '',
+      r.account || '', r.real_name || '', r.contact_phone || '',
+      r.role_name || '', r.last_location_time || '', r.activated_at || ''
+    ])
+    const csv = [headers, ...data].map(row =>
+      row.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')
+    ).join('\n')
+    const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' })
+    const link = document.createElement('a')
+    link.href = URL.createObjectURL(blob)
+    link.download = `设备清单_${new Date().toISOString().slice(0, 10)}.csv`
+    link.click()
+    URL.revokeObjectURL(link.href)
+    ElMessage.success(`已导出 ${rows.length} 台设备`)
+  } finally {
+    exporting.value = false
+  }
+}
+
+onMounted(() => {
+  loadData(1)
+  loadCustomers()      // 账户查询下拉
+  loadModelOptions()   // 型号查询下拉
+})
 </script>

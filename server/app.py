@@ -1233,12 +1233,35 @@ def batch_lifecycle():
     return ok({'updated': len(ids)})
 
 
+def _customer_and_descendants(cid):
+    """返回客户 cid 及其所有下级（递归）的 id 列表"""
+    result = [cid]
+    frontier = [cid]
+    seen = {cid}
+    while frontier:
+        ph = ','.join('?' * len(frontier))
+        children = db_query(f"SELECT id FROM customer WHERE parent_id IN ({ph})", frontier)
+        frontier = []
+        for row in children:
+            kid = row['id']
+            if kid not in seen:
+                seen.add(kid)
+                result.append(kid)
+                frontier.append(kid)
+    return result
+
+
 @app.get('/api/devices/with_customer')
 def devices_with_customer():
-    """设备信息列表：JOIN customer，返回绑定人员信息 + 围栏数"""
-    page   = int(request.args.get('page', 1))
-    size   = int(request.args.get('size', 20))
-    kw     = request.args.get('keyword', '').strip()
+    """设备信息列表：JOIN customer，返回绑定人员信息 + 围栏数。
+    支持三种查询：customer_id（含子账户）、terminal_model（设备型号）、imei。"""
+    page      = int(request.args.get('page', 1))
+    size      = int(request.args.get('size', 20))
+    kw        = request.args.get('keyword', '').strip()
+    cust_id   = request.args.get('customer_id', '').strip()
+    model     = request.args.get('terminal_model', '').strip()
+    imei      = request.args.get('imei', '').strip()
+    role_id   = request.args.get('role_id', '').strip()
     offset = (page - 1) * size
     sids   = _org_scope_ids(request)
 
@@ -1247,6 +1270,32 @@ def devices_with_customer():
         like = f'%{kw}%'
         conds.append("(d.phone LIKE ? OR d.name LIKE ? OR c.name LIKE ? OR c.contact LIKE ?)")
         params += [like, like, like, like]
+    # 查询①：按账户 + 其所有子账户
+    if cust_id:
+        try:
+            ids = _customer_and_descendants(int(cust_id))
+            ph  = ','.join('?' * len(ids))
+            conds.append(f"d.customer_id IN ({ph})")
+            params += ids
+        except ValueError:
+            pass
+    # 查询②：按设备型号
+    if model:
+        conds.append("d.terminal_model LIKE ?")
+        params.append(f'%{model}%')
+    # 查询③：按 IMEI 号
+    if imei:
+        conds.append("d.phone LIKE ?")
+        params.append(f'%{imei}%')
+    # 查询④：按角色（role_id=none 表示未分配）
+    if role_id:
+        if role_id == 'none':
+            conds.append("d.role_id IS NULL")
+        else:
+            try:
+                conds.append("d.role_id=?"); params.append(int(role_id))
+            except ValueError:
+                pass
     conds, params = _org_where(sids, conds, params, col='d.org_id')
 
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
@@ -1305,6 +1354,136 @@ def unbind_device_customer(did):
     db_exec("UPDATE device SET customer_id=NULL,updated_at=? WHERE id=?", (now, did))
     add_op_log('设备解绑', f'设备 {dev["phone"]} 已解绑')
     return ok()
+
+
+@app.post('/api/devices/batch_bind')
+def batch_bind_devices():
+    """批量绑定/转移设备到指定客户（ids + customer_id）。
+    未绑定设备 → 批量绑定；已绑定设备 → 转移到新客户。"""
+    data = request.get_json() or {}
+    ids  = data.get('ids', [])
+    cid  = data.get('customer_id')
+    if not ids:
+        return fail('ids 不能为空', 400)
+    if not cid:
+        return fail('customer_id 不能为空', 400)
+    cust = db_query_one("SELECT id, name FROM customer WHERE id=?", (cid,))
+    if not cust:
+        return fail('客户不存在', 404)
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    ph  = ','.join('?' * len(ids))
+    db_exec(f"UPDATE device SET customer_id=?,updated_at=? WHERE id IN ({ph})",
+            [cid, now] + list(ids))
+    add_op_log('批量绑定', f'{len(ids)} 台设备绑定/转移至客户 {cust["name"]}')
+    return ok({'updated': len(ids)})
+
+
+@app.put('/api/devices/<int:did>/role')
+def set_device_role(did):
+    """给单台设备设置/清除角色（role_id）。role_id 为空则清除。"""
+    data = request.get_json() or {}
+    rid  = data.get('role_id')
+    dev  = db_query_one("SELECT id, phone FROM device WHERE id=?", (did,))
+    if not dev:
+        return fail('设备不存在', 404)
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if rid:
+        role = db_query_one("SELECT id, name FROM device_role WHERE id=?", (rid,))
+        if not role:
+            return fail('角色不存在', 404)
+        db_exec("UPDATE device SET role_id=?,updated_at=? WHERE id=?", (rid, now, did))
+        add_op_log('设备分配角色', f'设备 {dev["phone"]} 分配角色 {role["name"]}')
+    else:
+        db_exec("UPDATE device SET role_id=NULL,updated_at=? WHERE id=?", (now, did))
+        add_op_log('设备清除角色', f'设备 {dev["phone"]} 清除角色')
+    return ok()
+
+
+@app.post('/api/devices/batch_role')
+def batch_set_device_role():
+    """批量给设备设置角色（ids + role_id）。role_id 为空则清除。"""
+    data = request.get_json() or {}
+    ids  = data.get('ids', [])
+    rid  = data.get('role_id')
+    if not ids:
+        return fail('ids 不能为空', 400)
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    ph  = ','.join('?' * len(ids))
+    if rid:
+        role = db_query_one("SELECT id, name FROM device_role WHERE id=?", (rid,))
+        if not role:
+            return fail('角色不存在', 404)
+        db_exec(f"UPDATE device SET role_id=?,updated_at=? WHERE id IN ({ph})",
+                [rid, now] + list(ids))
+        add_op_log('批量分配角色', f'{len(ids)} 台设备分配角色 {role["name"]}')
+    else:
+        db_exec(f"UPDATE device SET role_id=NULL,updated_at=? WHERE id IN ({ph})",
+                [now] + list(ids))
+        add_op_log('批量清除角色', f'{len(ids)} 台设备清除角色')
+    return ok({'updated': len(ids)})
+
+
+@app.post('/api/devices/batch_unbind')
+def batch_unbind_devices():
+    """批量解绑设备（ids）"""
+    data = request.get_json() or {}
+    ids  = data.get('ids', [])
+    if not ids:
+        return fail('ids 不能为空', 400)
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    ph  = ','.join('?' * len(ids))
+    db_exec(f"UPDATE device SET customer_id=NULL,updated_at=? WHERE id IN ({ph})",
+            [now] + list(ids))
+    add_op_log('批量解绑', f'{len(ids)} 台设备已解绑')
+    return ok({'updated': len(ids)})
+
+
+@app.post('/api/devices/batch_command')
+def batch_command_devices():
+    """批量下发文本指令（phones + text）。仅对在线设备下发。"""
+    data   = request.get_json() or {}
+    phones = data.get('phones', [])
+    text   = (data.get('text') or '').strip()
+    if not phones:
+        return fail('phones 不能为空', 400)
+    if not text:
+        return fail('指令内容不能为空', 400)
+    sent, offline = 0, 0
+    for phone in phones:
+        with sessions_lock:
+            conn = sessions.get(phone)
+        if not conn:
+            offline += 1
+            continue
+        try:
+            body = bytes([0x01]) + text.encode('utf-8')
+            conn.sendall(p.encode_message(0x8300, phone, next_serial(), body))
+            sent += 1
+        except Exception:
+            offline += 1
+    add_op_log('批量下发', f'向 {len(phones)} 台设备下发指令，成功 {sent} 台')
+    return ok({'sent': sent, 'offline': offline})
+
+
+@app.get('/api/devices/export')
+def export_devices():
+    """导出所有设备（含客户/角色信息）为 JSON，前端转 CSV。不分页。"""
+    sids = _org_scope_ids(request)
+    conds, params = _org_where(sids, col='d.org_id')
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    rows = db_query(
+        "SELECT d.phone, d.name, d.terminal_model, d.status, d.lifecycle, "
+        "       d.last_location_time, d.activated_at, "
+        "       c.name as account_name, c.login_name as account, "
+        "       c.contact as real_name, c.phone as contact_phone, "
+        "       r.name as role_name "
+        "FROM device d "
+        "LEFT JOIN customer c ON d.customer_id = c.id "
+        "LEFT JOIN device_role r ON d.role_id = r.id "
+        + where + " ORDER BY d.updated_at DESC",
+        params
+    )
+    return ok({'records': rows, 'total': len(rows)})
 
 
 # ── 角色（设备分组）接口 ──────────────────────────────────────────────────────────
@@ -1505,12 +1684,21 @@ def create_alarm_rule():
 @app.put('/api/alarm-rules/<int:rid>')
 def update_alarm_rule(rid):
     d = request.get_json() or {}
-    row = db_query_one("SELECT id FROM alarm_rule WHERE id=?", (rid,))
+    row = db_query_one("SELECT alarm_type FROM alarm_rule WHERE id=?", (rid,))
     if not row:
         return fail('规则不存在', 404)
+    # alarm_type 未传时沿用原值，避免部分更新（如只切开关）时 int(None) 崩溃
+    atype = d.get('alarm_type')
+    if atype is None:
+        atype = row['alarm_type']
+    else:
+        try:
+            atype = int(atype)
+        except (TypeError, ValueError):
+            return fail('报警类型格式错误', 400)
     db_exec(
         "UPDATE alarm_rule SET alarm_type=?,level=?,enabled=?,notify_page=?,notify_sms=?,ring_type=? WHERE id=?",
-        (int(d.get('alarm_type')), d.get('level', '普通级别'),
+        (atype, d.get('level', '普通级别'),
          1 if d.get('enabled', True) else 0, 1 if d.get('notify_page', True) else 0,
          1 if d.get('notify_sms', False) else 0, d.get('ring_type', '响几声'), rid)
     )
@@ -1557,11 +1745,16 @@ def attendance_detail():
     page     = int(request.args.get('page', 1))
     size     = int(request.args.get('size', 50))
     offset   = (page - 1) * size
+    sids     = _org_scope_ids(request)
     conds, params = [], []
     if fence_id:
-        conds.append("fence_id=?"); params.append(int(fence_id))
+        try:
+            conds.append("fence_id=?"); params.append(int(fence_id))
+        except ValueError:
+            return fail('fence_id 格式错误', 400)
     if day and _DATE_RE.match(day):
         conds.append("date(event_time)=?"); params.append(day)
+    conds, params = _org_where(sids, conds, params)   # 组织隔离
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     total   = db_scalar(f"SELECT COUNT(*) FROM attendance_record {where}", params)
     records = db_query(

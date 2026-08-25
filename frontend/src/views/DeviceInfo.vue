@@ -1,19 +1,52 @@
 <template>
   <el-card>
-    <!-- 搜索栏 -->
-    <el-row :gutter="12" style="margin-bottom:14px;" align="middle">
-      <el-col :span="8">
-        <el-input v-model="keyword" placeholder="IMEI / 设备名称 / 角色名称 / 姓名" clearable
-          @change="loadData(1)">
-          <template #prefix><el-icon><Search /></el-icon></template>
-        </el-input>
-      </el-col>
-      <el-col :span="16" style="text-align:right;">
-        <el-button type="primary" :icon="Search" @click="loadData(1)">搜索</el-button>
-      </el-col>
-    </el-row>
+    <!-- 顶部工具栏：账号 / 设备型号 / 设备IMEI / 角色 筛选 + 批量修改 + 导出 -->
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
+      <span style="font-size:14px;color:#606266;white-space:nowrap;">账号</span>
+      <el-cascader
+        v-model="queryCustomerPath"
+        :options="customerTree"
+        :props="cascaderProps"
+        placeholder="请选择账号"
+        clearable filterable
+        style="width:220px;"
+        @change="onCustomerChange" />
 
-    <el-table :data="list" v-loading="loading" stripe border size="small">
+      <span style="font-size:14px;color:#606266;white-space:nowrap;margin-left:6px;">设备型号</span>
+      <el-select v-model="queryModel" placeholder="请选择型号" filterable clearable
+        style="width:160px;" @change="loadData(1)">
+        <el-option v-for="m in modelOptions" :key="m" :label="m" :value="m" />
+      </el-select>
+
+      <span style="font-size:14px;color:#606266;white-space:nowrap;margin-left:6px;">设备IMEI</span>
+      <el-input v-model="queryImei" placeholder="请输入设备IMEI" clearable style="width:200px;"
+        @change="loadData(1)" @clear="loadData(1)">
+        <template #append><el-button :icon="Search" @click="loadData(1)" /></template>
+      </el-input>
+
+      <span style="font-size:14px;color:#606266;white-space:nowrap;margin-left:6px;">角色</span>
+      <el-select v-model="queryRoleId" placeholder="全部" clearable
+        style="width:140px;" @change="loadData(1)">
+        <el-option label="全部" value="" />
+        <el-option label="未分配" value="none" />
+        <el-option v-for="r in roleList" :key="r.id" :label="r.name" :value="r.id" />
+      </el-select>
+
+      <el-button type="primary" @click="openBatchRole" style="margin-left:6px;">批量修改角色</el-button>
+      <el-button :icon="Download" @click="exportAll" :loading="exporting">导出</el-button>
+    </div>
+
+    <!-- 已选提示 -->
+    <div v-if="selected.length"
+      style="margin-bottom:12px;background:#f0f7ff;border:1px solid #d0e8ff;border-radius:6px;
+             padding:8px 12px;font-size:13px;color:#409EFF;">
+      已选 <b>{{ selected.length }}</b> 台设备
+      <el-button size="small" text @click="clearSelection" style="margin-left:8px;">取消选择</el-button>
+    </div>
+
+    <el-table ref="tableRef" :data="list" v-loading="loading" stripe border size="small"
+      @selection-change="onSelectionChange">
+      <el-table-column type="selection" width="45" />
       <el-table-column type="index" label="#" width="50" />
       <el-table-column prop="phone"          label="设备IMEI"   width="160" />
       <el-table-column prop="terminal_model" label="设备型号"   width="110" />
@@ -22,18 +55,20 @@
           <el-tag size="small" type="info">{{ row.fence_count ?? 0 }}</el-tag>
         </template>
       </el-table-column>
-      <!-- 角色名称：带颜色色块 -->
-      <el-table-column label="角色名称" width="140">
+      <!-- 角色名称：带颜色色块，点击可分配 -->
+      <el-table-column label="角色名称" width="150">
         <template #default="{ row }">
-          <div v-if="row.role_name" style="display:flex;align-items:center;gap:6px;">
-            <span :style="{
-              display:'inline-block', width:'12px', height:'12px',
-              borderRadius: row.icon_type === '圆形' ? '50%' : '2px',
-              background: row.role_color || '#409EFF', flexShrink:0
-            }" />
-            <span>{{ row.role_name }}</span>
-          </div>
-          <span v-else style="color:#ccc;font-size:12px;">未分配</span>
+          <el-button link type="primary" style="padding:0;height:auto;" @click="openRole(row)">
+            <div v-if="row.role_name" style="display:flex;align-items:center;gap:6px;">
+              <span :style="{
+                display:'inline-block', width:'12px', height:'12px',
+                borderRadius: row.icon_type === '圆形' ? '50%' : '2px',
+                background: row.role_color || '#409EFF', flexShrink:0
+              }" />
+              <span>{{ row.role_name }}</span>
+            </div>
+            <span v-else style="color:#909399;">未分配</span>
+          </el-button>
         </template>
       </el-table-column>
       <el-table-column prop="real_name"    label="姓名"       width="100" />
@@ -50,11 +85,8 @@
       </el-table-column>
       <el-table-column label="操作" fixed="right" width="70" align="center">
         <template #default="{ row }">
-          <el-button
-            size="small" :icon="EditIcon" circle title="编辑人员信息"
-            @click="openEdit(row)"
-            :disabled="!row.customer_id"
-          />
+          <el-button size="small" :icon="EditIcon" circle title="编辑人员信息"
+            @click="openEdit(row)" :disabled="!row.customer_id" />
         </template>
       </el-table-column>
     </el-table>
@@ -63,7 +95,32 @@
       :current-page="page" :page-size="pageSize" :total="total"
       layout="total,prev,pager,next" @current-change="loadData" />
 
-    <!-- 编辑人员信息弹窗（只编辑 customer 里的个人信息，角色在「角色设置」里管理） -->
+    <!-- 分配角色弹窗（单台 + 批量共用） -->
+    <el-dialog v-model="roleVisible" :title="roleBatch ? '批量修改角色' : '分配角色'" width="420px">
+      <div style="margin-bottom:12px;font-size:13px;color:#606266;">
+        <template v-if="roleBatch">为选中的 <b>{{ selected.length }}</b> 台设备设置角色：</template>
+        <template v-else>为设备 <b>{{ roleTarget?.phone }}</b> 设置角色：</template>
+      </div>
+      <el-select v-model="roleChoice" placeholder="请选择角色" style="width:100%" clearable filterable>
+        <el-option label="（清除角色）" :value="null" />
+        <el-option v-for="r in roleList" :key="r.id" :value="r.id" :label="r.name">
+          <span style="display:flex;align-items:center;gap:6px;">
+            <span :style="{
+              display:'inline-block', width:'12px', height:'12px',
+              borderRadius: r.icon_type === '圆形' ? '50%' : '2px',
+              background: r.color || '#409EFF'
+            }" />
+            <span>{{ r.name }}</span>
+          </span>
+        </el-option>
+      </el-select>
+      <template #footer>
+        <el-button @click="roleVisible = false">取消</el-button>
+        <el-button type="primary" @click="submitRole" :loading="roleSaving">确定</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 编辑人员信息弹窗 -->
     <el-dialog v-model="editVisible" title="编辑人员信息" width="480px">
       <el-form :model="editForm" label-width="80px" style="padding-right:20px;">
         <el-form-item label="姓名">
@@ -100,8 +157,8 @@
 
 <script setup>
 import { ref, reactive, onMounted } from 'vue'
-import { Search, Edit as EditIcon } from '@element-plus/icons-vue'
-import { deviceApi, customerApi } from '@/api'
+import { Search, Edit as EditIcon, Download } from '@element-plus/icons-vue'
+import { deviceApi, customerApi, roleApi } from '@/api'
 import { ElMessage } from 'element-plus'
 
 const list      = ref([])
@@ -109,13 +166,81 @@ const loading   = ref(false)
 const page      = ref(1)
 const pageSize  = ref(20)
 const total     = ref(0)
-const keyword   = ref('')
+const exporting = ref(false)
 
+// 查询条件
+const queryCustomerId   = ref(null)   // 选中的账号 id（级联最末选中项）
+const queryCustomerPath = ref([])     // 级联选中的路径
+const queryModel        = ref(null)
+const queryImei         = ref('')
+const queryRoleId       = ref('')
+const modelOptions      = ref([])
+const customerList      = ref([])      // 平铺客户列表（编辑等复用）
+const customerTree      = ref([])      // 树形客户（级联用）
+const roleList          = ref([])
+
+// 级联配置：可选任意层级、非叶子也可选、单选
+const cascaderProps = {
+  value: 'id',
+  label: 'label',
+  children: 'children',
+  checkStrictly: true,
+  emitPath: true,
+}
+
+// 选中账号：取路径最末一级作为查询 id
+function onCustomerChange(path) {
+  queryCustomerId.value = (path && path.length) ? path[path.length - 1] : null
+  loadData(1)
+}
+
+// 平铺客户列表 → 树形结构
+function buildCustomerTree(flat) {
+  const map = {}
+  flat.forEach(c => {
+    map[c.id] = {
+      id: c.id,
+      label: `${c.name}${c.login_name ? ' (' + c.login_name + ')' : ''}`,
+      children: [],
+    }
+  })
+  const roots = []
+  flat.forEach(c => {
+    const node = map[c.id]
+    const pid = c.parent_id
+    if (pid && map[pid]) map[pid].children.push(node)
+    else roots.push(node)
+  })
+  // 去掉空 children，避免叶子节点出现空展开箭头
+  const prune = (nodes) => nodes.forEach(n => {
+    if (n.children.length) prune(n.children)
+    else delete n.children
+  })
+  prune(roots)
+  return roots
+}
+
+// 多选
+const tableRef = ref(null)
+const selected = ref([])
+function onSelectionChange(rows) { selected.value = rows }
+function clearSelection() {
+  tableRef.value?.clearSelection()
+  selected.value = []
+}
+
+// 角色分配弹窗
+const roleVisible = ref(false)
+const roleSaving  = ref(false)
+const roleBatch   = ref(false)
+const roleTarget  = ref(null)
+const roleChoice  = ref(null)
+
+// 编辑人员信息弹窗
 const editVisible = ref(false)
 const saving      = ref(false)
 const editForm    = reactive({
-  customerId: null,
-  name: '', contact: '', gender: '', age: null, phone: '', address: '', remark: ''
+  customerId: null, contact: '', gender: '', age: null, phone: '', address: '', remark: ''
 })
 
 async function loadData(p = page.value) {
@@ -124,7 +249,10 @@ async function loadData(p = page.value) {
   try {
     const res = await deviceApi.withCustomer({
       page: p, size: pageSize.value,
-      keyword: keyword.value || undefined,
+      customer_id:    queryCustomerId.value ?? undefined,
+      terminal_model: queryModel.value || undefined,
+      imei:           queryImei.value.trim() || undefined,
+      role_id:        queryRoleId.value || undefined,
     })
     list.value  = res.data?.records || []
     total.value = res.data?.total   || 0
@@ -133,11 +261,69 @@ async function loadData(p = page.value) {
   }
 }
 
+async function loadCustomers() {
+  if (customerList.value.length) return
+  try {
+    const res = await customerApi.listAll()
+    customerList.value = res.data?.records || []
+    customerTree.value = buildCustomerTree(customerList.value)
+  } catch {}
+}
+
+async function loadRoles() {
+  try {
+    const res = await roleApi.list()
+    roleList.value = res.data?.records || []
+  } catch {}
+}
+
+async function loadModelOptions() {
+  try {
+    const res = await deviceApi.exportAll()
+    const models = (res.data?.records || []).map(r => r.terminal_model).filter(Boolean)
+    modelOptions.value = [...new Set(models)].sort()
+  } catch {}
+}
+
+// ── 分配角色（单台） ──
+function openRole(row) {
+  roleBatch.value  = false
+  roleTarget.value = row
+  roleChoice.value = row.role_id || null
+  roleVisible.value = true
+}
+
+// ── 批量修改角色 ──
+function openBatchRole() {
+  if (!selected.value.length) { ElMessage.warning('请先勾选设备'); return }
+  roleBatch.value  = true
+  roleChoice.value = null
+  roleVisible.value = true
+}
+
+async function submitRole() {
+  roleSaving.value = true
+  try {
+    if (roleBatch.value) {
+      const ids = selected.value.map(d => d.id)
+      await deviceApi.batchRole(ids, roleChoice.value)
+    } else {
+      await deviceApi.setRole(roleTarget.value.id, roleChoice.value)
+    }
+    ElMessage.success('角色已更新')
+    roleVisible.value = false
+    clearSelection()
+    loadData()
+  } finally {
+    roleSaving.value = false
+  }
+}
+
+// ── 编辑人员信息 ──
 function openEdit(row) {
   if (!row.customer_id) return
   Object.assign(editForm, {
     customerId: row.customer_id,
-    name:    row.role_name       || '',
     contact: row.real_name       || '',
     gender:  row.gender          || '',
     age:     row.age             || null,
@@ -152,12 +338,8 @@ async function submitEdit() {
   saving.value = true
   try {
     await customerApi.update(editForm.customerId, {
-      contact: editForm.contact,
-      gender:  editForm.gender,
-      age:     editForm.age,
-      phone:   editForm.phone,
-      address: editForm.address,
-      remark:  editForm.remark,
+      contact: editForm.contact, gender: editForm.gender, age: editForm.age,
+      phone: editForm.phone, address: editForm.address, remark: editForm.remark,
     })
     ElMessage.success('保存成功')
     editVisible.value = false
@@ -167,5 +349,37 @@ async function submitEdit() {
   }
 }
 
-onMounted(() => loadData(1))
+// ── 导出 ──
+async function exportAll() {
+  exporting.value = true
+  try {
+    const res = await deviceApi.exportAll()
+    const rows = res.data?.records || []
+    if (!rows.length) { ElMessage.warning('暂无设备可导出'); return }
+    const statusMap = { 0: '离线', 1: '在线', 2: '报警' }
+    const headers = ['设备IMEI', '设备名称', '设备型号', '在线状态', '归属账号', '姓名', '联系方式', '角色']
+    const data = rows.map(r => [
+      r.phone, r.name || '', r.terminal_model || '', statusMap[r.status] ?? '',
+      r.account || '', r.real_name || '', r.contact_phone || '', r.role_name || ''
+    ])
+    const csv = [headers, ...data].map(row =>
+      row.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n')
+    const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' })
+    const link = document.createElement('a')
+    link.href = URL.createObjectURL(blob)
+    link.download = `设备信息_${new Date().toISOString().slice(0, 10)}.csv`
+    link.click()
+    URL.revokeObjectURL(link.href)
+    ElMessage.success(`已导出 ${rows.length} 台设备`)
+  } finally {
+    exporting.value = false
+  }
+}
+
+onMounted(() => {
+  loadData(1)
+  loadCustomers()
+  loadRoles()
+  loadModelOptions()
+})
 </script>
