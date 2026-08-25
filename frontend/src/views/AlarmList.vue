@@ -31,7 +31,11 @@
     <el-table ref="tableRef" :data="list" v-loading="loading" stripe border
       @selection-change="onSelectionChange">
       <el-table-column type="selection" width="45" :selectable="row => row.status === 0" />
-      <el-table-column prop="phone"     label="设备号"   width="140" />
+      <el-table-column prop="phone" label="设备号" width="170">
+        <template #default="{ row }">
+          <span style="white-space:nowrap;">{{ row.phone }}</span>
+        </template>
+      </el-table-column>
       <el-table-column prop="alarm_desc" label="报警类型" width="160">
         <template #default="{ row }">
           <el-tag

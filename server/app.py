@@ -60,12 +60,67 @@ def _hash_pw(pwd: str) -> str:
 
 # ── SQLite 数据库 ──────────────────────────────────────────────────────────────
 
+# ── 数据库后端抽象层 ─────────────────────────────────────────────────────────
+# 通过环境变量 DB_BACKEND 切换：'sqlite'（默认）或 'postgres'。
+# 业务代码统一用 ? 占位符；postgres 后端会自动把 ? 转成 %s。
+# 迁移到 PG 时只需：装 psycopg2、设 DB_BACKEND=postgres + DATABASE_URL，无需改业务 SQL。
+DB_BACKEND = os.environ.get('DB_BACKEND', 'sqlite').lower()
+
+if DB_BACKEND == 'postgres':
+    import psycopg2 as _pg
+    import psycopg2.extras as _pg_extras
+    _PG_DSN = os.environ.get('DATABASE_URL',
+                             'postgresql://postgres:postgres@127.0.0.1:5432/gps')
+
+def _to_pg(sql):
+    """把 ? 占位符转成 %s（psycopg2 用 %s）。字符串字面量里的 ? 需谨慎——本项目 SQL 无此情况。"""
+    return sql.replace('?', '%s')
+
+
+class _ConnWrapper:
+    """统一 sqlite3 / psycopg2 的接口差异：
+    - execute(sql, params) 自动转占位符
+    - 提供 row 转 dict 的游标
+    这样业务层的 conn.execute(...) 写法在两种后端下都能用。"""
+    def __init__(self, raw, backend):
+        self._raw = raw
+        self._backend = backend
+    def execute(self, sql, params=()):
+        cur = self._raw.cursor()
+        if self._backend == 'postgres':
+            cur.execute(_to_pg(sql), params)
+        else:
+            cur.execute(sql, params)
+        return cur
+    def executemany(self, sql, seq):
+        cur = self._raw.cursor()
+        if self._backend == 'postgres':
+            cur.executemany(_to_pg(sql), seq)
+        else:
+            cur.executemany(sql, seq)
+        return cur
+    def executescript(self, script):
+        # SQLite 有原生 executescript；postgres 用 cursor 逐段执行
+        if self._backend == 'sqlite':
+            self._raw.executescript(script)
+        else:
+            cur = self._raw.cursor()
+            cur.execute(script)   # psycopg2 支持一次执行多条以 ; 分隔的语句
+        return self
+    def cursor(self):  return self._raw.cursor()
+    def commit(self):  self._raw.commit()
+    def close(self):   self._raw.close()
+
+
 def get_db():
+    if DB_BACKEND == 'postgres':
+        raw = _pg.connect(_PG_DSN, cursor_factory=_pg_extras.RealDictCursor)
+        return _ConnWrapper(raw, 'postgres')
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")   # 提升并发写性能
     conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
+    return _ConnWrapper(conn, 'sqlite')
 
 _db_lock = threading.Lock()
 
@@ -97,9 +152,87 @@ def db_query_one(sql, params=()):
 def db_scalar(sql, params=()):
     conn = get_db()
     try:
-        return conn.execute(sql, params).fetchone()[0]
+        r = conn.execute(sql, params).fetchone()
+        if r is None:
+            return None
+        # sqlite3.Row 支持 [0]；psycopg2 RealDictCursor 返回 dict，取第一个值
+        return list(r.values())[0] if isinstance(r, dict) else r[0]
     finally:
         conn.close()
+
+
+# ── 高频位置写入的异步批量落库（削减 SQLite 全局写锁争用）────────────────────────
+import queue as _queue
+
+_loc_queue     = _queue.Queue()     # 待落库的 location_record 行
+_dev_latest    = {}                 # phone -> 设备最新状态（多次上报只落最后一次）
+_dev_latest_lk = threading.Lock()
+_devid_cache   = {}                 # phone -> device_id，免每次上报查库
+
+def _get_device_id(phone):
+    did = _devid_cache.get(phone)
+    if did is not None:
+        return did
+    row = db_query_one("SELECT id FROM device WHERE phone=?", (phone,))
+    did = row['id'] if row else 0
+    if did:
+        _devid_cache[phone] = did
+    return did
+
+def enqueue_location(loc_row, dev_state):
+    """位置上报入队（不落库，立即返回），后台线程批量写。
+    loc_row: location_record 的一整行值元组
+    dev_state: (phone, last_lat, last_lng, last_speed, last_location_time, status, updated_at)
+    """
+    _loc_queue.put(loc_row)
+    with _dev_latest_lk:
+        _dev_latest[dev_state[0]] = dev_state
+
+def _batch_writer_loop():
+    """后台线程：每 0.5 秒把队列里的位置记录 + 设备最新状态批量写入。"""
+    while True:
+        _time_mod.sleep(0.5)
+        # 取出本轮所有位置记录
+        rows = []
+        while True:
+            try:
+                rows.append(_loc_queue.get_nowait())
+            except _queue.Empty:
+                break
+        # 取出并清空设备最新状态快照
+        with _dev_latest_lk:
+            dev_snapshot = list(_dev_latest.values())
+            _dev_latest.clear()
+        if not rows and not dev_snapshot:
+            continue
+        try:
+            with _db_lock:
+                conn = get_db()
+                try:
+                    if rows:
+                        conn.executemany(
+                            "INSERT INTO location_record (device_id,phone,lat,lng,altitude,"
+                            "speed,direction,alarm_flag,status_flag,mileage,gps_time) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+                    if dev_snapshot:
+                        conn.executemany(
+                            "UPDATE device SET last_lat=?,last_lng=?,last_speed=?,"
+                            "last_location_time=?,status=?,updated_at=? WHERE phone=?",
+                            [(d[1],d[2],d[3],d[4],d[5],d[6],d[0]) for d in dev_snapshot])
+                    conn.commit()
+                finally:
+                    conn.close()
+        except Exception as e:
+            log.error("[批量写] 落库失败: %s", e)
+
+_batch_writer_started = False
+def start_batch_writer():
+    global _batch_writer_started
+    if _batch_writer_started:
+        return
+    _batch_writer_started = True
+    threading.Thread(target=_batch_writer_loop, daemon=True).start()
+    log.info("[批量写] 位置异步批量落库线程已启动")
 
 def init_db():
     conn = get_db()
@@ -925,24 +1058,15 @@ def handle_location(sock, phone, serial, body):
     gps_time    = loc['gps_time'].strftime('%Y-%m-%d %H:%M:%S')
     mileage     = loc.get('mileage')
 
-    row = db_query_one("SELECT id FROM device WHERE phone=?", (canonical,))
-    device_id = row['id'] if row else 0
+    device_id = _get_device_id(canonical)   # 缓存查询，免每次上报查库
 
-    # 保存位置记录
-    db_exec(
-        "INSERT INTO location_record (device_id,phone,lat,lng,altitude,speed,direction,"
-        "alarm_flag,status_flag,mileage,gps_time) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (device_id, canonical, lat, lng, altitude, speed, direction,
-         alarm_flag, loc['status_flag'], mileage, gps_time)
-    )
-
-    # 更新设备最新状态
+    # 位置记录 + 设备最新状态：异步批量落库（削减写锁争用，大幅降低上报延迟）
     status = 2 if alarm_flag else 1
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    db_exec(
-        "UPDATE device SET last_lat=?,last_lng=?,last_speed=?,last_location_time=?,"
-        "status=?,updated_at=? WHERE phone=?",
-        (lat, lng, speed, gps_time, status, now, canonical)
+    enqueue_location(
+        (device_id, canonical, lat, lng, altitude, speed, direction,
+         alarm_flag, loc['status_flag'], mileage, gps_time),
+        (canonical, lat, lng, speed, gps_time, status, now)
     )
 
     # 处理报警（使用 canonical phone，与 device 表保持一致）
@@ -4151,6 +4275,9 @@ def _serve_spa(path):
 
 if __name__ == '__main__':
     init_db()
+
+    # 启动位置异步批量落库线程（削减 SQLite 写锁争用）
+    start_batch_writer()
 
     # 后台启动 808 TCP 服务线程
     tcp_thread = threading.Thread(target=start_tcp_server, daemon=True)
