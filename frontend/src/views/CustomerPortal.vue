@@ -2,7 +2,7 @@
   <div style="height:100vh;display:flex;flex-direction:column;background:#f0f2f5;">
     <!-- 顶部导航 -->
     <div style="height:52px;background:#1a2a4a;display:flex;align-items:center;padding:0 20px;gap:16px;flex-shrink:0;">
-      <span style="color:#fff;font-weight:700;font-size:16px;">设备管理平台</span>
+      <span style="color:#fff;font-weight:700;font-size:16px;">应急物资管理系统</span>
       <el-divider direction="vertical" style="border-color:rgba(255,255,255,.3);" />
       <span style="color:rgba(255,255,255,.8);font-size:13px;">{{ customerName }}</span>
       <div style="flex:1;" />

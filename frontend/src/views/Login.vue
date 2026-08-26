@@ -4,7 +4,7 @@
 
       <div style="text-align:center;margin-bottom:32px;">
         <div style="font-size:26px;margin-bottom:10px;">🛰</div>
-        <div style="font-size:20px;font-weight:700;color:#303133;margin-bottom:4px;">设备管理平台</div>
+        <div style="font-size:20px;font-weight:700;color:#303133;margin-bottom:4px;">应急物资管理系统</div>
         <div style="font-size:12px;color:#b0b8c4;">输入账号密码即可登录</div>
       </div>
 

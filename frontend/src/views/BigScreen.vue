@@ -125,7 +125,7 @@ const mapEl  = ref(null)
 const lineEl = ref(null)
 
 // ── 白标：大屏标题 / Logo（读平台设置） ──────────────────────────────────────────
-const platformTitle = ref('资产管理平台')
+const platformTitle = ref('应急物资管理系统')
 const platformLogo  = ref('')
 const centerTitle   = ref('设备分布数据大屏')
 async function loadPlatform() {

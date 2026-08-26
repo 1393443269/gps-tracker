@@ -2,7 +2,7 @@
   <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#1a2a4a 0%,#2c4a7a 100%);">
     <el-card style="width:360px;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.3);" body-style="padding:32px 36px;">
       <div style="text-align:center;margin-bottom:28px;">
-        <div style="font-size:22px;font-weight:700;color:#303133;margin-bottom:6px;">设备管理平台</div>
+        <div style="font-size:22px;font-weight:700;color:#303133;margin-bottom:6px;">应急物资管理系统</div>
         <div style="font-size:13px;color:#909399;">设备查询</div>
       </div>
 

@@ -178,7 +178,7 @@ function onLogoError() {
 }
 
 const setting = reactive({
-  bigscreen_title: '资产管理平台', account_title: '资产管理平台',
+  bigscreen_title: '应急物资管理系统', account_title: '应急物资管理系统',
   unit_name: '', contact_phone: '', email: '', address: '', logo_url: '',
   enable_batch_cmd: true, sms_enabled: false, sms_total: 0, sms_used: 0,
 })
@@ -191,8 +191,8 @@ async function loadSetting() {
     const res = await platformApi.get()
     const d = res.data || {}
     Object.assign(setting, {
-      bigscreen_title: d.bigscreen_title || '资产管理平台',
-      account_title:   d.account_title   || '资产管理平台',
+      bigscreen_title: d.bigscreen_title || '应急物资管理系统',
+      account_title:   d.account_title   || '应急物资管理系统',
       unit_name:       d.unit_name       || '',
       contact_phone:   d.contact_phone   || '',
       email:           d.email           || '',

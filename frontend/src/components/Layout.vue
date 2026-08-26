@@ -162,7 +162,7 @@ const onlineCount = ref(0)
 const alarmCount  = ref(0)
 
 // 白标：平台标题 / Logo（从平台设置读取）
-const platformTitle = ref('🛰 资产管理平台')
+const platformTitle = ref('🛰 应急物资管理系统')
 const platformLogo  = ref('')
 
 async function loadPlatform() {
