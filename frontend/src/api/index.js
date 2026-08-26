@@ -20,6 +20,9 @@ http.interceptors.response.use(
     const msg      = err.response?.data?.msg || '请求失败'
     const onLogin  = window.location.pathname.startsWith('/login')
     if (status === 401 && !onLogin) {
+      // 客户账号访问管理员专属接口会返回 401，属正常权限边界，静默放过，
+      // 不清 token、不跳转，避免登录后被误判为失效而反复踢回登录页（死循环闪退）
+      if (localStorage.getItem('customer_token')) return Promise.reject(err)
       localStorage.removeItem('admin_token')
       localStorage.removeItem('user_role')
       window.location.href = '/login'
