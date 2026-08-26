@@ -102,6 +102,34 @@ def _pg_dialect(sql):
     return s
 
 
+def _split_sql(script):
+    """把多语句 SQL 脚本按分号拆成单条，忽略 -- 注释，避开字符串字面量内的分号。"""
+    out, buf, in_str = [], [], False
+    # 先逐行去掉 -- 行注释
+    lines = []
+    for ln in script.split('\n'):
+        # 去掉行内 -- 注释（不在字符串里时）
+        q = False; cut = None
+        for i, ch in enumerate(ln):
+            if ch == "'":
+                q = not q
+            elif ch == '-' and i+1 < len(ln) and ln[i+1] == '-' and not q:
+                cut = i; break
+        lines.append(ln if cut is None else ln[:cut])
+    text = '\n'.join(lines)
+    for ch in text:
+        if ch == "'":
+            in_str = not in_str
+            buf.append(ch)
+        elif ch == ';' and not in_str:
+            out.append(''.join(buf)); buf = []
+        else:
+            buf.append(ch)
+    if ''.join(buf).strip():
+        out.append(''.join(buf))
+    return out
+
+
 def _to_pg(sql):
     """PG 适配：先做方言改写，再把 ? 占位符转成 %s。"""
     return _pg_dialect(sql).replace('?', '%s')
@@ -130,13 +158,22 @@ class _ConnWrapper:
             cur.executemany(sql, seq)
         return cur
     def executescript(self, script):
-        # SQLite 有原生 executescript；postgres 需先做方言转换再逐条执行
+        # SQLite 有原生 executescript；postgres 先做方言转换，再按分号逐条独立执行
         if self._backend == 'sqlite':
             self._raw.executescript(script)
         else:
-            cur = self._raw.cursor()
-            # 整段脚本做 SQLite->PG 方言改写（AUTOINCREMENT→SERIAL、strftime 默认值等）
-            cur.execute(_pg_dialect(script))   # psycopg2 支持一次执行多条以 ; 分隔的语句
+            # 逐条执行：一条失败(如索引/表已存在)不影响其余，配合 autocommit 各自独立提交
+            for stmt in _split_sql(_pg_dialect(script)):
+                s = stmt.strip()
+                if not s:
+                    continue
+                cur = self._raw.cursor()
+                try:
+                    cur.execute(s)
+                except Exception as _e:
+                    # 幂等建表/加列场景下的"已存在"类错误忽略，其余抛出
+                    if 'already exists' not in str(_e).lower():
+                        raise
         return self
     def cursor(self):  return self._raw.cursor()
     def commit(self):  self._raw.commit()
@@ -146,6 +183,10 @@ class _ConnWrapper:
 def get_db():
     if DB_BACKEND == 'postgres':
         raw = _pg.connect(_PG_DSN, cursor_factory=_pg_extras.RealDictCursor)
+        # 关键：开 autocommit，对齐 SQLite 的自动提交语义。
+        # 否则 psycopg2 默认把多条语句包进一个事务，某条(如 ALTER 列已存在被 try/except 忽略)
+        # 失败会把事务打成中止态，后续全部报 InFailedSqlTransaction，真正的首错被掩盖。
+        raw.autocommit = True
         return _ConnWrapper(raw, 'postgres')
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
