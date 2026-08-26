@@ -2988,6 +2988,9 @@ def _require_admin_for_api():
     # 放行：客户门户（有独立的客户 token 校验）
     if path.startswith('/api/customer/'):
         return None
+    # 放行：读取平台白标设置（名称/Logo），客户门户与登录页均需展示，只读无敏感数据
+    if path == '/api/platform-setting' and request.method == 'GET':
+        return None
     # 其余所有管理员接口：校验 X-Admin-Token
     token = request.headers.get('X-Admin-Token', '')
     if not token or not _verify_admin_token(token):
