@@ -251,7 +251,7 @@ function alarmBarWidth(cnt) {
 async function buildMap(el, provinceData) {
   let geoJson
   try {
-    const r = await fetch('https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json')
+    const r = await fetch('/mapdata/areas_v3/bound/100000_full.json')
     geoJson = await r.json()
   } catch {
     return null
@@ -353,7 +353,7 @@ async function buildMap(el, provinceData) {
     let features = provinceFeaturesCache[adcode]
     if (!features) {
       try {
-        const r = await fetch(`https://geo.datav.aliyun.com/areas_v3/bound/${adcode}_full.json`)
+        const r = await fetch(`/mapdata/areas_v3/bound/${adcode}_full.json`)
         const geo = await r.json()
         echarts.registerMap(mapKey, geo)
         features = geo.features || []
