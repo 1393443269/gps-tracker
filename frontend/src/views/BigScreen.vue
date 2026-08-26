@@ -9,7 +9,7 @@
         <span class="bs-logo-text">{{ platformTitle }}</span>
       </div>
       <div class="bs-header-center">
-        <div class="bs-title">设备分布数据大屏</div>
+        <div class="bs-title">{{ centerTitle }}</div>
       </div>
       <div class="bs-header-right">
         <span class="bs-time">{{ currentTime }}</span>
@@ -127,11 +127,15 @@ const lineEl = ref(null)
 // ── 白标：大屏标题 / Logo（读平台设置） ──────────────────────────────────────────
 const platformTitle = ref('资产管理平台')
 const platformLogo  = ref('')
+const centerTitle   = ref('设备分布数据大屏')
 async function loadPlatform() {
   try {
     const res = await platformApi.get()
     const d = res.data || {}
     if (d.bigscreen_title) platformTitle.value = d.bigscreen_title
+    // 中间大标题跟随账号名称（平台设置里的 account_title），未配置则退回大屏标题或默认文案
+    if (d.account_title) centerTitle.value = d.account_title
+    else if (d.bigscreen_title) centerTitle.value = d.bigscreen_title
     if (d.logo_url) {
       platformLogo.value = /^https?:\/\//.test(d.logo_url)
         ? d.logo_url : (window.location.origin + d.logo_url)
