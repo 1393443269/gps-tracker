@@ -3073,6 +3073,9 @@ def _require_admin_for_api():
     # 保存逻辑内部仅允许客户改品牌字段，短信/功能配置保留原值。
     if path == '/api/platform-setting' and request.method == 'PUT' and _get_portal_customer():
         return None
+    # 放行：客户上传图片（Logo/头像）。持有效客户 token 即可，接口只存图返回 URL，无敏感操作。
+    if path == '/api/upload/avatar' and _get_portal_customer():
+        return None
     # 其余所有管理员接口：校验 X-Admin-Token
     token = request.headers.get('X-Admin-Token', '')
     if not token or not _verify_admin_token(token):

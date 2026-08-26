@@ -45,8 +45,12 @@ export const authApi = {
 // el-upload 用：上传地址 + 鉴权头
 export const UPLOAD_AVATAR_URL = '/api/upload/avatar'
 export function uploadHeaders() {
-  const token = localStorage.getItem('admin_token')
-  return token ? { 'X-Admin-Token': token } : {}
+  const h = {}
+  const token  = localStorage.getItem('admin_token')
+  const ctoken = localStorage.getItem('customer_token')
+  if (token)  h['X-Admin-Token']    = token
+  if (ctoken) h['X-Customer-Token'] = ctoken
+  return h
 }
 
 // ── 设备 ─────────────────────────────────────────────────────────────────────
