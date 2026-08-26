@@ -6,10 +6,12 @@ const http = axios.create({
   timeout: 10000
 })
 
-// 自动带上管理员 token
+// 自动带上管理员 token；客户身份时补带客户 token（供放开给客户的只读/品牌接口鉴权）
 http.interceptors.request.use(cfg => {
   const token = localStorage.getItem('admin_token')
   if (token) cfg.headers['X-Admin-Token'] = token
+  const ctoken = localStorage.getItem('customer_token')
+  if (ctoken) cfg.headers['X-Customer-Token'] = ctoken
   return cfg
 })
 

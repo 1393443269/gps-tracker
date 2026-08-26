@@ -117,7 +117,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import * as echarts from 'echarts'
-import { deviceApi, alarmApi, reportApi, platformApi } from '@/api'
+import { deviceApi, alarmApi, reportApi, platformApi, portalApi, isAdmin } from '@/api'
 
 // ── refs ──────────────────────────────────────────────────────────────────────
 const bsEl   = ref(null)
@@ -476,17 +476,20 @@ function buildLine(el, trend) {
 
 // ── 数据加载 ──────────────────────────────────────────────────────────────────
 async function loadData() {
+  // 按身份取数：管理员看全平台，客户只看自己名下（接口自带数据隔离）
+  const admin = isAdmin()
   const [devRes, sumRes] = await Promise.allSettled([
-    deviceApi.list({ size: 500 }),
-    reportApi.summary(),
+    admin ? deviceApi.list({ size: 500 }) : portalApi.deviceList({ size: 500 }),
+    admin ? reportApi.summary()           : portalApi.summary(),
   ])
   const devices = devRes.status === 'fulfilled' ? devRes.value.data?.records || [] : []
   const summary = sumRes.status === 'fulfilled' ? sumRes.value.data || {} : {}
 
-  // 激活率 / 在线率 / 设备数量
-  const total   = summary.device?.total  || 0
-  const onlineCnt = summary.device?.online || 0
-  const alarmCnt  = summary.device?.alarm  || 0
+  // 兼容两种结构：管理员 summary.device.{total,online,alarm}；客户为扁平 {total,online,alarm}
+  const dev = summary.device || summary
+  const total     = dev.total  || 0
+  const onlineCnt = dev.online || 0
+  const alarmCnt  = dev.alarm  || 0
   const online  = onlineCnt + alarmCnt
   activePct.value  = total ? +(alarmCnt / total * 100).toFixed(2) : 0   // 报警设备占比
   onlinePct.value  = total ? +(onlineCnt / total * 100).toFixed(2) : 0  // 纯在线率
@@ -495,8 +498,21 @@ async function loadData() {
   deviceAlarm.value   = alarmCnt
   deviceOffline.value = Math.max(0, total - online)
 
-  // 告警
-  const types = summary.alarm_types || []
+  // 告警统计：管理员 summary 自带 alarm_types；客户端无此字段，改用客户告警列表现算
+  let types = summary.alarm_types || []
+  if (!admin) {
+    try {
+      const alRes = await portalApi.alarms({ size: 500 })
+      const list  = alRes.data?.records || alRes.data || []
+      const byType = {}
+      list.forEach(a => {
+        const k = a.alarm_desc || a.type_name || a.alarm_type || '其他'
+        byType[k] = (byType[k] || 0) + 1
+      })
+      types = Object.entries(byType).map(([alarm_desc, cnt]) => ({ alarm_desc, cnt }))
+                    .sort((a, b) => b.cnt - a.cnt)
+    } catch { types = [] }
+  }
   alarmTypes.value = types.slice(0, 5)
   alarmTotal.value = types.reduce((s, t) => s + Number(t.cnt), 0)
 

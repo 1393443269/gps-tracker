@@ -2098,7 +2098,18 @@ def get_platform_setting():
 @app.put('/api/platform-setting')
 def update_platform_setting():
     d = request.get_json() or {}
-    _get_platform_setting(1)   # 确保存在
+    cur = _get_platform_setting(1)   # 确保存在，并取当前值
+    # 身份判定：管理员可改全部；客户仅可改品牌字段，运营配置（短信/功能开关）保留原值
+    is_admin = bool(_verify_admin_token(request.headers.get('X-Admin-Token', '')))
+    if is_admin:
+        enable_batch = 1 if d.get('enable_batch_cmd', True) else 0
+        sms_enabled  = 1 if d.get('sms_enabled', False) else 0
+        sms_total    = int(d.get('sms_total', 0) or 0)
+    else:
+        # 客户：运营项一律沿用数据库现有值，前端即使传了也忽略
+        enable_batch = cur.get('enable_batch_cmd', 1)
+        sms_enabled  = cur.get('sms_enabled', 0)
+        sms_total    = cur.get('sms_total', 0)
     db_exec(
         "UPDATE platform_setting SET bigscreen_title=?,account_title=?,unit_name=?,"
         "contact_phone=?,email=?,address=?,logo_url=?,enable_batch_cmd=?,"
@@ -2106,10 +2117,9 @@ def update_platform_setting():
         (d.get('bigscreen_title', '资产管理平台'), d.get('account_title', '资产管理平台'),
          d.get('unit_name', ''), d.get('contact_phone', ''), d.get('email', ''),
          d.get('address', ''), d.get('logo_url', ''),
-         1 if d.get('enable_batch_cmd', True) else 0,
-         1 if d.get('sms_enabled', False) else 0, int(d.get('sms_total', 0) or 0))
+         enable_batch, sms_enabled, sms_total)
     )
-    add_op_log('平台设置', '更新平台设置')
+    add_op_log('平台设置', '更新平台设置' + ('' if is_admin else '（客户改品牌）'))
     return ok()
 
 
@@ -2990,6 +3000,10 @@ def _require_admin_for_api():
         return None
     # 放行：读取平台白标设置（名称/Logo），客户门户与登录页均需展示，只读无敏感数据
     if path == '/api/platform-setting' and request.method == 'GET':
+        return None
+    # 放行：客户保存平台品牌设置（PUT）。持有效客户 token 即可，
+    # 保存逻辑内部仅允许客户改品牌字段，短信/功能配置保留原值。
+    if path == '/api/platform-setting' and request.method == 'PUT' and _get_portal_customer():
         return None
     # 其余所有管理员接口：校验 X-Admin-Token
     token = request.headers.get('X-Admin-Token', '')

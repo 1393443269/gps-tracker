@@ -17,7 +17,7 @@
         router
       >
         <div class="menu-group-label">监控</div>
-        <el-menu-item v-if="isAdmin" index="/bigscreen">
+        <el-menu-item index="/bigscreen">
           <el-icon><Monitor /></el-icon><span>大屏展示</span>
         </el-menu-item>
         <el-menu-item index="/dashboard">
@@ -60,7 +60,7 @@
           <span>客户管理</span>
         </el-menu-item>
 
-        <div class="menu-group-label" v-if="isAdmin">系统</div>
+        <div class="menu-group-label">系统</div>
         <el-menu-item v-if="isAdmin" index="/org">
           <el-icon><OfficeBuilding /></el-icon>
           <span>组织管理</span>
@@ -69,7 +69,7 @@
           <el-icon><Operation /></el-icon>
           <span>模块授权</span>
         </el-menu-item>
-        <el-menu-item v-if="isAdmin" index="/platform-setting">
+        <el-menu-item index="/platform-setting">
           <el-icon><Tools /></el-icon>
           <span>平台设置</span>
         </el-menu-item>

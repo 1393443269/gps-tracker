@@ -68,7 +68,7 @@
       </el-tab-pane>
 
       <!-- ══ 功能配置 ══ -->
-      <el-tab-pane label="功能配置" name="feature">
+      <el-tab-pane v-if="isAdmin()" label="功能配置" name="feature">
         <div style="max-width:700px;" v-loading="loading">
           <div style="font-size:14px;font-weight:600;margin:6px 0 12px;">设备功能</div>
           <el-descriptions :column="1" border>
@@ -101,7 +101,7 @@
       </el-tab-pane>
 
       <!-- ══ 操作日志 ══ -->
-      <el-tab-pane label="操作日志" name="log">
+      <el-tab-pane v-if="isAdmin()" label="操作日志" name="log">
         <el-table :data="logs" v-loading="logLoading" stripe border size="small">
           <el-table-column type="index" label="#" width="50" />
           <el-table-column prop="action"     label="操作类型" width="140" />
@@ -120,7 +120,7 @@
 <script setup>
 import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { Plus } from '@element-plus/icons-vue'
-import { platformApi, oplogApi, UPLOAD_AVATAR_URL, uploadHeaders } from '@/api'
+import { platformApi, oplogApi, UPLOAD_AVATAR_URL, uploadHeaders, isAdmin } from '@/api'
 import { ElMessage } from 'element-plus'
 
 const activeTab = ref('info')
