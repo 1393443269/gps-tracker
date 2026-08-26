@@ -32,7 +32,7 @@
         <el-menu-item index="/fence">
           <el-icon><Position /></el-icon><span>电子围栏</span>
         </el-menu-item>
-        <el-menu-item v-if="isAdmin" index="/health">
+        <el-menu-item index="/health">
           <el-icon><FirstAidKit /></el-icon><span>健康数据</span>
         </el-menu-item>
         <el-menu-item index="/query">
@@ -83,7 +83,7 @@
         <el-menu-item v-if="isAdmin" index="/alarm-setting">
           <el-icon><SetUp /></el-icon><span>报警设置</span>
         </el-menu-item>
-        <el-menu-item v-if="isAdmin" index="/attendance">
+        <el-menu-item index="/attendance">
           <el-icon><Calendar /></el-icon><span>考勤统计</span>
         </el-menu-item>
         <el-menu-item index="/recharges">

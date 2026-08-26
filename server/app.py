@@ -3265,6 +3265,96 @@ def portal_alarms():
     return ok({'records': records, 'total': total, 'page': page})
 
 
+# ── 客户门户：考勤统计（仅本人及下级名下设备）──────────────────────────────────
+@app.get('/api/customer/attendance')
+def portal_attendance():
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    phones = _get_subtree_phones(cid)
+    if not phones:
+        return ok({'records': [], 'total': 0})
+    ph = ','.join('?' * len(phones))
+    rows = db_query(
+        "SELECT fence_id, fence_name, "
+        "       COUNT(DISTINCT phone) as device_count, "
+        "       SUM(CASE WHEN action='enter' THEN 1 ELSE 0 END) as enter_count, "
+        "       SUM(CASE WHEN action='exit'  THEN 1 ELSE 0 END) as exit_count, "
+        "       MAX(event_time) as last_time "
+        f"FROM attendance_record WHERE phone IN ({ph}) "
+        "GROUP BY fence_id, fence_name ORDER BY last_time DESC",
+        phones
+    )
+    return ok({'records': rows, 'total': len(rows)})
+
+
+@app.get('/api/customer/attendance/detail')
+def portal_attendance_detail():
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    phones = _get_subtree_phones(cid)
+    if not phones:
+        return ok({'records': [], 'total': 0, 'page': 1})
+    fence_id = request.args.get('fence_id', '').strip()
+    day      = request.args.get('day', '').strip()
+    page     = int(request.args.get('page', 1))
+    size     = int(request.args.get('size', 50))
+    offset   = (page - 1) * size
+    ph = ','.join('?' * len(phones))
+    conds  = [f"phone IN ({ph})"]
+    params = list(phones)
+    if fence_id:
+        try:
+            conds.append("fence_id=?"); params.append(int(fence_id))
+        except ValueError:
+            return fail('fence_id 格式错误', 400)
+    if day and _DATE_RE.match(day):
+        conds.append("date(event_time)=?"); params.append(day)
+    where = "WHERE " + " AND ".join(conds)
+    total   = db_scalar(f"SELECT COUNT(*) FROM attendance_record {where}", params)
+    records = db_query(
+        f"SELECT * FROM attendance_record {where} ORDER BY event_time DESC LIMIT ? OFFSET ?",
+        params + [size, offset])
+    return ok({'records': records, 'total': total, 'page': page})
+
+
+# ── 客户门户：健康数据（仅本人及下级名下设备）──────────────────────────────────
+@app.get('/api/customer/health')
+def portal_health():
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    phones = _get_subtree_phones(cid)
+    if not phones:
+        return ok({'records': [], 'total': 0, 'page': 1})
+    kw   = request.args.get('keyword', '').strip()
+    day  = request.args.get('day', '').strip()
+    page = int(request.args.get('page', 1))
+    size = int(request.args.get('size', 20))
+    offset = (page - 1) * size
+    ph = ','.join('?' * len(phones))
+    conds  = [f"h.phone IN ({ph})"]
+    params = list(phones)
+    if kw:
+        like = f'%{kw}%'
+        conds.append("(h.phone LIKE ? OR d.name LIKE ? OR c.name LIKE ?)")
+        params += [like, like, like]
+    if day and _DATE_RE.match(day):
+        conds.append("date(h.record_time)=?"); params.append(day)
+    where = "WHERE " + " AND ".join(conds)
+    base = ("FROM health_record h "
+            "LEFT JOIN device d ON h.phone = d.phone "
+            "LEFT JOIN customer c ON d.customer_id = c.id ")
+    total   = db_scalar(f"SELECT COUNT(*) {base} {where}", params)
+    records = db_query(
+        "SELECT h.*, d.name as device_name, c.name as account "
+        + base + where +
+        " ORDER BY h.record_time DESC LIMIT ? OFFSET ?",
+        params + [size, offset])
+    return ok({'records': records, 'total': total, 'page': page})
+
+
 @app.post('/api/customer/commands/text')
 def portal_send_text():
     """客户向自己名下的设备发送文本指令"""

@@ -96,13 +96,13 @@ export const alarmRuleApi = {
 
 // ── 考勤统计 ──────────────────────────────────────────────────────────────────
 export const attendanceApi = {
-  list:   ()          => http.get('/attendance'),
-  detail: (params)    => http.get('/attendance/detail', { params }),
+  list:   ()          => isAdmin() ? http.get('/attendance')                 : portalHttp.get('/attendance'),
+  detail: (params)    => isAdmin() ? http.get('/attendance/detail',{params}) : portalHttp.get('/attendance/detail',{params}),
 }
 
 // ── 健康数据 ──────────────────────────────────────────────────────────────────
 export const healthApi = {
-  list:   (params)    => http.get('/health', { params }),
+  list:   (params)    => isAdmin() ? http.get('/health',{params})           : portalHttp.get('/health',{params}),
 }
 
 // ── 平台设置 ──────────────────────────────────────────────────────────────────
