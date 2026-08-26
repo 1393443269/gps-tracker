@@ -131,8 +131,13 @@ def _split_sql(script):
 
 
 def _to_pg(sql):
-    """PG 适配：先做方言改写，再把 ? 占位符转成 %s。"""
-    return _pg_dialect(sql).replace('?', '%s')
+    """PG 适配：先做方言改写；再把 SQL 里的字面 % 转义成 %%（psycopg2 用 % 做
+    参数占位，字面 % 不转义会被当成占位符解析而报 IndexError，如 LIKE '%'||x||'%'）；
+    最后把 ? 占位符转成 %s。转义务必在 ?→%s 之前，否则新引入的 %s 会被误转义。"""
+    s = _pg_dialect(sql)
+    s = s.replace('%', '%%')      # 先转义所有字面 %
+    s = s.replace('?', '%s')      # 再把占位符 ? 变成 %s（此时不会被上一步影响）
+    return s
 
 
 class _ConnWrapper:
