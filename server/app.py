@@ -130,12 +130,13 @@ class _ConnWrapper:
             cur.executemany(sql, seq)
         return cur
     def executescript(self, script):
-        # SQLite 有原生 executescript；postgres 用 cursor 逐段执行
+        # SQLite 有原生 executescript；postgres 需先做方言转换再逐条执行
         if self._backend == 'sqlite':
             self._raw.executescript(script)
         else:
             cur = self._raw.cursor()
-            cur.execute(script)   # psycopg2 支持一次执行多条以 ; 分隔的语句
+            # 整段脚本做 SQLite->PG 方言改写（AUTOINCREMENT→SERIAL、strftime 默认值等）
+            cur.execute(_pg_dialect(script))   # psycopg2 支持一次执行多条以 ; 分隔的语句
         return self
     def cursor(self):  return self._raw.cursor()
     def commit(self):  self._raw.commit()
