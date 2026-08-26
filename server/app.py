@@ -1129,10 +1129,76 @@ def handle_location(sock, phone, serial, body):
 
 # ── TCP 连接处理线程 ────────────────────────────────────────────────────────────
 
+import protocol_g618g as g618
+
+def handle_g618g_frame(conn, frame, phone_holder):
+    """处理一个 G618G 上报帧：解析并落库。phone_holder 是 [phone] 单元素列表（可变引用）。"""
+    r = g618.parse(frame)
+    typ = r.get('type')
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    if typ == 'register':          # 0xF0 建立连接：记录 IMEI、回复 F1、登记会话
+        imei = r.get('imei')
+        phone_holder[0] = imei
+        with sessions_lock:
+            sessions[imei] = conn
+        # 设备不存在则自动创建
+        row = db_query_one("SELECT id FROM device WHERE phone=?", (imei,))
+        if not row:
+            db_exec("INSERT INTO device (phone,name,manufacturer,terminal_model,status,"
+                    "org_id,lifecycle,created_at,updated_at) VALUES (?,?,?,?,1,1,1,?,?)",
+                    (imei, 'G618G-'+imei[-6:], 'OFERT', 'G618G', now, now))
+        else:
+            db_exec("UPDATE device SET status=1,online_time=?,updated_at=? WHERE phone=?", (now, now, imei))
+        # 回复 F1（时间戳用当前秒）
+        import time as _t
+        conn.sendall(g618.build_login_reply(int(_t.time())))
+        log.info("[G618G] 设备上线 IMEI=%s", imei)
+
+    elif typ == 'heartbeat':       # 0xF9 心跳：回复保持连接 + 更新电量
+        conn.sendall(g618.build_heartbeat_reply())
+        imei = phone_holder[0]
+        if imei:
+            db_exec("UPDATE device SET updated_at=? WHERE phone=?", (now, imei))
+
+    elif typ == 'location':        # 0x03 位置：更新设备最新位置 + 写轨迹（走异步批量）
+        imei = phone_holder[0]
+        if imei and r.get('valid'):
+            gps_time = datetime.fromtimestamp(r['timestamp']).strftime('%Y-%m-%d %H:%M:%S') if r.get('timestamp') else now
+            did = _get_device_id(imei)
+            enqueue_location(
+                (did, imei, r['lat'], r['lng'], 0, 0, 0, 0, 2, None, gps_time),
+                (imei, r['lat'], r['lng'], 0, gps_time, 1, now)
+            )
+
+    elif typ in ('alarm', 'alarm2'):   # 0x02/0x21 报警
+        imei = phone_holder[0]
+        if imei:
+            did = _get_device_id(imei)
+            desc = '、'.join(r.get('alarms') or ['报警'])
+            db_exec("INSERT INTO alarm_record (device_id,phone,alarm_type,alarm_desc,alarm_time,status) "
+                    "VALUES (?,?,?,?,?,0)", (did, imei, r.get('warn_bits', 0), desc, now))
+            has_sos = any('SOS' in a for a in (r.get('alarms') or []))
+            _emit_alarm('alarm', {'phone': imei, 'alarmDesc': desc, 'time': now},
+                        imei, 0 if has_sos else 99)
+
+    elif typ == 'iccid':           # 0xF3 SIM ICCID
+        imei = phone_holder[0]
+        if imei:
+            db_exec("UPDATE device SET remark=? WHERE phone=?", ('ICCID:'+r['iccid'], imei))
+
+    elif typ == 'charge':          # 0xC3 充电状态
+        pass   # 可扩展：记录充电事件
+
+    # ble / wifi_lbs 定位需接第三方定位库换算经纬度，暂只解析不落库
+    return typ
+
+
 def handle_client(conn, addr):
-    log.info("[808] 新连接: %s:%d", addr[0], addr[1])
+    log.info("[TCP] 新连接: %s:%d", addr[0], addr[1])
     buf   = bytearray()
     phone = None
+    proto = None   # None=未定, '808', 'g618'
     conn.settimeout(90)
 
     try:
@@ -1140,12 +1206,29 @@ def handle_client(conn, addr):
             try:
                 data = conn.recv(4096)
             except socket.timeout:
-                log.info("[808] 空闲超时: %s phone=%s", addr, phone)
+                log.info("[TCP] 空闲超时: %s phone=%s", addr, phone)
                 break
             if not data:
                 break
 
             buf.extend(data)
+
+            # ── 协议识别：首字节 0xBD → G618G；0x7E → JT/T808 ──
+            if proto is None and len(buf) >= 1:
+                proto = 'g618' if buf[0] == 0xBD else '808'
+
+            if proto == 'g618':
+                g_frames, buf = g618.split_frames(bytes(buf))
+                buf = bytearray(buf)
+                ph_holder = [phone]
+                for gf in g_frames:
+                    try:
+                        handle_g618g_frame(conn, gf, ph_holder)
+                    except Exception as e:
+                        log.error("[G618G] 处理异常: %s", e, exc_info=True)
+                phone = ph_holder[0]
+                continue
+
             frames, buf = p.extract_frames(buf)
 
             for frame in frames:
