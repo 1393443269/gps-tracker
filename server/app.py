@@ -537,6 +537,19 @@ def init_db():
     );
     CREATE INDEX IF NOT EXISTS idx_health_phone ON health_record(phone, record_time);
     CREATE INDEX IF NOT EXISTS idx_attend_fence ON attendance_record(fence_id, event_time);
+
+    -- 客户独立品牌：每个客户一份白标品牌；字段为 NULL 表示未配置，读取时逐级继承上级、最终回退全站默认
+    CREATE TABLE IF NOT EXISTS customer_branding (
+        customer_id     INTEGER PRIMARY KEY,
+        bigscreen_title TEXT DEFAULT NULL,
+        account_title   TEXT DEFAULT NULL,
+        unit_name       TEXT DEFAULT NULL,
+        contact_phone   TEXT DEFAULT NULL,
+        email           TEXT DEFAULT NULL,
+        address         TEXT DEFAULT NULL,
+        logo_url        TEXT DEFAULT NULL,
+        updated_at      TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
+    );
     """)
     conn.commit()
 
@@ -2090,26 +2103,80 @@ def _get_platform_setting(org_id=1):
     return row
 
 
+# ── 客户独立品牌 ───────────────────────────────────────────────────────────────
+# 7 个可白标的品牌字段（运营配置 sms_* / enable_batch_cmd 不在此列，仍全站一份）
+BRAND_FIELDS = ['bigscreen_title', 'account_title', 'unit_name',
+                'contact_phone', 'email', 'address', 'logo_url']
+
+
+def _get_customer_branding_row(cid):
+    """取某客户自己那份品牌（未配置返回 None）"""
+    return db_query_one("SELECT * FROM customer_branding WHERE customer_id=?", (cid,))
+
+
+def _resolve_branding(cid):
+    """
+    解析客户 cid 最终生效的品牌：逐字段沿「自己→父级→…→顶级」继承，
+    任一字段在某级已配置（非 NULL 非空）即采用；整条链都没配的字段回退全站默认。
+    返回含全部 BRAND_FIELDS 的 dict。
+    """
+    base = _get_platform_setting(1)                       # 全站默认（管理员那份）
+    result = {f: (base.get(f) or '') for f in BRAND_FIELDS}
+    if not cid:
+        return result
+    remaining = set(BRAND_FIELDS)
+    for anc in _customer_ancestors(cid):                  # 有序：自己在前，顶级在后
+        if not remaining:
+            break
+        row = _get_customer_branding_row(anc)
+        if not row:
+            continue
+        for f in list(remaining):
+            v = row.get(f)
+            if v is not None and str(v).strip() != '':
+                result[f] = v
+                remaining.discard(f)
+    return result
+
+
 @app.get('/api/platform-setting')
 def get_platform_setting():
+    # 客户登录：返回其专属品牌（继承解析）+ 全站运营配置的只读展示
+    cid = _get_portal_customer()
+    if cid:
+        brand = _resolve_branding(cid)
+        base  = _get_platform_setting(1)
+        # 运营配置沿用全站值（客户端不显示，仅避免字段缺失）
+        for k in ['enable_batch_cmd', 'sms_enabled', 'sms_total', 'sms_used']:
+            brand[k] = base.get(k)
+        return ok(brand)
     return ok(_get_platform_setting(1))
 
 
 @app.put('/api/platform-setting')
 def update_platform_setting():
     d = request.get_json() or {}
-    cur = _get_platform_setting(1)   # 确保存在，并取当前值
-    # 身份判定：管理员可改全部；客户仅可改品牌字段，运营配置（短信/功能开关）保留原值
     is_admin = bool(_verify_admin_token(request.headers.get('X-Admin-Token', '')))
-    if is_admin:
-        enable_batch = 1 if d.get('enable_batch_cmd', True) else 0
-        sms_enabled  = 1 if d.get('sms_enabled', False) else 0
-        sms_total    = int(d.get('sms_total', 0) or 0)
-    else:
-        # 客户：运营项一律沿用数据库现有值，前端即使传了也忽略
-        enable_batch = cur.get('enable_batch_cmd', 1)
-        sms_enabled  = cur.get('sms_enabled', 0)
-        sms_total    = cur.get('sms_total', 0)
+
+    # ── 客户：只写自己那份品牌（customer_branding），运营配置一律不碰 ──
+    if not is_admin:
+        cid = _get_portal_customer()
+        if not cid:
+            return fail('未授权，请先登录', 401)
+        vals = [ (d.get(f) if (d.get(f) is not None and str(d.get(f)).strip() != '') else None)
+                 for f in BRAND_FIELDS ]
+        cols = ','.join(BRAND_FIELDS)
+        ph   = ','.join(['?'] * len(BRAND_FIELDS))
+        setc = ','.join(f"{f}=excluded.{f}" for f in BRAND_FIELDS)
+        db_exec(
+            f"INSERT INTO customer_branding (customer_id,{cols}) VALUES (?,{ph}) "
+            f"ON CONFLICT(customer_id) DO UPDATE SET {setc}, "
+            f"updated_at=strftime('%Y-%m-%d %H:%M:%S','now','localtime')",
+            [cid] + vals
+        )
+        return ok()
+
+    # ── 管理员：写全站默认（platform_setting），可改运营配置 ──
     db_exec(
         "UPDATE platform_setting SET bigscreen_title=?,account_title=?,unit_name=?,"
         "contact_phone=?,email=?,address=?,logo_url=?,enable_batch_cmd=?,"
@@ -2117,9 +2184,10 @@ def update_platform_setting():
         (d.get('bigscreen_title', '资产管理平台'), d.get('account_title', '资产管理平台'),
          d.get('unit_name', ''), d.get('contact_phone', ''), d.get('email', ''),
          d.get('address', ''), d.get('logo_url', ''),
-         enable_batch, sms_enabled, sms_total)
+         1 if d.get('enable_batch_cmd', True) else 0,
+         1 if d.get('sms_enabled', False) else 0, int(d.get('sms_total', 0) or 0))
     )
-    add_op_log('平台设置', '更新平台设置' + ('' if is_admin else '（客户改品牌）'))
+    add_op_log('平台设置', '更新平台设置')
     return ok()
 
 
