@@ -11,6 +11,18 @@ services:
       - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
     restart: unless-stopped
 
+  # ── PostgreSQL（可选后端；backend 设 DB_BACKEND=postgres 时启用） ───────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: tracker-postgres
+    environment:
+      - POSTGRES_USER=gps
+      - POSTGRES_PASSWORD=gps_pw_2024
+      - POSTGRES_DB=gps
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
   # ── Python Flask 后端（REST API + Socket.IO + 808 TCP + MQTT 订阅） ─────────
   backend:
     build:
@@ -21,11 +33,15 @@ services:
     volumes:
       - tracker_data:/app/data
     environment:
+      # 数据库后端：默认 sqlite（不填即可）；切 PG 时设 DB_BACKEND=postgres
+      - DB_BACKEND=${DB_BACKEND:-sqlite}
+      - DATABASE_URL=postgresql://gps:gps_pw_2024@postgres:5432/gps
       - DB_PATH=/app/data/tracker.db
       - MQTT_BROKER=mqtt
       - MQTT_PORT=1883
     depends_on:
       - mqtt
+      - postgres
     restart: unless-stopped
 
   # ── Nginx 前端（静态资源 + 反向代理） ──────────────────────────────────────
@@ -39,7 +55,9 @@ services:
       - backend
     restart: unless-stopped
 
-# SQLite 数据持久化卷
+# 数据持久化卷
 volumes:
   tracker_data:
+    driver: local
+  pg_data:
     driver: local

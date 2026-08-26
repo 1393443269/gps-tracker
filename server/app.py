@@ -72,9 +72,39 @@ if DB_BACKEND == 'postgres':
     _PG_DSN = os.environ.get('DATABASE_URL',
                              'postgresql://postgres:postgres@127.0.0.1:5432/gps')
 
+import re as _re
+
+def _pg_dialect(sql):
+    """把 SQLite 方言 SQL 改写成 PostgreSQL 兼容写法（仅处理本项目实际用到的差异）。
+    覆盖：自增主键、建表时间默认值、INSERT OR IGNORE、now/date 时间运算。
+    注意：Python 侧的 datetime.now().strftime() 是 Python 代码不经过此函数，无需处理。"""
+    s = sql
+    # 1) 自增主键：INTEGER PRIMARY KEY AUTOINCREMENT -> SERIAL PRIMARY KEY
+    s = _re.sub(r'INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT', 'SERIAL PRIMARY KEY', s, flags=_re.I)
+    # 2) 建表默认值：DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime')) -> DEFAULT (to_char(now(),'YYYY-MM-DD HH24:MI:SS'))
+    s = s.replace("strftime('%Y-%m-%d %H:%M:%S','now','localtime')",
+                  "to_char(now(),'YYYY-MM-DD HH24:MI:SS')")
+    s = s.replace("strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime')",
+                  "to_char(now(),'YYYY-MM-DD HH24:MI:SS')")
+    # 3) INSERT OR IGNORE -> INSERT ... ON CONFLICT DO NOTHING（PG 需显式 ON CONFLICT）
+    #    本项目 OR IGNORE 用于避免重复插入，DO NOTHING 语义等价
+    s = _re.sub(r'INSERT\s+OR\s+IGNORE\s+INTO', 'INSERT INTO', s, flags=_re.I)
+    _or_ignore = _re.search(r'INSERT\s+OR\s+IGNORE', sql, flags=_re.I)
+    if _or_ignore and 'ON CONFLICT' not in s.upper():
+        s = s.rstrip().rstrip(';') + ' ON CONFLICT DO NOTHING'
+    # 4) date('now') / date('now','+N days') -> PG 的日期运算
+    s = s.replace("date('now','start of month')", "date_trunc('month', now())::date")
+    s = _re.sub(r"date\('now',\s*'([+-]\d+) days'\)",
+                lambda m: f"(now()::date + interval '{m.group(1)} day')::date", s)
+    s = s.replace("date('now')", "now()::date")
+    # 5) strftime 裸用（查询里对 now 取字符串，若有）
+    s = s.replace("strftime('%Y-%m-%d %H:%M:%S','now')", "to_char(now(),'YYYY-MM-DD HH24:MI:SS')")
+    return s
+
+
 def _to_pg(sql):
-    """把 ? 占位符转成 %s（psycopg2 用 %s）。字符串字面量里的 ? 需谨慎——本项目 SQL 无此情况。"""
-    return sql.replace('?', '%s')
+    """PG 适配：先做方言改写，再把 ? 占位符转成 %s。"""
+    return _pg_dialect(sql).replace('?', '%s')
 
 
 class _ConnWrapper:
