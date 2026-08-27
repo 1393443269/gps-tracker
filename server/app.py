@@ -4569,6 +4569,8 @@ def save_org_module_auth(org_id):
 
 MQTT_BROKER = os.environ.get('MQTT_BROKER', 'localhost')
 MQTT_PORT_NUM = int(os.environ.get('MQTT_PORT', 1883))
+MQTT_USER = os.environ.get("MQTT_USER", "")
+MQTT_PASS = os.environ.get("MQTT_PASS", "")
 
 
 def _mqtt_on_message(client, userdata, msg):
@@ -4641,6 +4643,8 @@ def start_mqtt_subscriber():
         client = _mqtt.Client(client_id='tracker-server', clean_session=True)
         client.on_connect = _on_connect
         client.on_message = _mqtt_on_message
+        if MQTT_USER:
+            client.username_pw_set(MQTT_USER, MQTT_PASS)
         client.connect(MQTT_BROKER, MQTT_PORT_NUM, keepalive=60)
         log.info("[MQTT] 正在连接 broker %s:%d ...", MQTT_BROKER, MQTT_PORT_NUM)
         client.loop_forever()

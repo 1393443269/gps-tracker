@@ -47,3 +47,7 @@ server/uploads/
 *.bak
 ~$*
 null
+
+# ── MQTT 凭证文件（含明文密码，禁止入库）──────────────────────────────────
+passwd
+mqtt_credentials.txt

@@ -1,65 +1,57 @@
 services:
-
-  # ── MQTT Broker（设备 MQTT 接入） ────────────────────────────────────────────
-  mqtt:
-    image: eclipse-mosquitto:2
-    container_name: tracker-mqtt
-    ports:
-      - "1883:1883"       # MQTT（设备直连）
-      - "9001:9001"       # MQTT over WebSocket（预留）
-    volumes:
-      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
-    restart: unless-stopped
-
-  # ── PostgreSQL（可选后端；backend 设 DB_BACKEND=postgres 时启用） ───────────
-  postgres:
-    image: postgres:16-alpine
-    container_name: tracker-postgres
-    environment:
-      - POSTGRES_USER=gps
-      - POSTGRES_PASSWORD=gps_pw_2024
-      - POSTGRES_DB=gps
-    volumes:
-      - pg_data:/var/lib/postgresql/data
-    restart: unless-stopped
-
-  # ── Python Flask 后端（REST API + Socket.IO + 808 TCP + MQTT 订阅） ─────────
   backend:
     build:
       context: ./server
     container_name: tracker-backend
-    ports:
-      - "9090:9090"       # JT/T 808 TCP（设备直连，绕过 Nginx）
-    volumes:
-      - tracker_data:/app/data
-    environment:
-      # 数据库后端：默认 sqlite（不填即可）；切 PG 时设 DB_BACKEND=postgres
-      - DB_BACKEND=postgres
-      - DATABASE_URL=postgresql://gps:gps_pw_2024@postgres:5432/gps
-      - DB_PATH=/app/data/tracker.db
-      - MQTT_BROKER=mqtt
-      - MQTT_PORT=1883
-      - ADMIN_SECRET=3e9651d4d2bd074817f5b868ae875b9719d63d1a08a653a2
-      - PORTAL_SECRET=81abeed060162179e4fa857bfc07f2258de64e0e8302ee94
     depends_on:
-      - mqtt
-      - postgres
+    - mqtt
+    - postgres
+    environment:
+    - DB_BACKEND=postgres
+    - DATABASE_URL=postgresql://gps:gps_pw_2024@postgres:5432/gps
+    - DB_PATH=/app/data/tracker.db
+    - MQTT_BROKER=mqtt
+    - MQTT_PORT=1883
+    - ADMIN_SECRET=3e9651d4d2bd074817f5b868ae875b9719d63d1a08a653a2
+    - PORTAL_SECRET=81abeed060162179e4fa857bfc07f2258de64e0e8302ee94
+    - MQTT_USER=gps_device
+    - MQTT_PASS=zYMxS+K4KZnPa7cgypQeDg==
+    ports:
+    - 9090:9090
     restart: unless-stopped
-
-  # ── Nginx 前端（静态资源 + 反向代理） ──────────────────────────────────────
+    volumes:
+    - tracker_data:/app/data
   frontend:
     build:
       context: ./frontend
     container_name: tracker-frontend
-    ports:
-      - "80:80"
     depends_on:
-      - backend
+    - backend
+    ports:
+    - 80:80
     restart: unless-stopped
-
-# 数据持久化卷
+  mqtt:
+    container_name: tracker-mqtt
+    image: eclipse-mosquitto:2
+    ports:
+    - 1883:1883
+    - 9001:9001
+    restart: unless-stopped
+    volumes:
+    - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+    - ./passwd:/mosquitto/config/passwd:ro
+  postgres:
+    container_name: tracker-postgres
+    environment:
+    - POSTGRES_USER=gps
+    - POSTGRES_PASSWORD=gps_pw_2024
+    - POSTGRES_DB=gps
+    image: postgres:16-alpine
+    restart: unless-stopped
+    volumes:
+    - pg_data:/var/lib/postgresql/data
 volumes:
-  tracker_data:
-    driver: local
   pg_data:
+    driver: local
+  tracker_data:
     driver: local
