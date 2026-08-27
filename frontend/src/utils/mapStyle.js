@@ -3,7 +3,7 @@
  * 申请 tk：https://console.tianditu.gov.cn/ → 创建应用 → 复制 key
  * 拿到 key 后把 YOUR_TDT_TOKEN 替换掉，整个项目只改这一处。
  */
-export const TDT_TOKEN = '260ee765221063ae84b1ad1b6dc45e93'
+export const TDT_TOKEN = import.meta.env.VITE_TDT_TOKEN || ''
 
 /** 生成 t0~t7 多节点负载均衡 URL 数组 */
 function tdtTiles(layer) {

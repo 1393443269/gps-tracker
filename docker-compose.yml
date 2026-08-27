@@ -25,6 +25,8 @@ services:
   frontend:
     build:
       context: ./frontend
+      args:
+        - VITE_TDT_TOKEN=${VITE_TDT_TOKEN}
     container_name: tracker-frontend
     depends_on:
       - backend

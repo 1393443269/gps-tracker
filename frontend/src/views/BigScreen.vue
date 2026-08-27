@@ -295,6 +295,8 @@ async function buildMap(el, provinceData) {
       geo: [{
         map: mapName,
         roam: mapName !== 'china',
+        layoutCenter: ['50%', '55%'],
+        layoutSize: mapName === 'china' ? '95%' : '90%',
         silent: true,
         itemStyle: { areaColor: 'transparent', borderColor: 'transparent' },
         label: { show: false },
@@ -417,6 +419,7 @@ async function backToChina() {
   }] : []
   c.setOption({
     geo: [{ map: 'china', roam: false, silent: true,
+      layoutCenter: ['50%', '55%'], layoutSize: '95%',
       itemStyle: { areaColor: 'transparent', borderColor: 'transparent' }, label: { show: false } }],
     series: [{
       type: 'map', map: 'china', roam: false,

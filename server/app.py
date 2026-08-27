@@ -2930,11 +2930,15 @@ def upload_avatar():
 def serve_upload(filename):
     """提供上传文件（头像等）的访问。防路径穿越 + Token 鉴权（不在 /api/ 前缀下，需手动验证）。"""
     # 需要有效的管理员或客户 Token，防止无鉴权枚举上传文件
-    admin_ok = bool(_verify_admin_token(request.headers.get('X-Admin-Token', '')))
-    cust_tok = request.headers.get('X-Customer-Token', '') or request.args.get('token', '')
-    cust_ok  = bool(_verify_token(cust_tok))
-    if not admin_ok and not cust_ok:
-        return fail('未授权', 401)
+    # 图片文件（Logo/头像）允许匿名访问，文件名已是UUID，枚举风险可控
+    ext = os.path.splitext(filename)[1].lower()
+    public_exts = {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico'}
+    if ext not in public_exts:
+        admin_ok = bool(_verify_admin_token(request.headers.get('X-Admin-Token', '')))
+        cust_tok = request.headers.get('X-Customer-Token', '') or request.args.get('token', '')
+        cust_ok  = bool(_verify_token(cust_tok))
+        if not admin_ok and not cust_ok:
+            return fail('未授权', 401)
     safe = os.path.normpath(filename).replace('\\', '/')
     if safe.startswith('..') or safe.startswith('/'):
         return fail('非法路径', 400)
