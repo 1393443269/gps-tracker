@@ -26,6 +26,7 @@ import re as _re
 from flask_socketio import SocketIO, join_room
 from flask_cors import CORS
 import protocol as p
+import protocol_zhiling as zl
 
 # ── 日志 ──────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -172,6 +173,8 @@ class _ConnWrapper:
                 s = stmt.strip()
                 if not s:
                     continue
+                # 转义字面 % → %% 防 psycopg2 把 LIKE '%x%' 中的 % 误识别为参数占位符
+                s = s.replace('%', '%%')
                 cur = self._raw.cursor()
                 try:
                     cur.execute(s)
@@ -282,25 +285,31 @@ def _batch_writer_loop():
             _dev_latest.clear()
         if not rows and not dev_snapshot:
             continue
-        try:
-            with _db_lock:
-                conn = get_db()
-                try:
-                    if rows:
-                        conn.executemany(
-                            "INSERT INTO location_record (device_id,phone,lat,lng,altitude,"
-                            "speed,direction,alarm_flag,status_flag,mileage,gps_time) "
-                            "VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
-                    if dev_snapshot:
-                        conn.executemany(
-                            "UPDATE device SET last_lat=?,last_lng=?,last_speed=?,"
-                            "last_location_time=?,status=?,updated_at=? WHERE phone=?",
-                            [(d[1],d[2],d[3],d[4],d[5],d[6],d[0]) for d in dev_snapshot])
-                    conn.commit()
-                finally:
-                    conn.close()
-        except Exception as e:
-            log.error("[批量写] 落库失败: %s", e)
+        _write_ok = False
+        for _attempt in range(3):   # 最多重试 3 次，防止瞬时数据库抖动丢弃位置数据
+            try:
+                with _db_lock:
+                    conn = get_db()
+                    try:
+                        if rows:
+                            conn.executemany(
+                                "INSERT INTO location_record (device_id,phone,lat,lng,altitude,"
+                                "speed,direction,alarm_flag,status_flag,mileage,gps_time) "
+                                "VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+                        if dev_snapshot:
+                            conn.executemany(
+                                "UPDATE device SET last_lat=?,last_lng=?,last_speed=?,"
+                                "last_location_time=?,status=?,updated_at=? WHERE phone=?",
+                                [(d[1],d[2],d[3],d[4],d[5],d[6],d[0]) for d in dev_snapshot])
+                        conn.commit()
+                    finally:
+                        conn.close()
+                _write_ok = True
+                break
+            except Exception as e:
+                log.error("[批量写] 落库失败(第%d次): %s", _attempt + 1, e)
+        if not _write_ok:
+            log.critical("[批量写] 连续 3 次落库失败，%d 条位置记录已丢弃！请检查数据库连接。", len(rows))
 
 _batch_writer_started = False
 def start_batch_writer():
@@ -627,6 +636,33 @@ def init_db():
         logo_url        TEXT DEFAULT NULL,
         updated_at      TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
     );
+
+    -- 蓝牙信标位置对照表：major/minor 唯一标识一个信标，映射到固定安装坐标（坐标可空，后续维护）
+    CREATE TABLE IF NOT EXISTS beacon_location (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        major       INTEGER NOT NULL,
+        minor       INTEGER NOT NULL,
+        name        TEXT DEFAULT NULL,      -- 信标位置名称（如"3号仓库门口"）
+        lat         REAL DEFAULT NULL,      -- 安装点纬度（留空表示未标定）
+        lng         REAL DEFAULT NULL,      -- 安装点经度
+        org_id      INTEGER DEFAULT 1,
+        updated_at  TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime')),
+        UNIQUE(major, minor)
+    );
+
+    -- 蓝牙信标上报记录：设备扫描到的信标（G618G 0xD6），命中对照表则带出坐标
+    CREATE TABLE IF NOT EXISTS beacon_report (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        phone       TEXT NOT NULL,
+        major       INTEGER,
+        minor       INTEGER,
+        rssi        INTEGER,
+        lat         REAL DEFAULT NULL,
+        lng         REAL DEFAULT NULL,
+        report_time TEXT,
+        created_at  TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_beacon_report ON beacon_report(phone, report_time);
     """)
     conn.commit()
 
@@ -1119,6 +1155,9 @@ def handle_auth(sock, phone, serial, body):
     else:
         result = 1
         log.warning("[808] 鉴权失败: phone=%s auth=%s", canonical, auth_code)
+        # 鉴权失败：从 sessions 中删除，防止未鉴权设备被下发指令
+        with sessions_lock:
+            sessions.pop(canonical, None)
 
     sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0102, result))
 
@@ -1220,6 +1259,7 @@ def handle_location(sock, phone, serial, body):
 # ── TCP 连接处理线程 ────────────────────────────────────────────────────────────
 
 import protocol_g618g as g618
+import geo_resolve
 
 def handle_g618g_frame(conn, frame, phone_holder):
     """处理一个 G618G 上报帧：解析并落库。phone_holder 是 [phone] 单元素列表（可变引用）。"""
@@ -1280,7 +1320,53 @@ def handle_g618g_frame(conn, frame, phone_holder):
     elif typ == 'charge':          # 0xC3 充电状态
         pass   # 可扩展：记录充电事件
 
-    # ble / wifi_lbs 定位需接第三方定位库换算经纬度，暂只解析不落库
+    elif typ == 'wifi_lbs':        # 0xA4 WiFi+基站：调第三方服务换算经纬度后落库
+        imei = phone_holder[0]
+        if imei:
+            ts = r.get('timestamp')
+            gps_time = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else now
+            # 优先 WiFi 定位，其次基站定位；未配置 AMAP_KEY 时 resolve 返回 None
+            fix = None
+            if geo_resolve.enabled():
+                fix = geo_resolve.resolve_wifi(r.get('wifis') or []) \
+                      or geo_resolve.resolve_lbs(r.get('cells') or [])
+            if fix:
+                did = _get_device_id(imei)
+                # loc_type: 3=WiFi, 4=基站(区别于 GPS=2)
+                loc_type = 3 if fix['source'] == 'wifi' else 4
+                enqueue_location(
+                    (did, imei, fix['lat'], fix['lng'], 0, 0, 0, 0, loc_type, None, gps_time),
+                    (imei, fix['lat'], fix['lng'], 0, gps_time, 1, now)
+                )
+            else:
+                # 未配 Key 或换算失败：仅调试日志，不落坐标（数据不丢，可后续补算）
+                log.debug("[G618G] WiFi/基站定位未换算 imei=%s wifi=%d cell=%d key=%s",
+                          imei, len(r.get('wifis') or []), len(r.get('cells') or []),
+                          'Y' if geo_resolve.enabled() else 'N')
+
+    elif typ == 'ble':             # 0xD6 蓝牙信标：结构化落库到 beacon_report(坐标靠对照表后补)
+        imei = phone_holder[0]
+        if imei:
+            ts = r.get('timestamp')
+            rt = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else now
+            for b in (r.get('beacons') or []):
+                # 查信标对照表，命中且有坐标则一并记录
+                loc = db_query_one(
+                    "SELECT lat, lng FROM beacon_location WHERE major=? AND minor=?",
+                    (b.get('major'), b.get('minor')))
+                lat = loc['lat'] if loc else None
+                lng = loc['lng'] if loc else None
+                db_exec("INSERT INTO beacon_report (phone,major,minor,rssi,lat,lng,report_time) "
+                        "VALUES (?,?,?,?,?,?,?)",
+                        (imei, b.get('major'), b.get('minor'), b.get('rssi'), lat, lng, rt))
+                # 命中且有坐标：同时更新设备最新位置(定位类型 5=蓝牙信标)
+                if lat is not None and lng is not None:
+                    did = _get_device_id(imei)
+                    enqueue_location(
+                        (did, imei, lat, lng, 0, 0, 0, 0, 5, None, rt),
+                        (imei, lat, lng, 0, rt, 1, now)
+                    )
+
     return typ
 
 
@@ -1363,6 +1449,15 @@ def handle_client(conn, addr):
         log.info("[808] 连接断开: %s phone=%s", addr, phone)
 
 
+_TCP_CONN_SEM = threading.Semaphore(500)   # 最大并发 TCP 连接数，防止线程耗尽 OOM
+
+def _handle_client_guarded(conn, addr):
+    """用信号量包裹 handle_client，连接退出后自动释放槽位。"""
+    try:
+        handle_client(conn, addr)
+    finally:
+        _TCP_CONN_SEM.release()
+
 def start_tcp_server():
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1374,13 +1469,31 @@ def start_tcp_server():
     while True:
         try:
             conn, addr = srv.accept()
-            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+            if not _TCP_CONN_SEM.acquire(blocking=False):
+                log.warning("[808] 连接数已达上限(500)，拒绝 %s", addr)
+                conn.close()
+                continue
+            t = threading.Thread(target=_handle_client_guarded, args=(conn, addr), daemon=True)
             t.start()
         except Exception as e:
             log.error("[808] accept 错误: %s", e)
 
 
 # ── REST API ───────────────────────────────────────────────────────────────────
+
+_MAX_PAGE_SIZE = 500   # 全局分页 size 上限，防止传 size=999999 触发全表扫描 DoS
+
+def _page_params(default_size=20, max_size=_MAX_PAGE_SIZE):
+    """安全解析分页参数：捕获 ValueError，并对 size/page 做范围约束。"""
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+    except (ValueError, TypeError):
+        page = 1
+    try:
+        size = min(max_size, max(1, int(request.args.get('size', default_size))))
+    except (ValueError, TypeError):
+        size = default_size
+    return page, size
 
 def ok(data=None):
     return jsonify({'code': 200, 'msg': 'success', 'data': data})
@@ -1438,8 +1551,7 @@ def device_summary():
 
 @app.get('/api/devices')
 def list_devices():
-    page   = int(request.args.get('page', 1))
-    size   = int(request.args.get('size', 20))
+    page, size = _page_params(20)
     kw     = request.args.get('keyword', '').strip()
     lc     = request.args.get('lifecycle', '').strip()
     st     = request.args.get('status', '').strip()
@@ -1584,8 +1696,7 @@ def _customer_and_descendants(cid):
 def devices_with_customer():
     """设备信息列表：JOIN customer，返回绑定人员信息 + 围栏数。
     支持三种查询：customer_id（含子账户）、terminal_model（设备型号）、imei。"""
-    page      = int(request.args.get('page', 1))
-    size      = int(request.args.get('size', 20))
+    page, size = _page_params(20)
     kw        = request.args.get('keyword', '').strip()
     cust_id   = request.args.get('customer_id', '').strip()
     model     = request.args.get('terminal_model', '').strip()
@@ -1785,7 +1896,7 @@ def batch_command_devices():
             offline += 1
             continue
         try:
-            body = bytes([0x01]) + text.encode('utf-8')
+            body = bytes([0x01]) + text.encode('gbk', errors='replace')
             conn.sendall(p.encode_message(0x8300, phone, next_serial(), body))
             sent += 1
         except Exception:
@@ -1908,8 +2019,7 @@ def latest_location(phone):
 
 @app.get('/api/locations/<phone>/history')
 def location_history(phone):
-    page   = int(request.args.get('page', 1))
-    size   = int(request.args.get('size', 100))
+    page, size = _page_params(100, max_size=1000)
     start  = request.args.get('start')
     end    = request.args.get('end')
     offset = (page - 1) * size
@@ -1928,8 +2038,7 @@ def location_history(phone):
 
 @app.get('/api/alarms')
 def list_alarms():
-    page   = int(request.args.get('page', 1))
-    size   = int(request.args.get('size', 20))
+    page, size = _page_params(20)
     status = request.args.get('status')
     phone  = request.args.get('phone', '').strip()
     offset = (page - 1) * size
@@ -2092,8 +2201,7 @@ def attendance_detail():
     """某围栏的考勤明细（可按日期过滤）"""
     fence_id = request.args.get('fence_id', '').strip()
     day      = request.args.get('day', '').strip()
-    page     = int(request.args.get('page', 1))
-    size     = int(request.args.get('size', 50))
+    page, size = _page_params(50)
     offset   = (page - 1) * size
     sids     = _org_scope_ids(request)
     conds, params = [], []
@@ -2121,8 +2229,7 @@ def list_health():
     """健康数据查询：按归属账号/日期/IMEI，返回每设备最新一条"""
     kw   = request.args.get('keyword', '').strip()
     day  = request.args.get('day', '').strip()
-    page = int(request.args.get('page', 1))
-    size = int(request.args.get('size', 20))
+    page, size = _page_params(20)
     offset = (page - 1) * size
     sids = _org_scope_ids(request)
 
@@ -2282,7 +2389,8 @@ def send_text():
     if not conn:
         return fail(f'设备不在线: {phone}', 404)
     try:
-        body = bytes([0x01]) + text.encode('utf-8')
+        # 天禧协议规定 0x8300 文本/命令字符串用 GBK 编码
+        body = bytes([0x01]) + text.encode('gbk', errors='replace')
         conn.sendall(p.encode_message(0x8300, phone, next_serial(), body))
         return ok()
     except Exception as e:
@@ -2290,23 +2398,40 @@ def send_text():
 
 @app.post('/api/commands/control')
 def terminal_control():
+    """终端控制。天禧设备(默认)走命令字符串经 0x8300 下发；proto='808' 时用标准
+    0x8105 终端控制报文(兼容标准808设备)。
+    天禧: {"phone","action":"reset|upload|query"}；标准: {"phone","proto":"808","cmd":4}"""
     data  = request.get_json() or {}
     phone = data.get('phone', '')
-    cmd   = int(data.get('cmd', 1))
+    proto = data.get('proto', 'zhiling')
     with sessions_lock:
         conn = sessions.get(phone)
     if not conn:
         return fail(f'设备不在线: {phone}', 404)
     try:
-        conn.sendall(p.encode_message(0x8105, phone, next_serial(), struct.pack('>I', cmd)))
-        return ok()
+        if proto == '808':
+            cmd = int(data.get('cmd', 1))
+            conn.sendall(p.encode_message(0x8105, phone, next_serial(), struct.pack('>I', cmd)))
+            sent = f'0x8105 cmd={cmd}'
+        else:
+            action = data.get('action', 'reset')
+            _map = {'reset': zl.build_reset, 'upload': zl.build_upload_now, 'query': zl.build_query_status}
+            if action not in _map:
+                return fail(f'不支持的天禧控制动作: {action}（reset/upload/query）')
+            sent = send_zhiling_cmd(conn, phone, _map[action]())
+        add_op_log('终端控制', f'phone={phone} {sent}')
+        return ok({'sent': sent})
     except Exception as e:
         return fail(str(e))
 
 @app.post('/api/commands/track')
 def location_track():
+    """临时位置跟踪。天禧设备(默认)用「设置上传频率」命令实现；proto='808' 时用
+    标准 0x8202 临时位置跟踪报文。天禧: {"phone","interval":10}(秒)；
+    标准: {"phone","proto":"808","interval","duration"}"""
     data     = request.get_json() or {}
     phone    = data.get('phone', '')
+    proto    = data.get('proto', 'zhiling')
     interval = int(data.get('interval', 30))
     duration = int(data.get('duration', 0))
     with sessions_lock:
@@ -2314,8 +2439,15 @@ def location_track():
     if not conn:
         return fail(f'设备不在线: {phone}', 404)
     try:
-        conn.sendall(p.encode_message(0x8202, phone, next_serial(), struct.pack('>HI', interval, duration)))
-        return ok()
+        if proto == '808':
+            conn.sendall(p.encode_message(0x8202, phone, next_serial(), struct.pack('>HI', interval, duration)))
+            sent = f'0x8202 interval={interval} duration={duration}'
+        else:
+            # 天禧无「临时跟踪」独立指令，用设置上传频率实现(运动/静止/心跳三段)，间隔最小3秒
+            iv = max(3, interval)
+            sent = send_zhiling_cmd(conn, phone, zl.build_set_interval(iv, iv, max(iv, 30)))
+        add_op_log('位置跟踪', f'phone={phone} {sent}')
+        return ok({'sent': sent})
     except Exception as e:
         return fail(str(e))
 
@@ -2374,6 +2506,120 @@ def g618g_command():
         return fail(str(e))
 
 
+# ── 天禧(智令 *XXX#)下行指令接口 ───────────────────────────────────────────────
+# 天禧协议规定：参数设置/查询/控制统一走「0x8300 类型0x01 下发命令字符串」，
+# 不使用标准 808 的 0x8103/0x8105/0x8202。命令字符串按协议用 GBK 编码。
+
+def send_zhiling_cmd(conn, phone, cmd_str):
+    """把智令命令字符串 *XXX# 经 0x8300(类型0x01, GBK) 下发给天禧设备。"""
+    body = bytes([0x01]) + cmd_str.encode('gbk', errors='replace')
+    conn.sendall(p.encode_message(0x8300, phone, next_serial(), body))
+    return cmd_str
+
+@app.post('/api/commands/zhiling')
+def zhiling_command():
+    """天禧(智令)设备下行指令。
+    Body: {"phone": "<终端号>", "cmd": "<命令名>", ...参数}
+    命令名取自 protocol_zhiling.AVAILABLE_COMMANDS（set_ip/set_interval/reset/
+    upload/set_volume/set_card_info/send_message/ota_http/set_family/
+    set_sos_numbers/set_ntrip/set_apn 等 22 条）。
+    参数按各命令的 params 定义在 body 里同名给出。"""
+    data  = request.get_json() or {}
+    phone = data.get('phone', '')
+    cmd   = data.get('cmd', '')
+    if not phone or not cmd:
+        return fail('phone 和 cmd 不能为空')
+    spec = zl.AVAILABLE_COMMANDS.get(cmd)
+    if not spec:
+        return fail(f'不支持的天禧指令: {cmd}，支持: {", ".join(zl.AVAILABLE_COMMANDS.keys())}')
+    with sessions_lock:
+        conn = sessions.get(phone)
+    if not conn:
+        return fail(f'设备不在线: {phone}', 404)
+    # 按命令声明的 params 顺序从 body 取值，缺参即报错（避免拼出错误命令串）
+    try:
+        args = []
+        for pname in spec['params']:
+            if pname not in data:
+                return fail(f'缺少参数: {pname}（命令 {cmd} 需要 {spec["params"]}）')
+            args.append(data[pname])
+        # set_sos_numbers 的构造函数是变参 *numbers，其 params 为单个 'numbers'；
+        # 传数组则展开为多个号码，传单个字符串则包成单元素，避免整串被当一个号码
+        if cmd == 'set_sos_numbers' and len(args) == 1:
+            nums = args[0] if isinstance(args[0], (list, tuple)) else [args[0]]
+            cmd_str = spec['func'](*nums)
+        else:
+            cmd_str = spec['func'](*args)
+    except Exception as e:
+        return fail(f'构造指令失败: {e}')
+    try:
+        send_zhiling_cmd(conn, phone, cmd_str)
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, resolve_phone(phone), f'{cmd} {cmd_str}', 'success', ''))
+        add_op_log('天禧指令下发', f'phone={phone} cmd={cmd} str={cmd_str}')
+        return ok({'cmd': cmd, 'phone': phone, 'cmd_str': cmd_str})
+    except Exception as e:
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, resolve_phone(phone), f'{cmd} {cmd_str}', 'fail', str(e)))
+        return fail(str(e))
+
+
+# ── 蓝牙信标位置对照表管理（major/minor → 坐标）────────────────────────────────
+
+@app.get('/api/beacons')
+def list_beacons():
+    """信标对照表列表。"""
+    rows = db_query("SELECT * FROM beacon_location ORDER BY major, minor")
+    return ok({'records': rows, 'total': len(rows)})
+
+@app.post('/api/beacons')
+def create_beacon():
+    """新增/更新信标位置。Body: {major, minor, name?, lat?, lng?}
+    major+minor 已存在则更新（UNIQUE 约束）。"""
+    data = request.get_json() or {}
+    if 'major' not in data or 'minor' not in data:
+        return fail('major 和 minor 不能为空')
+    try:
+        major = int(data['major']); minor = int(data['minor'])
+    except (ValueError, TypeError):
+        return fail('major/minor 必须为整数')
+    name = data.get('name')
+    lat  = data.get('lat'); lng = data.get('lng')
+    exist = db_query_one("SELECT id FROM beacon_location WHERE major=? AND minor=?", (major, minor))
+    if exist:
+        db_exec("UPDATE beacon_location SET name=?, lat=?, lng=?, "
+                "updated_at=strftime('%Y-%m-%d %H:%M:%S','now','localtime') WHERE major=? AND minor=?",
+                (name, lat, lng, major, minor))
+        add_op_log('信标更新', f'major={major} minor={minor} lat={lat} lng={lng}')
+    else:
+        db_exec("INSERT INTO beacon_location (major, minor, name, lat, lng) VALUES (?,?,?,?,?)",
+                (major, minor, name, lat, lng))
+        add_op_log('信标新增', f'major={major} minor={minor}')
+    return ok()
+
+@app.delete('/api/beacons/<int:bid>')
+def delete_beacon(bid):
+    db_exec("DELETE FROM beacon_location WHERE id=?", (bid,))
+    add_op_log('信标删除', f'id={bid}')
+    return ok()
+
+@app.get('/api/beacons/reports')
+def list_beacon_reports():
+    """信标上报记录（分页）。可按 phone 过滤。"""
+    phone = request.args.get('phone', '')
+    page  = max(1, int(request.args.get('page', 1)))
+    size  = min(100, int(request.args.get('size', 20)))
+    offset = (page - 1) * size
+    conds, params = [], []
+    if phone:
+        conds.append("phone=?"); params.append(phone)
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    total = db_scalar(f"SELECT COUNT(*) FROM beacon_report {where}", params)
+    rows  = db_query(f"SELECT * FROM beacon_report {where} ORDER BY report_time DESC LIMIT ? OFFSET ?",
+                     params + [size, offset])
+    return ok({'records': rows, 'total': total, 'page': page, 'size': size})
+
+
 # ── 辅助：记操作日志 ───────────────────────────────────────────────────────────
 
 def add_op_log(action, detail, ip=None):
@@ -2409,8 +2655,7 @@ def _sim_days_left(expire_date):
 
 @app.get('/api/sims')
 def list_sims():
-    page    = int(request.args.get('page', 1))
-    size    = int(request.args.get('size', 20))
+    page, size = _page_params(20)
     kw      = request.args.get('keyword', '').strip()
     status  = request.args.get('status', '').strip()
     expiring = request.args.get('expiring', '').strip()   # '7' / '30' = 近N天到期
@@ -2507,8 +2752,7 @@ def bind_sim(sid):
 
 @app.get('/api/recharges')
 def list_recharges():
-    page   = int(request.args.get('page', 1))
-    size   = int(request.args.get('size', 20))
+    page, size = _page_params(20)
     sim_id = request.args.get('sim_id')
     offset = (page - 1) * size
     if sim_id:
@@ -2544,8 +2788,7 @@ def create_recharge():
 
 @app.get('/api/customers')
 def list_customers():
-    page   = int(request.args.get('page', 1))
-    size   = int(request.args.get('size', 20))
+    page, size = _page_params(20)
     kw     = request.args.get('keyword', '').strip()
     status = request.args.get('status', '').strip()
     # parent_id='null' 查顶级，parent_id='5' 查 id=5 的子级，不传则全量（搜索模式）
@@ -2685,7 +2928,13 @@ def upload_avatar():
 
 @app.get('/uploads/<path:filename>')
 def serve_upload(filename):
-    """提供上传文件（头像等）的访问。防路径穿越。"""
+    """提供上传文件（头像等）的访问。防路径穿越 + Token 鉴权（不在 /api/ 前缀下，需手动验证）。"""
+    # 需要有效的管理员或客户 Token，防止无鉴权枚举上传文件
+    admin_ok = bool(_verify_admin_token(request.headers.get('X-Admin-Token', '')))
+    cust_tok = request.headers.get('X-Customer-Token', '') or request.args.get('token', '')
+    cust_ok  = bool(_verify_token(cust_tok))
+    if not admin_ok and not cust_ok:
+        return fail('未授权', 401)
     safe = os.path.normpath(filename).replace('\\', '/')
     if safe.startswith('..') or safe.startswith('/'):
         return fail('非法路径', 400)
@@ -2699,15 +2948,24 @@ def serve_upload(filename):
 def delete_customer(cid):
     row = db_query_one("SELECT name FROM customer WHERE id=?", (cid,))
     if not row: return fail('客户不存在', 404)
-    # 1. 将该客户所有下级客户的设备归还到管理员池（NULL），并删除下级客户
-    sub_ids = [r['id'] for r in db_query("SELECT id FROM customer WHERE parent_id=?", (cid,))]
-    for sid in sub_ids:
+    # 递归收集所有后代 ID（含孙级及更深层），防止只删一层导致数据孤岛
+    def _all_descendants(root_id):
+        result, stack = [], [root_id]
+        while stack:
+            pid = stack.pop()
+            children = [r['id'] for r in db_query("SELECT id FROM customer WHERE parent_id=?", (pid,))]
+            result.extend(children)
+            stack.extend(children)
+        return result
+    all_sub_ids = _all_descendants(cid)
+    # 1. 回收所有后代客户的设备，再删后代客户记录
+    for sid in all_sub_ids:
         db_exec("UPDATE device SET customer_id=NULL WHERE customer_id=?", (sid,))
         db_exec("DELETE FROM customer WHERE id=?", (sid,))
-    # 2. 将该客户自身的设备归还到管理员池
+    # 2. 将该客户自身的设备归还到管理员池，再删自身
     db_exec("UPDATE device SET customer_id=NULL WHERE customer_id=?", (cid,))
     db_exec("DELETE FROM customer WHERE id=?", (cid,))
-    add_op_log('客户删除', f'删除客户 {row["name"]}，已回收设备至管理员设备池')
+    add_op_log('客户删除', f'删除客户 {row["name"]}（含 {len(all_sub_ids)} 个子账户），已回收设备至管理员设备池')
     return ok()
 
 
@@ -2867,8 +3125,7 @@ def delete_risk_point(rid):
 
 @app.get('/api/command-history')
 def list_command_history():
-    page   = int(request.args.get('page', 1))
-    size   = int(request.args.get('size', 20))
+    page, size = _page_params(20)
     phone  = request.args.get('phone', '').strip()
     offset = (page - 1) * size
     if phone:
@@ -2894,8 +3151,7 @@ def create_command_history():
 
 @app.get('/api/oplogs')
 def list_oplogs():
-    page   = int(request.args.get('page', 1))
-    size   = int(request.args.get('size', 20))
+    page, size = _page_params(20)
     offset = (page - 1) * size
     sids   = _org_scope_ids(request)
     conds, params = _org_where(sids)   # 按当前管理员组织范围过滤
@@ -2912,8 +3168,11 @@ _DATE_RE = _re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
 @app.get('/api/report/summary')
 def report_summary():
-    # 时间范围参数（默认近30天）
-    days      = int(request.args.get('days', 30))
+    # 时间范围参数（默认近30天，最多365天）
+    try:
+        days = min(365, max(1, int(request.args.get('days', 30))))
+    except (ValueError, TypeError):
+        days = 30
     start_raw = request.args.get('start', '').strip()
     end_raw   = request.args.get('end', '').strip()
 
@@ -3108,12 +3367,17 @@ def on_disconnect():
     log.debug("[WS] 客户端断开")
 
 
+_DEBUG_MODE = os.environ.get('DEBUG_MODE', '0') == '1'
+
 @app.get('/api/fences/check/<path:phone>')
 def debug_fence_check(phone):
     """
     调试端点：手动对某设备执行一次围栏检测，返回每个围栏的 inside 状态。
+    生产环境须设置 DEBUG_MODE=0（默认），仅本地调试时开启 DEBUG_MODE=1。
     用法：GET /api/fences/check/13800138001
     """
+    if not _DEBUG_MODE:
+        return fail('调试接口已禁用，设置 DEBUG_MODE=1 可启用', 403)
     row = db_query_one("SELECT last_lat, last_lng FROM device WHERE phone=?", (phone,))
     if not row:
         return fail(f'设备不存在: {phone}', 404)
@@ -3150,16 +3414,30 @@ def debug_fence_check(phone):
 
 @app.get('/api/_routes')
 def debug_routes():
-    """列出所有注册路由（调试用）"""
+    """列出所有注册路由（调试用，生产须设置 DEBUG_MODE=0）"""
+    if not _DEBUG_MODE:
+        return fail('调试接口已禁用，设置 DEBUG_MODE=1 可启用', 403)
     routes = [{'rule': str(r.rule), 'methods': sorted(r.methods)} for r in app.url_map.iter_rules()]
     return jsonify(routes)
 
 
 # ── 管理员登录接口 ─────────────────────────────────────────────────────────────
 
-_ADMIN_SECRET = os.environ.get('ADMIN_SECRET', 'admin_secret_quectel_2024')
-if _ADMIN_SECRET == 'admin_secret_quectel_2024':
-    log.warning("[安全] 正在使用默认 ADMIN_SECRET，生产环境务必设置环境变量 ADMIN_SECRET！")
+def _require_secret(env_name: str) -> str:
+    """读取签名密钥。生产必须通过环境变量注入；缺失则拒绝启动（fail-closed），
+    杜绝用硬编码默认密钥继续运行导致 token 可被离线伪造。
+    仅当显式设置 ALLOW_DEV_SECRET=1（本地开发）时，才允许回退到临时开发密钥。"""
+    val = os.environ.get(env_name, '').strip()
+    if val:
+        return val
+    if os.environ.get('ALLOW_DEV_SECRET') == '1':
+        log.warning("[安全] %s 未设置，正在使用开发临时密钥（仅限本地！生产务必注入 %s）", env_name, env_name)
+        return f'DEV_ONLY_{env_name}_do_not_use_in_prod'
+    raise RuntimeError(
+        f"[安全] 环境变量 {env_name} 未设置，拒绝启动。请注入强随机密钥，"
+        f"或本地开发时设置 ALLOW_DEV_SECRET=1。")
+
+_ADMIN_SECRET = _require_secret('ADMIN_SECRET')
 
 def _make_admin_token(admin_id: int) -> str:
     ts  = int(_time_mod.time())
@@ -3263,9 +3541,7 @@ def admin_change_password():
 
 # ── 客户门户：账号 / Token 工具 ────────────────────────────────────────────────
 
-_PORTAL_SECRET = os.environ.get('PORTAL_SECRET', 'portal_secret_quectel_2024')
-if _PORTAL_SECRET == 'portal_secret_quectel_2024':
-    log.warning("[安全] 正在使用默认 PORTAL_SECRET，生产环境务必设置环境变量 PORTAL_SECRET！")
+_PORTAL_SECRET = _require_secret('PORTAL_SECRET')
 
 def _make_token(customer_id: int) -> str:
     ts  = int(_time_mod.time())
@@ -3361,8 +3637,7 @@ def portal_location_history(phone):
                        [phone] + all_cids)
     if not dev:
         return fail('设备不存在或无权限', 403)
-    page   = int(request.args.get('page', 1))
-    size   = int(request.args.get('size', 500))
+    page, size = _page_params(100, max_size=1000)
     start  = request.args.get('start')
     end    = request.args.get('end')
     offset = (page - 1) * size
@@ -3386,8 +3661,7 @@ def portal_alarms():
     phones = _get_subtree_phones(cid)
     if not phones:
         return ok({'records': [], 'total': 0})
-    page   = int(request.args.get('page', 1))
-    size   = int(request.args.get('size', 20))
+    page, size = _page_params(20)
     offset = (page - 1) * size
     ph     = ','.join('?' * len(phones))
     total   = db_scalar(f"SELECT COUNT(*) FROM alarm_record WHERE phone IN ({ph})", phones)
@@ -3429,8 +3703,7 @@ def portal_attendance_detail():
         return ok({'records': [], 'total': 0, 'page': 1})
     fence_id = request.args.get('fence_id', '').strip()
     day      = request.args.get('day', '').strip()
-    page     = int(request.args.get('page', 1))
-    size     = int(request.args.get('size', 50))
+    page, size = _page_params(50)
     offset   = (page - 1) * size
     ph = ','.join('?' * len(phones))
     conds  = [f"phone IN ({ph})"]
@@ -3461,8 +3734,7 @@ def portal_health():
         return ok({'records': [], 'total': 0, 'page': 1})
     kw   = request.args.get('keyword', '').strip()
     day  = request.args.get('day', '').strip()
-    page = int(request.args.get('page', 1))
-    size = int(request.args.get('size', 20))
+    page, size = _page_params(20)
     offset = (page - 1) * size
     ph = ','.join('?' * len(phones))
     conds  = [f"h.phone IN ({ph})"]
@@ -3508,7 +3780,7 @@ def portal_send_text():
     if not conn:
         return fail(f'设备不在线: {phone}', 404)
     try:
-        body = bytes([0x01]) + text.encode('utf-8')
+        body = bytes([0x01]) + text.encode('gbk', errors='replace')
         conn.sendall(p.encode_message(0x8300, phone, next_serial(), body))
         db_exec("INSERT INTO command_history (phone,device_name,command,result) VALUES (?,?,?,?)",
                 (phone, dev['name'] or phone, text, '已发送'))
@@ -3527,8 +3799,7 @@ def portal_command_history():
     if not phones:
         return ok({'records': [], 'total': 0})
     phone  = request.args.get('phone', '').strip()
-    page   = int(request.args.get('page', 1))
-    size   = int(request.args.get('size', 20))
+    page, size = _page_params(20)
     offset = (page - 1) * size
     if phone and phone in phones:
         total   = db_scalar("SELECT COUNT(*) FROM command_history WHERE phone=?", (phone,))
@@ -3568,8 +3839,7 @@ def portal_device_list():
     cid = _get_portal_customer()
     if not cid:
         return fail('未授权', 401)
-    page    = int(request.args.get('page', 1))
-    size    = int(request.args.get('size', 20))
+    page, size = _page_params(20)
     keyword = request.args.get('keyword', '').strip()
     offset  = (page - 1) * size
     base_cols = ("SELECT device.id, device.phone, device.name, device.plate_no, "
@@ -3638,8 +3908,7 @@ def portal_list_sub_customers():
     cid = _get_portal_customer()
     if not cid:
         return fail('未授权', 401)
-    page    = int(request.args.get('page', 1))
-    size    = int(request.args.get('size', 20))
+    page, size = _page_params(20)
     keyword = request.args.get('keyword', '').strip()
     offset  = (page - 1) * size
     if keyword:
@@ -3903,8 +4172,7 @@ def portal_list_sims():
     phones = _portal_sim_phones(cid)
     if not phones:
         return ok({'records': [], 'total': 0, 'page': 1})
-    page    = int(request.args.get('page', 1))
-    size    = int(request.args.get('size', 20))
+    page, size = _page_params(20)
     keyword = request.args.get('keyword', '').strip()
     status  = request.args.get('status',  '').strip()
     offset  = (page - 1) * size
@@ -3979,8 +4247,7 @@ def portal_list_recharges():
     sim_ids = [r['id'] for r in db_query(f"SELECT id FROM sim_card WHERE device_phone IN ({ph})", phones)]
     if not sim_ids:
         return ok({'records': [], 'total': 0, 'page': 1})
-    page   = int(request.args.get('page', 1))
-    size   = int(request.args.get('size', 20))
+    page, size = _page_params(20)
     offset = (page - 1) * size
     sp     = ','.join('?' * len(sim_ids))
     # 支持按 sim_id 筛选（只接受客户自己名下的 sim_id）
@@ -4130,9 +4397,10 @@ def _scope_path(admin):
     返回该管理员的可见范围 org_path 前缀。
     None  → 无限制（根超管）
     str   → 只能看到该前缀下的组织（含自身）
+    注意：不可返回 ''（空字符串），空串会匹配所有 org_path LIKE '%'，等同于无限制。
     """
     if not admin:
-        return ''   # 没有 admin 信息，最严格限制
+        return '__NONE__'   # 没有 admin 信息，用不可能存在的前缀实现最严格限制
     # 超级管理员 且 属于根组织 → 无限制
     if admin.get('user_type') == 9 and (admin.get('org_id') or 1) == 1:
         return None
@@ -4363,6 +4631,8 @@ def list_sys_users():
 @app.post('/api/sys/users')
 def create_sys_user():
     admin    = _current_admin(request)
+    if not admin:
+        return fail('未登录', 401)
     scope    = _scope_path(admin)
     d        = request.get_json() or {}
     username = (d.get('username') or '').strip()
@@ -4378,6 +4648,12 @@ def create_sys_user():
         return fail('用户名已存在', 400)
     org  = db_query_one("SELECT org_level FROM sys_org WHERE id=?", (org_id,))
     now  = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    # ── 越权提权防护 ──────────────────────────────────────────────────────────
+    # 操作者只能创建 user_type ≤ 自身 user_type 的账号，杜绝低权限管理员提权为超管
+    operator_type  = int(admin.get('user_type') or 1)
+    requested_type = int(d.get('userType') or d.get('user_type') or 1)
+    new_user_type  = min(requested_type, operator_type)
+    # ─────────────────────────────────────────────────────────────────────────
     db_exec(
         "INSERT INTO admin_user (username,password_hash,real_name,phone,org_id,org_level,user_type,is_active,created_at) "
         "VALUES (?,?,?,?,?,?,?,1,?)",
@@ -4386,7 +4662,7 @@ def create_sys_user():
          d.get('phone') or '',
          org_id,
          (org['org_level'] if org else 1),
-         int(d.get('userType') or d.get('user_type') or 1),
+         new_user_type,
          now)
     )
     return ok()

@@ -7,7 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制业务代码
-COPY app.py protocol.py protocol_g618g.py ./
+COPY app.py protocol.py protocol_g618g.py protocol_zhiling.py geo_resolve.py ./
 
 # 数据目录（SQLite 落盘，docker-compose 挂载卷到此处）
 RUN mkdir -p /app/data
