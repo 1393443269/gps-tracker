@@ -103,7 +103,7 @@
           <el-tag type="success">在线: {{ onlineCount }}</el-tag>
           <el-tag type="danger" v-if="alarmCount > 0">未处理报警: {{ alarmCount }}</el-tag>
           <el-divider direction="vertical" />
-          <el-tag v-if="!isAdmin" type="warning" size="small">客户</el-tag>
+          <img v-if="!isAdmin && platformLogo" :src="platformLogo" class="header-logo" /><el-tag v-else-if="!isAdmin" type="warning" size="small">客户</el-tag>
           <el-dropdown @command="handleCmd" trigger="click">
             <span style="font-size:13px;color:#606266;cursor:pointer;display:flex;align-items:center;gap:4px">
               {{ displayName }}<el-icon style="font-size:12px"><ArrowDown /></el-icon>
@@ -297,6 +297,13 @@ onUnmounted(() => clearInterval(timer))
   letter-spacing: 0.05em;
   text-transform: uppercase;
 }
+.header-logo {
+  height: 28px;
+  max-width: 100px;
+  object-fit: contain;
+  vertical-align: middle;
+}
+
 .alarm-badge {
   margin-left: 8px;
 }
