@@ -158,6 +158,87 @@ def parse_register_body(body: bytes) -> dict:
         return {}
 
 
+# ── JT808 附加信息结构化解析 ─────────────────────────────────────────────────
+
+def _parse_extra_wifi(data: bytes) -> dict:
+    """0x54 WiFi定位数据: wifi_count(1B) + [mac(6B)+rssi(1B)]*n"""
+    result = {'count': 0, 'aps': []}
+    if len(data) < 1:
+        return result
+    count = data[0]
+    result['count'] = count
+    offset = 1
+    for _ in range(count):
+        if offset + 7 > len(data):
+            break
+        mac = ':'.join(f'{b:02X}' for b in data[offset:offset+6])
+        rssi = data[offset+6] if data[offset+6] < 128 else data[offset+6] - 256
+        result['aps'].append({'mac': mac, 'rssi': rssi})
+        offset += 7
+    return result
+
+
+def _parse_extra_lbs(data: bytes) -> dict:
+    """0xE1 基站定位数据: mcc(2B)+mnc(1B)+lac(2B)+cell_id(4B)+rssi(1B)"""
+    result = {}
+    if len(data) < 10:
+        return result
+    result['mcc'] = struct.unpack('>H', data[0:2])[0]
+    result['mnc'] = data[2]
+    result['lac'] = struct.unpack('>H', data[3:5])[0]
+    result['cell_id'] = struct.unpack('>I', data[5:9])[0]
+    rssi = data[9] if data[9] < 128 else data[9] - 256
+    result['rssi'] = rssi
+    return result
+
+
+def _parse_extra_beacon(data: bytes) -> dict:
+    """0x67 蓝牙信标: beacon_count(1B) + [major(2B)+minor(2B)+rssi(1B)]*n"""
+    result = {'count': 0, 'beacons': []}
+    if len(data) < 1:
+        return result
+    count = data[0]
+    result['count'] = count
+    offset = 1
+    for _ in range(count):
+        if offset + 5 > len(data):
+            break
+        major = struct.unpack('>H', data[offset:offset+2])[0]
+        minor = struct.unpack('>H', data[offset+2:offset+4])[0]
+        rssi = data[offset+4] if data[offset+4] < 128 else data[offset+4] - 256
+        result['beacons'].append({'major': major, 'minor': minor, 'rssi': rssi})
+        offset += 5
+    return result
+
+
+def _parse_extra_rtk(data: bytes) -> dict:
+    """0xE3 RTK高精度信息: status(1B)+lat(4B)+lng(4B)+alt(4B)"""
+    result = {}
+    if len(data) < 1:
+        return result
+    result['status'] = data[0]  # 0=无效,1=单点,2=差分,4=固定解,5=浮点解
+    if len(data) >= 13:
+        raw_lat = struct.unpack('>I', data[1:5])[0]
+        raw_lng = struct.unpack('>I', data[5:9])[0]
+        result['lat'] = raw_lat / 1_000_000.0
+        result['lng'] = raw_lng / 1_000_000.0
+        if len(data) >= 13:
+            result['altitude'] = struct.unpack('>I', data[9:13])[0]
+    return result
+
+
+def _parse_extra_battery(data: bytes) -> dict:
+    """0xFB 电池信息: level(1B)+voltage(2B)+charge_state(1B)"""
+    result = {}
+    if len(data) >= 1:
+        result['level'] = data[0]
+    if len(data) >= 3:
+        result['voltage'] = struct.unpack('>H', data[1:3])[0]
+    if len(data) >= 4:
+        result['charge_state'] = data[3]  # 0=未充电,1=充电中,2=已充满
+    return result
+
+
 def parse_location_body(body: bytes):
     """
     0x0200 位置信息汇报体
@@ -180,8 +261,14 @@ def parse_location_body(body: bytes):
         if status_flag & 0x04: lat = -lat   # 南纬
         if status_flag & 0x08: lng = -lng   # 西经
 
-        # 解析附加信息
+        # 解析附加信息（扩展）
         mileage = None
+        wifi_data = None       # 0x54 WiFi
+        lbs_data = None        # 0xE1 基站
+        beacon_data = None     # 0x67 蓝牙信标
+        rtk_data = None        # 0xE3 RTK
+        battery_data = None    # 0xFB 电池
+        extra_raw = {}         # 所有附加项原始数据
         offset = 28
         while offset + 2 <= len(body):
             item_id  = body[offset];     offset += 1
@@ -189,8 +276,19 @@ def parse_location_body(body: bytes):
             if offset + item_len > len(body):
                 break
             item_data = body[offset: offset + item_len]
-            if item_id == 0x01 and item_len == 4:   # 里程
+            extra_raw[hex(item_id)] = item_data.hex()
+            if item_id == 0x01 and item_len == 4:   # 里程 (km, 0.1km)
                 mileage = struct.unpack('>I', item_data)[0]
+            elif item_id == 0x54 and item_len >= 2:  # WiFi 定位
+                wifi_data = _parse_extra_wifi(item_data)
+            elif item_id == 0xE1 and item_len >= 2:  # 基站定位
+                lbs_data = _parse_extra_lbs(item_data)
+            elif item_id == 0x67 and item_len >= 2:  # 蓝牙信标
+                beacon_data = _parse_extra_beacon(item_data)
+            elif item_id == 0xE3 and item_len >= 4:  # RTK 状态
+                rtk_data = _parse_extra_rtk(item_data)
+            elif item_id == 0xFB and item_len >= 2:  # 电池信息
+                battery_data = _parse_extra_battery(item_data)
             offset += item_len
 
         return {
@@ -202,7 +300,13 @@ def parse_location_body(body: bytes):
             'speed':       speed,
             'direction':   direction,
             'gps_time':    gps_time,
-            'mileage':     mileage,
+            'mileage':      mileage,
+            'wifi_data':    wifi_data,
+            'lbs_data':     lbs_data,
+            'beacon_data':  beacon_data,
+            'rtk_data':     rtk_data,
+            'battery_data': battery_data,
+            'extra_raw':    extra_raw,
         }
     except Exception:
         return None

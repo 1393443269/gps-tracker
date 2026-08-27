@@ -122,7 +122,7 @@ def parse(frame: bytes):
                      timestamp=_u32(p, 1) if len(p) >= 5 else None)
 
         elif msg_id == 0xA9:    # 状态参数（版本）
-            r.update(type='version', raw=p.hex())
+            r.update(type='version', **_parse_a9(p))
 
         elif msg_id == 0xE9:    # 设备状态（频率）
             r.update(type='dev_status',
@@ -204,6 +204,34 @@ def _parse_d6(p):
     return {'timestamp': ts, 'beacons': beacons}
 
 
+def _parse_a9(p):
+    """解析 0xA9 状态参数：提取固件版本和模组版本"""
+    result = {'raw': p.hex()}
+    try:
+        type_cnt = p[0]
+        offset = 2  # skip TypeCnt + reserved
+        versions = {}
+        for _ in range(type_cnt):
+            if offset >= len(p):
+                break
+            typ = p[offset]; offset += 1
+            name_len = p[offset]; offset += 1
+            if offset + name_len > len(p):
+                break
+            name = p[offset:offset + name_len].decode('ascii', errors='replace')
+            offset += name_len
+            if typ == 0:
+                versions['mcu_version'] = name
+            elif typ == 1:
+                versions['modem_version'] = name
+            elif typ == 2:
+                versions['sensor_version'] = name
+        result.update(versions)
+    except Exception:
+        pass
+    return result
+
+
 # ── 下发指令构造（平台→设备）─────────────────────────────────────────────────
 def _build(msg_id: int, payload: bytes = b'') -> bytes:
     frame = TOKEN + bytes([msg_id]) + payload
@@ -241,3 +269,41 @@ def build_set_server_ip(ip: str, port: int) -> bytes:
     octets = bytes(int(x) for x in ip.split('.'))
     payload = bytes([1]) + struct.pack('<H', port) + bytes([len(octets)]) + octets
     return _build(0xC3, payload)
+def build_set_loc_priority(priorities: list) -> bytes:
+    """0xCE01 设置定位优先级。priorities: [0x01(GPS), 0x02(wifi), 0x03(BLE)] 按优先级排序"""
+    body = bytes([0x01, 0x00]) + struct.pack('<H', len(priorities)) + bytes(priorities)
+    return _build(0xCE, body)
+
+def _build_switch_cmd(type_byte: int, on: bool) -> bytes:
+    """通用开关类 0xCE 指令构造。on=True→0x00开启, False→0x02关闭"""
+    sw = 0x00 if on else 0x02
+    body = bytes([type_byte, sw, 0x00, 0x00])
+    return _build(0xCE, body)
+
+def build_set_ble_broadcast(on: bool) -> bytes:
+    """0xCE05 蓝牙广播开关"""
+    return _build_switch_cmd(0x05, on)
+
+def build_set_fall_alarm(on: bool) -> bytes:
+    """0xCE07 跌落报警开关"""
+    return _build_switch_cmd(0x07, on)
+
+def build_set_button_shutdown(on: bool) -> bytes:
+    """0xCE16 按键关机开关"""
+    return _build_switch_cmd(0x16, on)
+
+def build_set_sleep(on: bool) -> bytes:
+    """0xCE18 休眠功能开关"""
+    return _build_switch_cmd(0x18, on)
+
+def build_set_sos_button(on: bool) -> bytes:
+    """0xCE19 按键触发SOS开关"""
+    return _build_switch_cmd(0x19, on)
+
+def build_set_charge_power(on: bool) -> bytes:
+    """0xCE21 充电开关机状态。on=True→充电开机, False→充电关机"""
+    return _build_switch_cmd(0x21, on)
+
+def build_set_long_connection(on: bool) -> bytes:
+    """0xCE22 长短连接模式切换。on=True→长连接, False→短连接"""
+    return _build_switch_cmd(0x22, on)

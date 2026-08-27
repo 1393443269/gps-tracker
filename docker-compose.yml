@@ -34,11 +34,13 @@ services:
       - tracker_data:/app/data
     environment:
       # 数据库后端：默认 sqlite（不填即可）；切 PG 时设 DB_BACKEND=postgres
-      - DB_BACKEND=${DB_BACKEND:-sqlite}
+      - DB_BACKEND=postgres
       - DATABASE_URL=postgresql://gps:gps_pw_2024@postgres:5432/gps
       - DB_PATH=/app/data/tracker.db
       - MQTT_BROKER=mqtt
       - MQTT_PORT=1883
+      - ADMIN_SECRET=3e9651d4d2bd074817f5b868ae875b9719d63d1a08a653a2
+      - PORTAL_SECRET=81abeed060162179e4fa857bfc07f2258de64e0e8302ee94
     depends_on:
       - mqtt
       - postgres

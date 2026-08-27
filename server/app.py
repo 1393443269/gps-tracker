@@ -2320,6 +2320,60 @@ def location_track():
         return fail(str(e))
 
 
+# ── G618G 下行指令接口 ─────────────────────────────────────────────────────────
+
+_G618G_CMD_MAP = {
+    'set_freq':          lambda d: g618.build_set_freq(int(d.get('interval', 10))),
+    'reboot':            lambda d: g618.build_reboot(),
+    'shutdown':          lambda d: g618.build_shutdown(),
+    'set_server_ip':     lambda d: g618.build_set_server_ip(d['ip'], int(d['port'])),
+    'set_loc_priority':  lambda d: g618.build_set_loc_priority([int(x) for x in d['priorities']]),
+    'ble_broadcast':     lambda d: g618.build_set_ble_broadcast(bool(d.get('on', True))),
+    'fall_alarm':        lambda d: g618.build_set_fall_alarm(bool(d.get('on', True))),
+    'button_shutdown':   lambda d: g618.build_set_button_shutdown(bool(d.get('on', True))),
+    'sleep':             lambda d: g618.build_set_sleep(bool(d.get('on', True))),
+    'sos_button':        lambda d: g618.build_set_sos_button(bool(d.get('on', True))),
+    'charge_power':      lambda d: g618.build_set_charge_power(bool(d.get('on', True))),
+    'long_connection':   lambda d: g618.build_set_long_connection(bool(d.get('on', True))),
+}
+
+@app.post('/api/commands/g618g')
+def g618g_command():
+    """G618G 设备下行指令。
+    Body: {"phone": "<IMEI>", "cmd": "<命令名>", ...参数}
+    支持的 cmd: set_freq, reboot, shutdown, set_server_ip, set_loc_priority,
+               ble_broadcast, fall_alarm, button_shutdown, sleep, sos_button,
+               charge_power, long_connection
+    """
+    data  = request.get_json() or {}
+    phone = data.get('phone', '')
+    cmd   = data.get('cmd', '')
+    if not phone or not cmd:
+        return fail('phone 和 cmd 不能为空')
+    builder = _G618G_CMD_MAP.get(cmd)
+    if not builder:
+        return fail(f'不支持的 G618G 指令: {cmd}，支持: {", ".join(_G618G_CMD_MAP.keys())}')
+    with sessions_lock:
+        conn = sessions.get(phone)
+    if not conn:
+        return fail(f'设备不在线: {phone}', 404)
+    try:
+        payload = builder(data)
+        # G618G 短连接设备需在下行窗口连续发两次（间隔 <20ms）
+        conn.sendall(payload)
+        import time as _t; _t.sleep(0.01)
+        conn.sendall(payload)
+        # 记录指令历史
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, 'G618G-'+phone[-6:], cmd, 'success', ''))
+        add_op_log('G618G指令下发', f'phone={phone} cmd={cmd}')
+        return ok({'cmd': cmd, 'phone': phone})
+    except Exception as e:
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, 'G618G-'+phone[-6:], cmd, 'fail', str(e)))
+        return fail(str(e))
+
+
 # ── 辅助：记操作日志 ───────────────────────────────────────────────────────────
 
 def add_op_log(action, detail, ip=None):
