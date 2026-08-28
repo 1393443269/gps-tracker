@@ -68,17 +68,20 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 _ALLOWED_IMG_EXT = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
 
 def _hash_pw(pwd: str) -> str:
-    """用 bcrypt 哈希密码（cost=12）。"""
+    """用 bcrypt 哈希密码（cost=12）。bcrypt 只处理前 72 字节。"""
     import bcrypt as _bcrypt
-    return _bcrypt.hashpw(pwd.encode('utf-8'), _bcrypt.gensalt(rounds=12)).decode('utf-8')
+    return _bcrypt.hashpw(pwd.encode('utf-8')[:72], _bcrypt.gensalt(rounds=12)).decode('utf-8')
 
 def _verify_pw(plain: str, stored: str) -> bool:
-    """验证密码，兼容旧 SHA-256 哈希（自动升级）。"""
+    """验证密码，兼容旧 SHA-256 哈希（自动升级）。异常一律返回 False。"""
     import bcrypt as _bcrypt
-    if stored and (stored.startswith('$2b$') or stored.startswith('$2a$')):
-        return _bcrypt.checkpw(plain.encode('utf-8'), stored.encode('utf-8'))
-    # 旧 SHA-256 路径（兼容历史数据）
-    return hashlib.sha256(plain.encode('utf-8')).hexdigest() == stored
+    try:
+        if stored and (stored.startswith('$2b$') or stored.startswith('$2a$')):
+            return _bcrypt.checkpw(plain.encode('utf-8')[:72], stored.encode('utf-8'))
+        # 旧 SHA-256 路径（兼容历史数据）
+        return hashlib.sha256(plain.encode('utf-8')).hexdigest() == stored
+    except Exception:
+        return False
 
 # ── SQLite 数据库 ──────────────────────────────────────────────────────────────
 
@@ -349,9 +352,10 @@ def _batch_writer_loop():
     """后台线程：每 0.5 秒把队列里的位置记录 + 设备最新状态批量写入。"""
     while True:
         _time_mod.sleep(0.5)
-        # 取出本轮所有位置记录
+        # 取出本轮位置记录，单批上限 2000 行，超出的留到下轮，避免单次事务过大
+        _BATCH_MAX = 2000
         rows = []
-        while True:
+        while len(rows) < _BATCH_MAX:
             try:
                 rows.append(_loc_queue.get_nowait())
             except _queue.Empty:
@@ -369,10 +373,21 @@ def _batch_writer_loop():
                     conn = get_db()
                     try:
                         if rows:
-                            conn.executemany(
-                                "INSERT INTO location_record (device_id,phone,lat,lng,altitude,"
-                                "speed,direction,alarm_flag,status_flag,mileage,gps_time) "
-                                "VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+                            if DB_BACKEND == 'postgres':
+                                # PG 下用 execute_values 单条 INSERT 批量写，性能远优于 executemany
+                                # rows 每项列顺序：device_id,phone,lat,lng,altitude,speed,
+                                #                direction,alarm_flag,status_flag,mileage,gps_time
+                                _cur = conn.cursor()
+                                _pg_extras.execute_values(
+                                    _cur,
+                                    "INSERT INTO location_record (device_id,phone,lat,lng,altitude,"
+                                    "speed,direction,alarm_flag,status_flag,mileage,gps_time) "
+                                    "VALUES %s", rows)
+                            else:
+                                conn.executemany(
+                                    "INSERT INTO location_record (device_id,phone,lat,lng,altitude,"
+                                    "speed,direction,alarm_flag,status_flag,mileage,gps_time) "
+                                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
                         if dev_snapshot:
                             conn.executemany(
                                 "UPDATE device SET last_lat=?,last_lng=?,last_speed=?,"
@@ -615,6 +630,17 @@ def init_db():
             conn.commit()
         except Exception:
             pass  # 列已存在，忽略
+
+    # device 表：为 customer_id / org_id 补索引（这两列由上面的 ALTER 追加，故索引放此处）
+    for _idx_sql in (
+        "CREATE INDEX IF NOT EXISTS idx_device_customer ON device(customer_id)",
+        "CREATE INDEX IF NOT EXISTS idx_device_org ON device(org_id)",
+    ):
+        try:
+            conn.execute(_idx_sql)
+            conn.commit()
+        except Exception:
+            pass
 
     # ── customer 表：个人信息扩展（设备信息页使用） ───────────────────────────────
     for _col in ["gender  TEXT DEFAULT ''",
@@ -1649,6 +1675,7 @@ def handle_client(conn, addr):
 
             frames, buf = p.extract_frames(buf)
 
+            _should_close = False
             for frame in frames:
                 try:
                     hdr = p.parse_header(frame)
@@ -1672,6 +1699,7 @@ def handle_client(conn, addr):
                     if   msg_id == 0x0100: handle_register(conn, ph, serial, body)
                     elif msg_id == 0x0102:
                         if handle_auth(conn, ph, serial, body) == 'close':
+                            _should_close = True
                             break
                     elif msg_id == 0x0002: handle_heartbeat(conn, ph, serial)
                     elif msg_id == 0x0200: handle_location(conn, ph, serial, body)
@@ -1681,6 +1709,9 @@ def handle_client(conn, addr):
                         log.debug("[808] 未知消息 ID=0x%04X phone=%s", msg_id, ph)
                 except Exception as e:
                     log.error("[808] 处理消息异常 ID=0x%04X: %s", msg_id, e, exc_info=True)
+
+            if _should_close:
+                break
 
     except Exception as e:
         log.error("[808] 连接异常: %s %s", addr, e)
@@ -1945,9 +1976,19 @@ def batch_lifecycle():
         extra_col = ',activated_at=?'; extra_val = [now]
     elif lc in (2, 3):
         extra_col = ',deactivated_at=?'; extra_val = [now]
+    # 组织范围校验：非超管只能操作自己权限范围内的设备（补齐此前遗漏的越权点）
+    sids = _org_scope_ids(request)
+    scope_sql = ''
+    scope_args = []
+    if sids is not None:
+        if not sids:
+            return fail('无权限', 403)
+        scope_ph = ','.join('?' * len(sids))
+        scope_sql = f" AND org_id IN ({scope_ph})"
+        scope_args = list(sids)
     db_exec(
-        f"UPDATE device SET lifecycle=?,updated_at=?{extra_col} WHERE id IN ({ph})",
-        [lc, now] + extra_val + list(ids)
+        f"UPDATE device SET lifecycle=?,updated_at=?{extra_col} WHERE id IN ({ph}){scope_sql}",
+        [lc, now] + extra_val + list(ids) + scope_args
     )
     return ok({'updated': len(ids)})
 
@@ -2994,8 +3035,14 @@ def list_sims():
     if expiring:
         try:
             days = int(expiring)
-            conds.append("expire_date IS NOT NULL AND expire_date <= date('now',?) AND expire_date >= date('now')")
-            params.append(f'+{days} days')
+            # 在 Python 端算好日期字符串，用普通参数传入，兼容 SQLite / PG
+            # （_pg_dialect 的日期改写只匹配字面量 date('now','+N days')，不匹配参数占位符形式）
+            from datetime import timedelta as _td
+            _expire_limit = (datetime.now() + _td(days=days)).strftime('%Y-%m-%d')
+            _today = datetime.now().strftime('%Y-%m-%d')
+            conds.append("expire_date IS NOT NULL AND expire_date <= ? AND expire_date >= ?")
+            params.append(_expire_limit)
+            params.append(_today)
         except ValueError:
             pass
     where = "WHERE " + " AND ".join(conds) if conds else ""
@@ -3099,18 +3146,27 @@ def create_recharge():
     row = db_query_one("SELECT id, iccid FROM sim_card WHERE id=?", (sim_id,))
     if not row: return fail('SIM卡不存在', 404)
     # 原子 UPDATE：balance = balance + amount，再用 CASE 修正欠费状态
-    # 避免先 SELECT 再计算再 UPDATE 之间的余额竞态
-    db_exec(
-        "UPDATE sim_card SET balance = ROUND(balance + ?, 2), "
-        "status = CASE WHEN status='欠费' AND (balance + ?) >= 0 THEN '正常' ELSE status END "
-        "WHERE id=?",
-        (amount, amount, sim_id)
-    )
-    updated = db_query_one("SELECT balance FROM sim_card WHERE id=?", (sim_id,))
-    new_balance = float(updated['balance']) if updated else 0.0
-    db_exec("INSERT INTO recharge (sim_id,iccid,amount,method,plan,remark,operator) VALUES (?,?,?,?,?,?,?)",
-            (sim_id, row['iccid'], amount, d.get('method','支付宝'),
-             d.get('plan',''), d.get('remark',''), d.get('operator','管理员')))
+    # 避免先 SELECT 再计算再 UPDATE 之间的余额竞态。
+    # 扣费 UPDATE 与充值记录 INSERT 放到同一连接的事务里，避免二者不一致
+    # （参考 create_customer 的事务写法：_db_lock + get_db + 一次 commit）
+    with _db_lock:
+        conn = get_db()
+        try:
+            conn.execute(
+                "UPDATE sim_card SET balance = ROUND(balance + ?, 2), "
+                "status = CASE WHEN status='欠费' AND (balance + ?) >= 0 THEN '正常' ELSE status END "
+                "WHERE id=?",
+                (amount, amount, sim_id)
+            )
+            conn.execute(
+                "INSERT INTO recharge (sim_id,iccid,amount,method,plan,remark,operator) VALUES (?,?,?,?,?,?,?)",
+                (sim_id, row['iccid'], amount, d.get('method','支付宝'),
+                 d.get('plan',''), d.get('remark',''), d.get('operator','管理员')))
+            new_balance_row = conn.execute("SELECT balance FROM sim_card WHERE id=?", (sim_id,)).fetchone()
+            conn.commit()
+        finally:
+            conn.close()
+    new_balance = float(new_balance_row['balance']) if new_balance_row else 0.0
     add_op_log('充值', f'SIM卡 {row["iccid"]} 充值 ¥{amount:.2f}')
     return ok({'new_balance': new_balance})
 
@@ -3298,8 +3354,17 @@ def serve_upload(filename):
 
 @app.delete('/api/customers/<int:cid>')
 def delete_customer(cid):
-    row = db_query_one("SELECT name FROM customer WHERE id=?", (cid,))
-    if not row: return fail('客户不存在', 404)
+    # 组织范围校验：非超管只能删除自己权限范围内的客户（补齐此前遗漏的越权点）
+    sids = _org_scope_ids(request)
+    if sids is not None:
+        if not sids:
+            return fail('客户不存在或无权限', 403)
+        ph = ','.join(['?'] * len(sids))
+        row = db_query_one(f"SELECT name FROM customer WHERE id=? AND org_id IN ({ph})",
+                           [cid] + list(sids))
+    else:
+        row = db_query_one("SELECT name FROM customer WHERE id=?", (cid,))
+    if not row: return fail('客户不存在或无权限', 404)
     # 递归收集所有后代 ID（含孙级及更深层），防止只删一层导致数据孤岛
     def _all_descendants(root_id):
         result, stack = [], [root_id]
@@ -3312,18 +3377,20 @@ def delete_customer(cid):
     all_sub_ids = _all_descendants(cid)
     all_cids    = [cid] + all_sub_ids   # 本客户 + 全部后代
 
-    # 1. 收集所有客户名下的设备 ID，用于级联清理
+    # 1. 一次 IN 查询收集所有客户名下的设备 ID（消除 N+1）
     device_ids = []
-    for aid in all_cids:
-        rows = db_query("SELECT id FROM device WHERE customer_id=?", (aid,))
-        device_ids.extend(r['id'] for r in rows)
+    if all_cids:
+        cph = ','.join(['?'] * len(all_cids))
+        device_ids = [r['id'] for r in
+                      db_query(f"SELECT id FROM device WHERE customer_id IN ({cph})", list(all_cids))]
 
-    # 2. 级联清理：删除这些设备的报警记录（历史轨迹保留，设备归还管理员池后仍可查）
+    # 2. 级联清理：一次 IN 删除这些设备的报警记录（历史轨迹保留，设备归还管理员池后仍可查）
     alarm_count = 0
-    for did in device_ids:
-        cur = db_query("SELECT COUNT(*) AS cnt FROM alarm_record WHERE device_id=?", (did,))
-        alarm_count += (cur[0]['cnt'] if cur else 0)
-        db_exec("DELETE FROM alarm_record WHERE device_id=?", (did,))
+    if device_ids:
+        dph = ','.join(['?'] * len(device_ids))
+        cnt = db_scalar(f"SELECT COUNT(*) FROM alarm_record WHERE device_id IN ({dph})", list(device_ids))
+        alarm_count = cnt or 0
+        db_exec(f"DELETE FROM alarm_record WHERE device_id IN ({dph})", list(device_ids))
 
     # 3. 回收所有后代客户的设备，再删后代客户记录
     for sid in all_sub_ids:
@@ -3585,7 +3652,7 @@ def report_summary():
             _alarm_sids)
         alarm_unhandled = db_scalar(
             f"SELECT COUNT(*) FROM alarm_record ar "
-            f"JOIN device d ON ar.device_id=d.id WHERE d.org_id IN ({_alarm_ph}) AND ar.handled=0",
+            f"JOIN device d ON ar.device_id=d.id WHERE d.org_id IN ({_alarm_ph}) AND ar.status=0",
             _alarm_sids)
     else:
         alarm_total     = db_scalar("SELECT COUNT(*) FROM alarm_record")
@@ -3868,10 +3935,13 @@ def _verify_admin_token(token: str):
         if _time_mod.time() - int(ts_s) > 30 * 24 * 3600:
             return None
         aid = int(aid_s)
-        # 检查 admin 账号是否仍然活跃
-        row = db_query_one("SELECT is_active FROM admin_user WHERE id=?", (aid,))
-        if not row or not row.get('is_active', 1):
-            return None  # 账号已禁用，token 作废
+        # 检查 admin 账号是否仍然活跃；DB 查询失败时不阻断（避免 DB 抖动误登出）
+        try:
+            row = db_query_one("SELECT is_active FROM admin_user WHERE id=?", (aid,))
+            if row is not None and not row.get('is_active', 1):
+                return None  # 明确禁用才拒绝
+        except Exception:
+            pass  # DB 异常不影响已签发的有效 token
         return aid
     except Exception:
         return None
@@ -3957,9 +4027,8 @@ def admin_change_password():
     if not new_pwd or len(new_pwd) < 6:
         return fail('新密码不能少于6位', 400)
     admin_id = _verify_admin_token(token)
-    row = db_query_one("SELECT id FROM admin_user WHERE id=? AND password_hash=?",
-                       (admin_id, _hash_pw(old_pwd)))
-    if not row:
+    row = db_query_one("SELECT password_hash FROM admin_user WHERE id=?", (admin_id,))
+    if not row or not _verify_pw(old_pwd, row['password_hash']):
         return fail('原密码错误', 400)
     db_exec("UPDATE admin_user SET password_hash=? WHERE id=?", (_hash_pw(new_pwd), admin_id))
     return ok()
@@ -3989,10 +4058,13 @@ def _verify_token(token: str):
         if _time_mod.time() - int(ts_s) > 30 * 24 * 3600:  # 30天有效
             return None
         customer_id = int(cid_s)
-        # 检查客户账号是否仍然活跃
-        row = db_query_one("SELECT status FROM customer WHERE id=?", (customer_id,))
-        if not row or row.get('status') != '活跃':
-            return None  # 账号已禁用
+        # 检查客户账号是否仍然活跃；DB 查询失败时不阻断（避免 DB 抖动误登出）
+        try:
+            row = db_query_one("SELECT status FROM customer WHERE id=?", (customer_id,))
+            if row is not None and row.get('status') != '活跃':
+                return None  # 明确禁用才拒绝
+        except Exception:
+            pass  # DB 异常不影响已签发的有效 token
         return customer_id
     except Exception:
         return None
@@ -4831,6 +4903,15 @@ def assign_customer_devices(cid):
         return fail('客户不存在', 404)
     d      = request.get_json() or {}
     phones = d.get('phones', [])
+    # 分配前校验：非超管只能分配自己 org scope 内的设备（补齐此前遗漏的越权点）
+    if sids is not None and phones:
+        scope_ph = ','.join(['?'] * len(sids))
+        ph_q     = ','.join(['?'] * len(phones))
+        valid = db_query(
+            f"SELECT phone FROM device WHERE phone IN ({ph_q}) AND org_id IN ({scope_ph})",
+            list(phones) + list(sids))
+        valid_phones = {r['phone'] for r in valid}
+        phones = [p for p in phones if p in valid_phones]  # 只分配有权限的设备
     # 只清该客户的直属设备（子客户设备由客户自己管理，不联动）
     db_exec("UPDATE device SET customer_id=NULL WHERE customer_id=?", (cid,))
     # 批量分配：单条 WHERE phone IN(…) 替代 N 次循环，减少锁竞争
