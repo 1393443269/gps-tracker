@@ -451,6 +451,9 @@ function riskLevelLabel(l) {
   return { low:'低风险', medium:'中风险', high:'高风险' }[l] || l
 }
 
+// ── XSS 防护：HTML 转义 ───────────────────────────────────────────────────────
+const _esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+
 // ── 地图 ─────────────────────────────────────────────────────────────────────
 let map = null
 const fenceCanvas      = ref(null)   // 2D canvas 叠加层（绕过 MapLibre v6 GL fill 不渲染问题）
@@ -565,10 +568,10 @@ function renderFences() {
           new maplibregl.Popup({ closeButton: true, maxWidth: '220px' })
             .setLngLat(e.lngLat)
             .setHTML([
-              `<b style="font-size:14px;color:${color};">${f.name}</b>`,
-              `<div style="margin-top:4px;font-size:12px;color:#555;">类型：${fenceTypeLabel(f.fence_type)}</div>`,
-              f.fence_type === 'circle' ? `<div style="font-size:12px;color:#555;">半径：${f.radius} m</div>` : '',
-              devCount ? `<div style="font-size:12px;color:#409EFF;">关联设备：${devCount} 台</div>` : '',
+              `<b style="font-size:14px;color:${_esc(color)};">${_esc(f.name)}</b>`,
+              `<div style="margin-top:4px;font-size:12px;color:#555;">类型：${_esc(fenceTypeLabel(f.fence_type))}</div>`,
+              f.fence_type === 'circle' ? `<div style="font-size:12px;color:#555;">半径：${_esc(String(f.radius))} m</div>` : '',
+              devCount ? `<div style="font-size:12px;color:#409EFF;">关联设备：${_esc(String(devCount))} 台</div>` : '',
             ].join(''))
             .addTo(map)
         })
@@ -621,7 +624,7 @@ function renderMarks() {
     const marker = new maplibregl.Marker({ element: el })
       .setLngLat([m.lng, m.lat])
       .setPopup(new maplibregl.Popup({ closeButton:false })
-        .setHTML(`<b>${m.name}</b>${m.remark ? '<br>'+m.remark : ''}`))
+        .setHTML(`<b>${_esc(m.name)}</b>${m.remark ? '<br>'+_esc(m.remark) : ''}`))
       .addTo(map)
     markMarkers[m.id] = marker
   })
@@ -640,7 +643,7 @@ function renderRisks() {
     const marker = new maplibregl.Marker({ element: el })
       .setLngLat([r.lng, r.lat])
       .setPopup(new maplibregl.Popup({ closeButton:false })
-        .setHTML(`<b>${r.name}</b><br>${riskLevelLabel(r.level)}${r.remark ? '<br>'+r.remark : ''}`))
+        .setHTML(`<b>${_esc(r.name)}</b><br>${_esc(riskLevelLabel(r.level))}${r.remark ? '<br>'+_esc(r.remark) : ''}`))
       .addTo(map)
     riskMarkers[r.id] = marker
   })
@@ -1264,7 +1267,7 @@ onMounted(async () => {
           el.style.cssText = 'width:10px;height:10px;border-radius:50%;background:#409eff;border:1.5px solid #fff;box-shadow:0 0 3px rgba(0,0,0,.3);'
           const m = new maplibregl.Marker({ element: el })
             .setLngLat([d.last_lng, d.last_lat])
-            .setPopup(new maplibregl.Popup({ closeButton:false }).setHTML(`<b>${d.phone}</b>${d.name ? '<br>'+d.name : ''}`))
+            .setPopup(new maplibregl.Popup({ closeButton:false }).setHTML(`<b>${_esc(d.phone)}</b>${d.name ? '<br>'+_esc(d.name) : ''}`))
             .addTo(map)
           deviceMarkers.push(m)
         }

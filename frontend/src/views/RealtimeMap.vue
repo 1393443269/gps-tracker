@@ -184,7 +184,7 @@ function connectSocket() {
   const token = localStorage.getItem('admin_token') || localStorage.getItem('customer_token') || ''
   socket = io(window.location.origin, {
     transports: ['websocket', 'polling'],
-    query: { token },
+    auth: { token },
   })
 
   socket.on('connect',    () => { wsConnected.value = true  })

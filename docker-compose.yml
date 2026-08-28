@@ -43,6 +43,11 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s   # Gunicorn 启动 + DB 初始化约需 15-30s，给足余量
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.5'
 
   frontend:
     build:
@@ -64,6 +69,11 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
 
   mqtt:
     container_name: tracker-mqtt
@@ -76,7 +86,7 @@ services:
     networks:
       - internal
     volumes:
-      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - ./passwd:/mosquitto/config/passwd:ro
     environment:
       - MQTT_USER=${MQTT_USER}
@@ -85,11 +95,16 @@ services:
       # 带认证的 sub 一次（-C 1 收一条消息后退出，-W 3 秒超时）
       # $$SYS 在 compose 里是转义的 $，shell 展开后变成 $SYS
       test: ["CMD-SHELL",
-             "mosquitto_sub -h 127.0.0.1 -p 1883 -u \"$$MQTT_USER\" -P \"$$MQTT_PASS\" -t '$$SYS/broker/uptime' -C 1 -W 3"]
+             "mosquitto_sub -h 127.0.0.1 -p 1883 -u \"$$MQTT_USER\" -P \"$$MQTT_PASS\" -t '$$SYS/broker/uptime' -C 1 -W 3 2>/dev/null || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
 
   postgres:
     container_name: tracker-postgres
@@ -109,6 +124,11 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.5'
 
 networks:
   # 内部网络：backend ↔ mqtt ↔ postgres 通信，不对外暴露

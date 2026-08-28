@@ -302,7 +302,7 @@ def db_scalar(sql, params=()):
 # ── 高频位置写入的异步批量落库（削减 SQLite 全局写锁争用）────────────────────────
 import queue as _queue
 
-_loc_queue     = _queue.Queue()     # 待落库的 location_record 行
+_loc_queue     = _queue.Queue(maxsize=100000)  # 有界队列防 OOM；满时丢弃最新帧并告警
 _dev_latest    = {}                 # phone -> 设备最新状态（多次上报只落最后一次）
 _dev_latest_lk = threading.Lock()
 _devid_cache   = {}                 # phone -> device_id，免每次上报查库
@@ -322,7 +322,10 @@ def enqueue_location(loc_row, dev_state):
     loc_row: location_record 的一整行值元组
     dev_state: (phone, last_lat, last_lng, last_speed, last_location_time, status, updated_at)
     """
-    _loc_queue.put(loc_row)
+    try:
+        _loc_queue.put_nowait(loc_row)
+    except _queue.Full:
+        log.warning("[批量写] 位置队列已满(>100000)，丢弃帧 phone=%s；请检查数据库写入是否正常", dev_state[0])
     with _dev_latest_lk:
         _dev_latest[dev_state[0]] = dev_state
 
@@ -439,6 +442,9 @@ def init_db():
         handle_note TEXT,
         created_at  TEXT    DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
     );
+
+    CREATE INDEX IF NOT EXISTS idx_alarm_phone_time ON alarm_record(phone, alarm_time);
+    CREATE INDEX IF NOT EXISTS idx_alarm_device_time ON alarm_record(device_id, alarm_time);
 
     CREATE TABLE IF NOT EXISTS sim_card (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -973,6 +979,7 @@ _serial_lock  = threading.Lock()
 # 围栏状态：记录每台设备当前"在哪些围栏内"，用于检测穿越
 # phone → set of fence_id
 fence_device_inside: dict = {}
+_fence_lock = threading.Lock()   # 保护下面四个围栏状态字典的并发读写
 
 # ── P0: 防抖 ─────────────────────────────────────────────────────────────────
 # 连续读数一致 FENCE_DEBOUNCE_N 次才确认状态切换，避免边界抖动重复告警
@@ -982,6 +989,14 @@ fence_device_pending: dict = {}        # phone → {fence_id: (last_state:bool|N
 # ── P1: 停留超时 ──────────────────────────────────────────────────────────────
 fence_device_enter_time:    dict = {}  # phone → {fence_id: datetime} 进入时刻
 fence_device_dwell_alarmed: dict = {}  # phone → set of fence_id（已触发滞留告警，离开时清除）
+
+def _fence_cleanup(phone):
+    """设备下线时清理四个围栏状态字典，防止内存泄漏和 phone 复用时的状态污染。"""
+    with _fence_lock:
+        fence_device_inside.pop(phone, None)
+        fence_device_pending.pop(phone, None)
+        fence_device_enter_time.pop(phone, None)
+        fence_device_dwell_alarmed.pop(phone, None)
 
 
 def next_serial():
@@ -1086,7 +1101,8 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
     now_time  = now_ts.time()
     speed_kmh = speed_raw / 10.0          # 808 协议单位 → km/h
 
-    prev_inside = fence_device_inside.get(phone, set())
+    with _fence_lock:
+        prev_inside = set(fence_device_inside.get(phone, set()))
     new_inside  = set()
 
     for f in fences:
@@ -1210,7 +1226,8 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
                 }, phone, 103)
                 log.info("[围栏] %s 围栏「%s」超速 %.1f>%dkm/h", phone, f['name'], speed_kmh, speed_lim)
 
-    fence_device_inside[phone] = new_inside
+    with _fence_lock:
+        fence_device_inside[phone] = new_inside
 
 
 # ── 808 消息处理函数 ────────────────────────────────────────────────────────────
@@ -1627,6 +1644,7 @@ def handle_client(conn, addr):
         if phone:
             with sessions_lock:
                 sessions.pop(phone, None)
+            _fence_cleanup(phone)   # 清理围栏状态，防内存泄漏和 phone 复用时状态污染
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             try:
                 db_exec("UPDATE device SET status=0, offline_time=? WHERE phone=?", (now, resolve_phone(phone)))
@@ -2208,7 +2226,15 @@ def assign_role_devices(rid):
 
 @app.get('/api/locations/<phone>/latest')
 def latest_location(phone):
-    row = db_query_one("SELECT * FROM location_record WHERE phone=? ORDER BY gps_time DESC LIMIT 1", (phone,))
+    # 优先从 device 缓存字段读（O(1) 主键查），无记录时回退到 location_record
+    dev = db_query_one(
+        "SELECT last_lat AS lat, last_lng AS lng, last_speed AS speed, "
+        "last_location_time AS gps_time FROM device WHERE phone=?", (phone,))
+    if dev and dev.get('lat'):
+        return ok(dev)
+    row = db_query_one(
+        "SELECT lat, lng, altitude, speed, direction, alarm_flag, gps_time, created_at "
+        "FROM location_record WHERE phone=? ORDER BY gps_time DESC LIMIT 1", (phone,))
     return ok(row)
 
 @app.get('/api/locations/<phone>/history')
@@ -3016,20 +3042,30 @@ def list_customers():
     total   = db_scalar(f"SELECT COUNT(*) FROM customer {where}", params)
     records = db_query(f"SELECT * FROM customer {where} ORDER BY id ASC LIMIT ? OFFSET ?",
                        params + [size, offset])
-    # 补充 has_children（树形展开用）和 parent_name（搜索模式显示归属用）
-    parent_cache = {}
+    # 补充 has_children 和 parent_name — 批量查询消除 N+1
     for r in records:
         r.pop('password_hash', None)   # 绝不把密码哈希返回给前端
-        r['has_children'] = db_scalar(
-            "SELECT COUNT(*) FROM customer WHERE parent_id=?", (r['id'],)) > 0
-        pid = r.get('parent_id')
-        if pid:
-            if pid not in parent_cache:
-                p = db_query_one("SELECT name FROM customer WHERE id=?", (pid,))
-                parent_cache[pid] = p['name'] if p else '—'
-            r['parent_name'] = parent_cache[pid]
-        else:
-            r['parent_name'] = None
+
+    if records:
+        ids        = [r['id'] for r in records]
+        parent_ids = list({r['parent_id'] for r in records if r.get('parent_id')})
+
+        # 一次查出所有"有子级"的 parent_id
+        ph = ','.join(['?'] * len(ids))
+        child_rows = db_query(f"SELECT DISTINCT parent_id FROM customer WHERE parent_id IN ({ph})", ids)
+        has_child_set = {row['parent_id'] for row in child_rows}
+
+        # 一次查出所有父级名称
+        parent_name_map = {}
+        if parent_ids:
+            ph2 = ','.join(['?'] * len(parent_ids))
+            p_rows = db_query(f"SELECT id, name FROM customer WHERE id IN ({ph2})", parent_ids)
+            parent_name_map = {row['id']: row['name'] for row in p_rows}
+
+        for r in records:
+            r['has_children'] = r['id'] in has_child_set
+            pid = r.get('parent_id')
+            r['parent_name'] = parent_name_map.get(pid) if pid else None
     return ok({'records': records, 'total': total, 'page': page})
 
 @app.post('/api/customers')
@@ -3506,17 +3542,24 @@ def report_summary():
 # ── Socket.IO 事件 ─────────────────────────────────────────────────────────────
 
 # ── Socket.IO 多租户隔离：按设备 org_id 分房间推送 ────────────────────────────
-_device_org_cache: dict = {}   # phone → org_id，按需缓存，避免每次推送都查库
+_device_org_cache: dict = {}        # phone → (org_id, expire_ts)；5 分钟 TTL，防止设备迁移组织后推错房间
+_ORG_CACHE_TTL = 300                # 秒
 
 def _get_device_org(phone: str) -> int:
-    """返回设备所属 org_id（先查缓存，再查库，找不到默认 1）"""
-    oid = _device_org_cache.get(phone)
-    if oid:
-        return oid
+    """返回设备所属 org_id（TTL 缓存 5 分钟，迁移组织后最迟 5 分钟生效）"""
+    import time as _t
+    now = _t.time()
+    entry = _device_org_cache.get(phone)
+    if entry and now < entry[1]:
+        return entry[0]
     row = db_query_one("SELECT org_id FROM device WHERE phone=?", (phone,))
     oid = int(row.get('org_id') or 1) if row else 1
-    _device_org_cache[phone] = oid
+    _device_org_cache[phone] = (oid, now + _ORG_CACHE_TTL)
     return oid
+
+def _invalidate_device_org_cache(phone: str):
+    """设备迁移组织时主动失效缓存，让下次推送立即读到新 org_id。"""
+    _device_org_cache.pop(phone, None)
 
 def _customer_ancestors(cid):
     """返回客户 cid 及其所有上级客户 id（上级能看下级设备，故推送要覆盖整条链）"""
@@ -3550,9 +3593,11 @@ def _sio_emit(event: str, data: dict, phone: str):
 
 
 @socketio.on('connect')
-def on_connect():
+def on_connect(auth):
     """验证 token，加入对应 org 房间；未认证则拒绝连接。"""
-    token = request.args.get('token', '')
+    # 优先从 Socket.IO auth 字段读取（不会出现在 URL/日志中）；
+    # 兼容旧客户端仍通过 query 传 token 的场景
+    token = (auth or {}).get('token', '') or request.args.get('token', '')
     if not token:
         return False   # 拒绝匿名连接
 
@@ -4152,8 +4197,16 @@ def portal_list_sub_customers():
         rows    = db_query("SELECT id,name,contact,phone,email,status,login_name,remark,created_at "
                            "FROM customer WHERE parent_id=? AND id!=? ORDER BY id DESC LIMIT ? OFFSET ?",
                            (cid, cid, size, offset))
-    for r in rows:
-        r['device_count'] = db_scalar("SELECT COUNT(*) FROM device WHERE customer_id=?", (r['id'],))
+    # 批量查设备数（单条 GROUP BY 替代 N 次循环）
+    if rows:
+        sub_ids = [r['id'] for r in rows]
+        ph = ','.join(['?'] * len(sub_ids))
+        dc_rows = db_query(
+            f"SELECT customer_id, COUNT(*) AS cnt FROM device WHERE customer_id IN ({ph}) GROUP BY customer_id",
+            sub_ids)
+        dc_map = {row['customer_id']: row['cnt'] for row in dc_rows}
+        for r in rows:
+            r['device_count'] = dc_map.get(r['id'], 0)
     return ok({'records': rows, 'total': total, 'page': page})
 
 
@@ -4573,8 +4626,10 @@ def assign_customer_devices(cid):
     phones = d.get('phones', [])
     # 只清该客户的直属设备（子客户设备由客户自己管理，不联动）
     db_exec("UPDATE device SET customer_id=NULL WHERE customer_id=?", (cid,))
-    for phone in phones:
-        db_exec("UPDATE device SET customer_id=? WHERE phone=?", (cid, phone))
+    # 批量分配：单条 WHERE phone IN(…) 替代 N 次循环，减少锁竞争
+    if phones:
+        ph = ','.join(['?'] * len(phones))
+        db_exec(f"UPDATE device SET customer_id=? WHERE phone IN ({ph})", [cid] + list(phones))
     add_op_log('分配设备', f'客户 {row["name"]} 分配 {len(phones)} 台设备')
     return ok()
 
@@ -5111,15 +5166,11 @@ def _mqtt_on_message(client, userdata, msg):
         device_id = device['id']
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        db_exec(
-            "INSERT INTO location_record (device_id,phone,lat,lng,altitude,speed,direction,gps_time,created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (device_id, phone, lat, lng, altitude, speed_raw, direction, gps_time, now)
-        )
-        db_exec(
-            "UPDATE device SET last_lat=?,last_lng=?,last_speed=?,last_location_time=?,status=1 WHERE phone=?",
-            (lat, lng, speed_raw, gps_time, phone)
-        )
+        # 走批量写队列（与 TCP 808 路径统一），避免在 paho 回调线程里直接持 _db_lock
+        loc_row  = (device_id, phone, lat, lng, altitude, speed_raw, direction, 0, 0, None, gps_time)
+        dev_state = (phone, lat, lng, speed_raw, gps_time, 1, now)
+        enqueue_location(loc_row, dev_state)
+
         _sio_emit('location_update', {
             'phone': phone, 'lat': lat, 'lng': lng,
             'speed': speed_raw / 10, 'direction': direction,
