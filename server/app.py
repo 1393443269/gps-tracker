@@ -3969,6 +3969,9 @@ def _require_admin_for_api():
     # 放行 CORS 预检
     if request.method == 'OPTIONS':
         return None
+    # 放行：健康探针（Docker healthcheck / 负载均衡存活检测），仅返回 {status:ok}，无敏感数据
+    if path == '/api/ping':
+        return None
     # 放行：认证接口（登录）
     if path.startswith('/api/auth/'):
         return None
