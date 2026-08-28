@@ -7,7 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制业务代码
-COPY app.py protocol.py protocol_g618g.py protocol_zhiling.py geo_resolve.py ./
+COPY app.py protocol.py protocol_g618g.py protocol_zhiling.py geo_resolve.py gunicorn.conf.py ./
 
 # 数据目录（SQLite 落盘，docker-compose 挂载卷到此处）
 RUN mkdir -p /app/data
@@ -17,4 +17,6 @@ EXPOSE 8080
 # JT/T 808 TCP（设备直连，明文 TCP，不走 Nginx）
 EXPOSE 9090
 
-CMD ["python", "app.py"]
+# 生产：Gunicorn + gevent WebSocket worker（替换 Flask dev server）
+# 若需本地调试可覆盖：docker run ... python app.py
+CMD ["gunicorn", "--config", "gunicorn.conf.py", "app:app"]

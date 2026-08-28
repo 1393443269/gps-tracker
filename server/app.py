@@ -1,3 +1,13 @@
+# ── gevent 猴子补丁（必须在所有其他 import 之前执行）────────────────────────────
+# Gunicorn gevent worker 和 python app.py 直接运行两种模式均适用。
+# 若 gevent 未安装（开发环境），优雅降级到 threading 模式。
+try:
+    from gevent import monkey as _gmonkey
+    _gmonkey.patch_all(thread=True, socket=True, ssl=True)
+    _GEVENT_AVAILABLE = True
+except ImportError:
+    _GEVENT_AVAILABLE = False
+
 """
 JT/T 808 资产管理平台 - Python 版
 Flask + Flask-SocketIO + SQLite + 808 TCP 服务一体化程序
@@ -39,7 +49,8 @@ log = logging.getLogger(__name__)
 # ── 应用初始化 ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app)
-socketio = SocketIO(app, cors_allowed_origins='*', async_mode='threading', logger=False, engineio_logger=False)
+_SIO_MODE = 'gevent' if _GEVENT_AVAILABLE else 'threading'
+socketio = SocketIO(app, cors_allowed_origins='*', async_mode=_SIO_MODE, logger=False, engineio_logger=False)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 支持通过环境变量指定数据目录（Docker 挂载卷场景）
@@ -72,6 +83,31 @@ if DB_BACKEND == 'postgres':
     import psycopg2.extras as _pg_extras
     _PG_DSN = os.environ.get('DATABASE_URL',
                              'postgresql://postgres:postgres@127.0.0.1:5432/gps')
+
+    # ── PG 连接池：防止每请求新建/关闭连接，在高并发下耗尽 max_connections ─────
+    from psycopg2.pool import ThreadedConnectionPool as _PgPool
+    _pg_pool      = None
+    _pg_pool_lock = threading.Lock()
+
+    def _get_pg_pool():
+        global _pg_pool
+        if _pg_pool is None:
+            with _pg_pool_lock:
+                if _pg_pool is None:
+                    # psycogreen：令 psycopg2 的 I/O 等待协作式让出 gevent 事件循环
+                    if _GEVENT_AVAILABLE:
+                        try:
+                            import psycogreen.gevent as _pcg
+                            _pcg.patch_psycopg()
+                        except ImportError:
+                            pass   # psycogreen 可选；不影响连接池防耗尽功能
+                    _pg_pool = _PgPool(
+                        minconn=2,
+                        maxconn=20,   # 远低于 PG max_connections=100，保留充足余量
+                        dsn=_PG_DSN,
+                        cursor_factory=_pg_extras.RealDictCursor,
+                    )
+        return _pg_pool
 
 import re as _re
 
@@ -146,9 +182,10 @@ class _ConnWrapper:
     - execute(sql, params) 自动转占位符
     - 提供 row 转 dict 的游标
     这样业务层的 conn.execute(...) 写法在两种后端下都能用。"""
-    def __init__(self, raw, backend):
-        self._raw = raw
+    def __init__(self, raw, backend, pool=None):
+        self._raw     = raw
         self._backend = backend
+        self._pool    = pool   # 非 None 时 close() 归还连接池而非真正断开
     def execute(self, sql, params=()):
         cur = self._raw.cursor()
         if self._backend == 'postgres':
@@ -185,17 +222,26 @@ class _ConnWrapper:
         return self
     def cursor(self):  return self._raw.cursor()
     def commit(self):  self._raw.commit()
-    def close(self):   self._raw.close()
+    def close(self):
+        if self._pool is not None:
+            try:
+                self._pool.putconn(self._raw)   # 归还连接到池，供后续请求复用
+            except Exception:
+                try: self._raw.close()
+                except Exception: pass
+        else:
+            self._raw.close()
 
 
 def get_db():
     if DB_BACKEND == 'postgres':
-        raw = _pg.connect(_PG_DSN, cursor_factory=_pg_extras.RealDictCursor)
+        pool = _get_pg_pool()
+        raw  = pool.getconn()
         # 关键：开 autocommit，对齐 SQLite 的自动提交语义。
         # 否则 psycopg2 默认把多条语句包进一个事务，某条(如 ALTER 列已存在被 try/except 忽略)
         # 失败会把事务打成中止态，后续全部报 InFailedSqlTransaction，真正的首错被掩盖。
         raw.autocommit = True
-        return _ConnWrapper(raw, 'postgres')
+        return _ConnWrapper(raw, 'postgres', pool=pool)  # close() 时归还连接池
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")   # 提升并发写性能
@@ -1529,6 +1575,12 @@ def _org_where(scope_ids, existing_conds=None, existing_params=None, col='org_id
             conds.append(f"{col} IN ({ph})")
             params.extend(scope_ids)
     return conds, params
+
+
+@app.get('/api/ping')
+def api_ping():
+    """健康探针：Docker healthcheck / 负载均衡存活检测用。"""
+    return ok({'status': 'ok'})
 
 
 @app.get('/api/devices/summary')
