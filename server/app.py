@@ -114,9 +114,11 @@ if DB_BACKEND == 'postgres':
                             _pcg.patch_psycopg()
                         except ImportError:
                             pass   # psycogreen 可选；不影响连接池防耗尽功能
+                    # maxconn 通过环境变量 PG_POOL_MAX 配置（默认 20）。
+                    # 1000 台设备接入时建议提到 40~50，并同步调大 PG 的 max_connections（默认 100）。
                     _pg_pool = _PgPool(
                         minconn=2,
-                        maxconn=20,   # 远低于 PG max_connections=100，保留充足余量
+                        maxconn=int(os.environ.get('PG_POOL_MAX', '20')),
                         dsn=_PG_DSN,
                         cursor_factory=_pg_extras.RealDictCursor,
                     )
@@ -1736,7 +1738,11 @@ def handle_client(conn, addr):
         log.info("[808] 连接断开: %s phone=%s", addr, phone)
 
 
-_TCP_CONN_SEM = threading.Semaphore(500)   # 最大并发 TCP 连接数，防止线程耗尽 OOM
+# 最大并发 TCP 连接数，防止连接/线程耗尽 OOM。
+# 通过环境变量 TCP_MAX_CONN 配置（默认 1200，给 1000 台设备留 20% 冗余，覆盖断连重连的瞬时叠加）。
+# gevent 模式下每连接是协程（开销极小），可放大到数千；纯线程模式（gevent 未装）建议不超过 800。
+TCP_MAX_CONN = int(os.environ.get('TCP_MAX_CONN', '1200'))
+_TCP_CONN_SEM = threading.Semaphore(TCP_MAX_CONN)
 
 def _handle_client_guarded(conn, addr):
     """用信号量包裹 handle_client，连接退出后自动释放槽位。"""
@@ -1757,7 +1763,7 @@ def start_tcp_server():
         try:
             conn, addr = srv.accept()
             if not _TCP_CONN_SEM.acquire(blocking=False):
-                log.warning("[808] 连接数已达上限(500)，拒绝 %s", addr)
+                log.warning("[808] 连接数已达上限(%d)，拒绝 %s", TCP_MAX_CONN, addr)
                 conn.close()
                 continue
             t = threading.Thread(target=_handle_client_guarded, args=(conn, addr), daemon=True)
