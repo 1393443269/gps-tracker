@@ -832,6 +832,9 @@ def handle_g618g_frame(conn, frame, phone_holder):
 
 # ── TCP 连接处理线程 ────────────────────────────────────────────────────────────
 
+# 808 TCP 服务监听端口(与 app.py 原定义一致)。start_tcp_server 绑定此端口。
+TCP_PORT = 9090
+
 def handle_client(conn, addr):
     log.info("[TCP] 新连接: %s:%d", addr[0], addr[1])
     buf   = bytearray()
