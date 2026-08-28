@@ -46,7 +46,16 @@ def split_frames(buf: bytes):
         # 找下一个 token 作为本帧结束
         nxt = buf.find(TOKEN, len(TOKEN))
         if nxt < 0:
-            # 没有下一个 token，剩余数据不完整，留待下次收到更多数据后再处理
+            # 没有后继 token。协议 V2.0 明确承诺「报文为完整报文，不会出现中间断开在
+            # 下一个数据包的现象」，故最后一个 token 之后的整段就是一条完整帧，直接产出。
+            # 设备一次只发一帧（发完即休眠）是最常见场景，旧逻辑在此把它当半包永久滞留，
+            # 导致注册/心跳帧收不到、设备一直上不了线。
+            # 不用校验和判断是否成帧——协议规定「通用版本设备不强求校验，可忽略」，
+            # 用 verify 卡尾段会把不算校验的设备的帧误判为半包，回退到同一个 bug。
+            # 帧过短（连 token+msgid+checksum 都不够 6 字节）才留作半包。
+            if len(buf) >= 6:
+                frames.append(buf)
+                return frames, b''
             return frames, buf
         frames.append(buf[:nxt])
         buf = buf[nxt:]

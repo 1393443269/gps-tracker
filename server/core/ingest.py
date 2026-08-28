@@ -660,6 +660,11 @@ def handle_location(sock, phone, serial, body):
         (canonical, lat, lng, speed, gps_time, status, now)
     )
 
+    # 先应答再做后续处理：报警写库、角色查询、围栏检测（check_fence_crossing 内部也写库）
+    # 都不在设备关心的关键路径上。高并发+SQLite 全局写锁时，把应答压在这些同步写库之后
+    # 会拖慢定位帧应答，触发设备超时断连。位置已异步入队，此处立即应答不丢数据。
+    sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0200, 0))
+
     # 处理报警（使用 canonical phone，与 device 表保持一致）
     if alarm_flag:
         import time as _t
@@ -725,18 +730,23 @@ def handle_location(sock, phone, serial, body):
     except Exception as e:
         log.error("[围栏检测] 异常: %s", e)
 
-    # 应答
-    sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0200, 0))
-
 
 def handle_g618g_frame(conn, frame, phone_holder):
     """处理一个 G618G 上报帧：解析并落库。phone_holder 是 [phone] 单元素列表（可变引用）。"""
     r = g618.parse(frame)
     typ = r.get('type')
+    # 注意：不按 checksum_ok 拦截。协议 V2.0 规定「通用版本设备不强求校验，可忽略此部分，
+    # 下行指令随意一个字节即可」——设备可能根本不认真算校验字节，若强制丢弃校验失败帧，
+    # 会误杀这类设备的全部上报数据。防幽灵设备改由注册段的 IMEI 合法性校验负责（见下）。
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     if typ == 'register':          # 0xF0 建立连接：记录 IMEI、回复 F1、登记会话
         imei = r.get('imei')
+        # IMEI 合法性校验：G618G 上报 IMEI 为 15 位数字（协议示例 869465050010011）。
+        # 并包错位/误码拼出的假注册帧 IMEI 多为异常值，据此拦截自动建档，避免幽灵设备灌库。
+        if not (imei and imei.isdigit() and len(imei) == 15):
+            log.warning("[G618G] 非法 IMEI 拒绝建档: %r frame=%s", imei, frame[:16].hex())
+            return typ
         phone_holder[0] = imei
         with sessions_lock:
             sessions[imei] = conn
