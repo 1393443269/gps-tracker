@@ -13,7 +13,7 @@
 
 def _build_cmd(cmd: str, *params) -> str:
     """构造智令指令字符串: *CMD,p1,p2,...#"""
-    _ILLEGAL = (',', '#', '*')
+    _ILLEGAL = (',', '#', '*', '\r', '\n', '\x00')
     for p in params:
         if isinstance(p, str) and any(c in p for c in _ILLEGAL):
             raise ValueError(f"指令参数含非法字符: {p!r}")
@@ -64,6 +64,7 @@ def build_set_card_info(company: str, name: str, emp_id: str, title: str) -> str
 
 def build_send_message(message: str) -> str:
     """发送留言(最长140字符/70中文，不支持标点)"""
+    message = message[:140]  # 协议上限 140 字符
     return _build_cmd('Message', message)
 
 

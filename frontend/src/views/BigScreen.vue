@@ -128,6 +128,24 @@ const lineEl = ref(null)
 const platformTitle = ref('应急物资管理系统')
 const platformLogo  = ref('')
 const centerTitle   = ref('设备分布数据大屏')
+
+// Logo URL 域名白名单校验，拒绝内网地址和非 http/https 协议
+const _safeLogo = (url) => {
+  if (!url) return ''
+  // 相对路径（/uploads/... 等）直接允许，拼上 origin 后使用
+  if (url.startsWith('/')) return url
+  // 仅允许 http/https 协议
+  try {
+    const u = new URL(url)
+    if (!['http:', 'https:'].includes(u.protocol)) return ''
+    // 拒绝内网地址（localhost、127.x、10.x、172.16-31.x、192.168.x）
+    if (/^(localhost|127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(u.hostname)) return ''
+    return url
+  } catch {
+    return ''
+  }
+}
+
 async function loadPlatform() {
   try {
     const res = await platformApi.get()
@@ -137,8 +155,12 @@ async function loadPlatform() {
     if (d.account_title) centerTitle.value = d.account_title
     else if (d.bigscreen_title) centerTitle.value = d.bigscreen_title
     if (d.logo_url) {
-      platformLogo.value = /^https?:\/\//.test(d.logo_url)
-        ? d.logo_url : (window.location.origin + d.logo_url)
+      const safe = _safeLogo(d.logo_url)
+      if (safe) {
+        platformLogo.value = safe.startsWith('/')
+          ? (window.location.origin + safe)
+          : safe
+      }
     }
   } catch {}
 }

@@ -11,6 +11,7 @@ G618G 4G Cat.1 定位设备 TCP 协议解析模块（上海欧孚）
 规格来源：G618G-4GCat.1-tcp通信协议V2.0
 """
 import struct
+import math as _math
 
 TOKEN = b'\xBD\xBD\xBD\xBD'
 
@@ -110,6 +111,8 @@ def parse(frame: bytes):
                 return {**r, 'type': 'location', 'parse_error': 'short payload'}
             lon = _double(p, 0)
             lat = _double(p, 8)
+            if not (_math.isfinite(lat) and _math.isfinite(lon)):
+                return {**r, 'type': 'location', 'valid': False, 'parse_error': 'NaN/Inf coordinate'}
             ns = chr(p[16]); ew = chr(p[17]); st = chr(p[18])
             if ns == 'S': lat = -abs(lat)
             if ew == 'W': lon = -abs(lon)

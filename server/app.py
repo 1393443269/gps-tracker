@@ -68,7 +68,17 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 _ALLOWED_IMG_EXT = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
 
 def _hash_pw(pwd: str) -> str:
-    return hashlib.sha256(pwd.encode('utf-8')).hexdigest()
+    """用 bcrypt 哈希密码（cost=12）。"""
+    import bcrypt as _bcrypt
+    return _bcrypt.hashpw(pwd.encode('utf-8'), _bcrypt.gensalt(rounds=12)).decode('utf-8')
+
+def _verify_pw(plain: str, stored: str) -> bool:
+    """验证密码，兼容旧 SHA-256 哈希（自动升级）。"""
+    import bcrypt as _bcrypt
+    if stored and (stored.startswith('$2b$') or stored.startswith('$2a$')):
+        return _bcrypt.checkpw(plain.encode('utf-8'), stored.encode('utf-8'))
+    # 旧 SHA-256 路径（兼容历史数据）
+    return hashlib.sha256(plain.encode('utf-8')).hexdigest() == stored
 
 # ── SQLite 数据库 ──────────────────────────────────────────────────────────────
 
@@ -308,6 +318,7 @@ _dev_latest_lk = threading.Lock()
 _devid_cache: dict = {}            # phone → (device_id, expire_ts)；10 分钟 TTL
 _DEVID_CACHE_TTL = 600
 _alarm_last_ts: dict = {}          # (phone, alarm_type) → last_alarm_unix_ts
+_alarm_last_ts_lock = threading.Lock()
 _ALARM_DEBOUNCE_SEC = 60           # 同类型报警至少间隔 60 秒
 
 def _get_device_id(phone):
@@ -1352,10 +1363,12 @@ def handle_auth(sock, phone, serial, body):
         log.info("[808] 鉴权成功: phone=%s", canonical)
     else:
         result = 1
-        log.warning("[808] 鉴权失败: phone=%s auth=%s", canonical, auth_code)
+        log.warning("[808] 鉴权失败断开连接 phone=%s auth=%s", canonical, auth_code)
         # 鉴权失败：从 sessions 中删除，防止未鉴权设备被下发指令
         with sessions_lock:
             sessions.pop(canonical, None)
+        sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0102, result))
+        return 'close'
 
     sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0102, result))
 
@@ -1382,8 +1395,17 @@ def handle_location(sock, phone, serial, body):
     altitude   = loc['altitude']
     alarm_flag  = loc['alarm_flag']
     status_flag = loc['status_flag']    # bit1=1 表示已定位，围栏检测用
-    gps_time    = loc['gps_time'].strftime('%Y-%m-%d %H:%M:%S')
+    _gt = loc.get('gps_time')
+    gps_time = (_gt.strftime('%Y-%m-%d %H:%M:%S')
+                if _gt else datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
     mileage     = loc.get('mileage')
+
+    # GPS 字段合理性校验
+    if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+        log.warning("[808] 非法坐标丢弃 phone=%s lat=%s lng=%s", phone, lat, lng)
+        return
+    speed = min(max(speed, 0), 5000)   # 限速 5000 km/h（合理上限）
+    direction = int(direction) % 360   # 方向截断到 0-359
 
     device_id = _get_device_id(canonical)   # 缓存查询，免每次上报查库
 
@@ -1403,8 +1425,14 @@ def handle_location(sock, phone, serial, body):
             if alarm_flag & (1 << bit):
                 _alarm_key = (canonical, bit)
                 _now_ts = _t.time()
-                if _now_ts - _alarm_last_ts.get(_alarm_key, 0) >= _ALARM_DEBOUNCE_SEC:
-                    _alarm_last_ts[_alarm_key] = _now_ts
+                with _alarm_last_ts_lock:
+                    last_ts = _alarm_last_ts.get(_alarm_key, 0)
+                    if _now_ts - last_ts >= _ALARM_DEBOUNCE_SEC:
+                        _alarm_last_ts[_alarm_key] = _now_ts
+                        should_alarm = True
+                    else:
+                        should_alarm = False
+                if should_alarm:
                     db_exec(
                         "INSERT INTO alarm_record (device_id,phone,alarm_type,alarm_desc,"
                         "lat,lng,speed,alarm_time,status) VALUES (?,?,?,?,?,?,?,?,0)",
@@ -1497,6 +1525,14 @@ def handle_g618g_frame(conn, frame, phone_holder):
     elif typ == 'location':        # 0x03 位置：更新设备最新位置 + 写轨迹（走异步批量）
         imei = phone_holder[0]
         if imei and r.get('valid'):
+            _lat = r.get('lat', 0)
+            _lng = r.get('lng', 0)
+            if not (math.isfinite(_lat) and math.isfinite(_lng)):
+                log.warning("[G618G] NaN/Inf 坐标丢弃 phone=%s", imei)
+                return typ
+            if not (-90 <= _lat <= 90) or not (-180 <= _lng <= 180):
+                log.warning("[G618G] 非法坐标丢弃 phone=%s lat=%s lng=%s", imei, _lat, _lng)
+                return typ
             gps_time = datetime.fromtimestamp(r['timestamp']).strftime('%Y-%m-%d %H:%M:%S') if r.get('timestamp') else now
             did = _get_device_id(imei)
             enqueue_location(
@@ -1614,7 +1650,11 @@ def handle_client(conn, addr):
             frames, buf = p.extract_frames(buf)
 
             for frame in frames:
-                hdr = p.parse_header(frame)
+                try:
+                    hdr = p.parse_header(frame)
+                except (ValueError, struct.error) as e:
+                    log.warning("[%s] 帧头解析失败 addr=%s err=%s", proto or '?', addr, e)
+                    continue
                 if not hdr:
                     continue
 
@@ -1630,7 +1670,9 @@ def handle_client(conn, addr):
 
                 try:
                     if   msg_id == 0x0100: handle_register(conn, ph, serial, body)
-                    elif msg_id == 0x0102: handle_auth(conn, ph, serial, body)
+                    elif msg_id == 0x0102:
+                        if handle_auth(conn, ph, serial, body) == 'close':
+                            break
                     elif msg_id == 0x0002: handle_heartbeat(conn, ph, serial)
                     elif msg_id == 0x0200: handle_location(conn, ph, serial, body)
                     elif msg_id == 0x0001: pass   # 终端通用应答，忽略
@@ -1703,10 +1745,14 @@ def _page_params(default_size=20, max_size=_MAX_PAGE_SIZE):
     return page, size
 
 def ok(data=None):
-    return jsonify({'code': 200, 'msg': 'success', 'data': data})
+    resp = jsonify({'code': 200, 'msg': 'success', 'data': data})
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
 
 def fail(msg, code=500):
-    return jsonify({'code': code, 'msg': msg}), code
+    resp = jsonify({'code': code, 'msg': msg})
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp, code
 
 
 # ── 设备接口 ──
@@ -1823,8 +1869,17 @@ def create_device():
 
 @app.get('/api/devices/<int:did>')
 def get_device(did):
-    row = db_query_one("SELECT * FROM device WHERE id=?", (did,))
-    if not row: return fail('设备不存在', 404)
+    sids = _org_scope_ids(request)
+    if sids is not None:
+        if not sids:
+            return fail('设备不存在或无权限', 404)
+        ph = ','.join(['?'] * len(sids))
+        row = db_query_one(f"SELECT * FROM device WHERE id=? AND org_id IN ({ph})",
+                           [did] + sids)
+    else:
+        row = db_query_one("SELECT * FROM device WHERE id=?", (did,))
+    if not row:
+        return fail('设备不存在或无权限', 404)
     row = dict(row)
     row.pop('auth_code', None)   # 鉴权码属设备内部凭据，不对外暴露
     return ok(row)
@@ -1833,9 +1888,17 @@ def get_device(did):
 def update_device(did):
     data = request.get_json() or {}
     now  = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    row  = db_query_one("SELECT lifecycle FROM device WHERE id=?", (did,))
+    sids = _org_scope_ids(request)
+    if sids is not None:
+        if not sids:
+            return fail('设备不存在或无权限', 404)
+        ph = ','.join(['?'] * len(sids))
+        row = db_query_one(f"SELECT lifecycle FROM device WHERE id=? AND org_id IN ({ph})",
+                           [did] + sids)
+    else:
+        row = db_query_one("SELECT lifecycle FROM device WHERE id=?", (did,))
     if not row:
-        return fail('设备不存在', 404)
+        return fail('设备不存在或无权限', 404)
 
     new_lc = data.get('lifecycle')
     activated_at   = None
@@ -2231,6 +2294,15 @@ def assign_role_devices(rid):
 
 @app.get('/api/locations/<phone>/latest')
 def latest_location(phone):
+    sids = _org_scope_ids(request)
+    if sids is not None:
+        if not sids:
+            return fail('设备不存在或无权限', 403)
+        ph = ','.join(['?'] * len(sids))
+        dev_check = db_query_one(f"SELECT id FROM device WHERE phone=? AND org_id IN ({ph})",
+                                 [phone] + sids)
+        if not dev_check:
+            return fail('设备不存在或无权限', 403)
     # 优先从 device 缓存字段读（O(1) 主键查），无记录时回退到 location_record
     dev = db_query_one(
         "SELECT last_lat AS lat, last_lng AS lng, last_speed AS speed, "
@@ -2244,6 +2316,15 @@ def latest_location(phone):
 
 @app.get('/api/locations/<phone>/history')
 def location_history(phone):
+    sids = _org_scope_ids(request)
+    if sids is not None:
+        if not sids:
+            return fail('设备不存在或无权限', 403)
+        ph = ','.join(['?'] * len(sids))
+        dev_check = db_query_one(f"SELECT id FROM device WHERE phone=? AND org_id IN ({ph})",
+                                 [phone] + sids)
+        if not dev_check:
+            return fail('设备不存在或无权限', 403)
     page, size = _page_params(100, max_size=1000)
     start  = request.args.get('start', '')
     end    = request.args.get('end', '')
@@ -2717,6 +2798,16 @@ def g618g_command():
     builder = _G618G_CMD_MAP.get(cmd)
     if not builder:
         return fail(f'不支持的 G618G 指令: {cmd}，支持: {", ".join(_G618G_CMD_MAP.keys())}')
+    # IP 格式校验（set_server_ip 命令）
+    _IPV4_RE = _re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
+    if cmd == 'set_server_ip':
+        ip = data.get('ip', '')
+        try:
+            port = int(data.get('port', 0))
+        except (ValueError, TypeError):
+            port = 0
+        if not _IPV4_RE.match(ip) or not (1 <= port <= 65535):
+            return fail('IP 地址或端口格式错误')
     with sessions_lock:
         conn = sessions.get(phone)
     if not conn:
@@ -3485,8 +3576,20 @@ def report_summary():
     device_inactive = db_scalar(f"SELECT COUNT(*) {_scoped('device','AND lifecycle=0')}", sids or [])
     device_disabled = db_scalar(f"SELECT COUNT(*) {_scoped('device','AND lifecycle IN (2,3)')}", sids or [])
 
-    alarm_total     = db_scalar("SELECT COUNT(*) FROM alarm_record")
-    alarm_unhandled = db_scalar("SELECT COUNT(*) FROM alarm_record WHERE status=0")
+    if sids is not None:
+        _alarm_sids = sids if sids else []
+        _alarm_ph   = ','.join(['?'] * len(_alarm_sids)) if _alarm_sids else '0'
+        alarm_total = db_scalar(
+            f"SELECT COUNT(*) FROM alarm_record ar "
+            f"JOIN device d ON ar.device_id=d.id WHERE d.org_id IN ({_alarm_ph})",
+            _alarm_sids)
+        alarm_unhandled = db_scalar(
+            f"SELECT COUNT(*) FROM alarm_record ar "
+            f"JOIN device d ON ar.device_id=d.id WHERE d.org_id IN ({_alarm_ph}) AND ar.handled=0",
+            _alarm_sids)
+    else:
+        alarm_total     = db_scalar("SELECT COUNT(*) FROM alarm_record")
+        alarm_unhandled = db_scalar("SELECT COUNT(*) FROM alarm_record WHERE status=0")
     # 使用参数化查询，防止日期字段 SQL 注入
     if start_raw:
         alarm_period = db_scalar(
@@ -3764,7 +3867,12 @@ def _verify_admin_token(token: str):
             return None
         if _time_mod.time() - int(ts_s) > 30 * 24 * 3600:
             return None
-        return int(aid_s)
+        aid = int(aid_s)
+        # 检查 admin 账号是否仍然活跃
+        row = db_query_one("SELECT is_active FROM admin_user WHERE id=?", (aid,))
+        if not row or not row.get('is_active', 1):
+            return None  # 账号已禁用，token 作废
+        return aid
     except Exception:
         return None
 
@@ -3809,12 +3917,16 @@ def admin_login():
     if not username or not password:
         return fail('账号和密码不能为空', 400)
     row = db_query_one(
-        "SELECT id, username, real_name, org_id, org_level, user_type "
-        "FROM admin_user WHERE username=? AND password_hash=? AND COALESCE(is_active,1)=1",
-        (username, _hash_pw(password))
+        "SELECT id, username, real_name, org_id, org_level, user_type, password_hash "
+        "FROM admin_user WHERE username=? AND COALESCE(is_active,1)=1",
+        (username,)
     )
-    if not row:
+    if not row or not _verify_pw(password, row.get('password_hash') or ''):
         return fail('账号或密码错误', 401)
+    # 如果是旧 SHA-256 哈希，自动升级为 bcrypt
+    if not (row['password_hash'].startswith('$2b$') or row['password_hash'].startswith('$2a$')):
+        db_exec("UPDATE admin_user SET password_hash=? WHERE username=?",
+                (_hash_pw(password), row['username']))
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     db_exec("UPDATE admin_user SET last_login=? WHERE id=?", (now, row['id']))
     token = _make_admin_token(row['id'])
@@ -3828,6 +3940,11 @@ def admin_login():
         'orgLevel': row.get('org_level') or 1,
         'userType': row.get('user_type') or 9,
     })
+
+@app.post('/api/auth/logout')
+def admin_logout():
+    """管理员注销（前端清除 token，服务端无状态）"""
+    return ok({'message': '注销成功'})
 
 @app.post('/api/auth/change_password')
 def admin_change_password():
@@ -3860,7 +3977,7 @@ def _make_token(customer_id: int) -> str:
     return base64.b64encode(f"{raw}:{sig}".encode()).decode()
 
 def _verify_token(token: str):
-    """返回 customer_id(int) 或 None（无效/过期）"""
+    """返回 customer_id(int) 或 None（无效/过期/已禁用）"""
     import hmac as _hmac
     try:
         decoded = base64.b64decode(token).decode()
@@ -3871,7 +3988,12 @@ def _verify_token(token: str):
             return None
         if _time_mod.time() - int(ts_s) > 30 * 24 * 3600:  # 30天有效
             return None
-        return int(cid_s)
+        customer_id = int(cid_s)
+        # 检查客户账号是否仍然活跃
+        row = db_query_one("SELECT status FROM customer WHERE id=?", (customer_id,))
+        if not row or row.get('status') != '活跃':
+            return None  # 账号已禁用
+        return customer_id
     except Exception:
         return None
 
@@ -3891,13 +4013,22 @@ def portal_login():
     if not login_name or not password:
         return fail('账号和密码不能为空', 400)
     row = db_query_one(
-        "SELECT id, name, login_name FROM customer WHERE login_name=? AND password_hash=? AND status='活跃'",
-        (login_name, _hash_pw(password))
+        "SELECT id, name, login_name, password_hash FROM customer WHERE login_name=? AND status='活跃'",
+        (login_name,)
     )
-    if not row:
+    if not row or not _verify_pw(password, row.get('password_hash') or ''):
         return fail('账号或密码错误', 401)
+    # 如果是旧 SHA-256 哈希，自动升级为 bcrypt
+    if not (row['password_hash'].startswith('$2b$') or row['password_hash'].startswith('$2a$')):
+        db_exec("UPDATE customer SET password_hash=? WHERE id=?",
+                (_hash_pw(password), row['id']))
     token = _make_token(row['id'])
     return ok({'token': token, 'customer': {'id': row['id'], 'name': row['name'], 'login_name': row['login_name']}})
+
+@app.post('/api/customer/logout')
+def portal_logout():
+    """客户注销"""
+    return ok({'message': '注销成功'})
 
 @app.get('/api/customer/me')
 def portal_me():
@@ -4639,6 +4770,15 @@ def set_customer_password(cid):
     login_name = (d.get('login_name') or '').strip()
     if not login_name:
         return fail('login_name 不能为空', 400)
+    sids = _org_scope_ids(request)
+    if sids is not None:
+        if not sids:
+            return fail('客户不存在或无权限', 403)
+        ph = ','.join(['?'] * len(sids))
+        cust = db_query_one(f"SELECT id FROM customer WHERE id=? AND org_id IN ({ph})",
+                            [cid] + sids)
+        if not cust:
+            return fail('客户不存在或无权限', 403)
     row = db_query_one("SELECT id, password_hash FROM customer WHERE id=?", (cid,))
     if not row:
         return fail('客户不存在', 404)
@@ -4659,6 +4799,15 @@ def set_customer_password(cid):
 @app.get('/api/customers/<int:cid>/devices')
 def list_customer_devices(cid):
     """列出归属于该客户的设备"""
+    sids = _org_scope_ids(request)
+    if sids is not None:
+        if not sids:
+            return fail('客户不存在或无权限', 403)
+        ph = ','.join(['?'] * len(sids))
+        cust = db_query_one(f"SELECT id FROM customer WHERE id=? AND org_id IN ({ph})",
+                            [cid] + sids)
+        if not cust:
+            return fail('客户不存在或无权限', 403)
     records = db_query(
         "SELECT id, phone, name, status, last_lat, last_lng, last_location_time FROM device WHERE customer_id=?",
         (cid,)
@@ -4668,6 +4817,15 @@ def list_customer_devices(cid):
 @app.put('/api/customers/<int:cid>/devices')
 def assign_customer_devices(cid):
     """管理员将一组设备（phone 列表）分配给客户；phones=[] 则全部解绑"""
+    sids = _org_scope_ids(request)
+    if sids is not None:
+        if not sids:
+            return fail('客户不存在或无权限', 403)
+        ph = ','.join(['?'] * len(sids))
+        cust = db_query_one(f"SELECT id FROM customer WHERE id=? AND org_id IN ({ph})",
+                            [cid] + sids)
+        if not cust:
+            return fail('客户不存在或无权限', 403)
     row = db_query_one("SELECT name FROM customer WHERE id=?", (cid,))
     if not row:
         return fail('客户不存在', 404)
@@ -5239,7 +5397,8 @@ def _mqtt_on_message(client, userdata, msg):
 
 
 def start_mqtt_subscriber():
-    """后台 MQTT 订阅线程，broker 不可达时静默退出"""
+    """后台 MQTT 订阅线程，broker 不可达时自动重连"""
+    import time as _t
     try:
         import paho.mqtt.client as _mqtt
     except ImportError:
@@ -5253,17 +5412,20 @@ def start_mqtt_subscriber():
         else:
             log.warning("[MQTT] 连接失败 rc=%d", rc)
 
-    try:
-        client = _mqtt.Client(client_id='tracker-server', clean_session=True)
-        client.on_connect = _on_connect
-        client.on_message = _mqtt_on_message
-        if MQTT_USER:
-            client.username_pw_set(MQTT_USER, MQTT_PASS)
-        client.connect(MQTT_BROKER, MQTT_PORT_NUM, keepalive=60)
-        log.info("[MQTT] 正在连接 broker %s:%d ...", MQTT_BROKER, MQTT_PORT_NUM)
-        client.loop_forever()
-    except Exception as e:
-        log.warning("[MQTT] broker 不可达，MQTT 接入已跳过: %s", e)
+    while True:
+        try:
+            client = _mqtt.Client(client_id='tracker-server', clean_session=True)
+            client.on_connect = _on_connect
+            client.on_message = _mqtt_on_message
+            if MQTT_USER:
+                client.username_pw_set(MQTT_USER, MQTT_PASS)
+            client.connect(MQTT_BROKER, MQTT_PORT_NUM, keepalive=60)
+            log.info("[MQTT] 正在连接 broker %s:%d ...", MQTT_BROKER, MQTT_PORT_NUM)
+            client.loop_forever()
+            log.warning("[MQTT] loop_forever 退出，5 秒后重连")
+        except Exception as e:
+            log.warning("[MQTT] 连接异常，5 秒后重连: %s", e)
+        _t.sleep(5)
 
 
 # ── 前端静态文件托管（生产 build / 演示用） ────────────────────────────────────

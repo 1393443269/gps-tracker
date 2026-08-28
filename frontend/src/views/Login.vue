@@ -18,8 +18,8 @@
             :prefix-icon="Lock" show-password @keyup.enter="doLogin" />
         </el-form-item>
         <el-button type="primary" size="large" style="width:100%;margin-top:4px;"
-          :loading="loading" @click="doLogin">
-          登录
+          :loading="loading" :disabled="loading || loginCooldown > 0" @click="doLogin">
+          {{ loginCooldown > 0 ? `请等待 ${loginCooldown} 秒` : '登录' }}
         </el-button>
       </el-form>
 
@@ -38,7 +38,23 @@ const router  = useRouter()
 const loading = ref(false)
 const form    = ref({ username: '', password: '' })
 
+const loginFailCount = ref(0)
+const loginCooldown  = ref(0)
+let _cooldownTimer = null
+
+const startCooldown = (seconds) => {
+  loginCooldown.value = seconds
+  _cooldownTimer = setInterval(() => {
+    loginCooldown.value--
+    if (loginCooldown.value <= 0) {
+      clearInterval(_cooldownTimer)
+      loginCooldown.value = 0
+    }
+  }, 1000)
+}
+
 async function doLogin() {
+  if (loginCooldown.value > 0) return
   if (!form.value.username || !form.value.password) {
     ElMessage.warning('请填写账号和密码')
     return
@@ -72,6 +88,11 @@ async function doLogin() {
       }
     } catch {}
 
+    loginFailCount.value++
+    if (loginFailCount.value >= 5) {
+      startCooldown(30)
+      loginFailCount.value = 0
+    }
     ElMessage.error('账号或密码错误')
   } finally {
     loading.value = false

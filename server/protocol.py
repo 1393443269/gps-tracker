@@ -124,7 +124,12 @@ def parse_header(data: bytes) -> dict:
     phone     = bcd_to_phone(data[4:10])
     serial    = struct.unpack('>H', data[10:12])[0]
 
-    body_start = 16 if sub_pkg and len(data) >= 16 else 12
+    if sub_pkg:
+        if len(data) < 16:
+            raise ValueError(f'子包帧数据不足 16 字节(实际 {len(data)} 字节)')
+        body_start = 16
+    else:
+        body_start = 12
     if body_start + body_len > len(data):
         raise ValueError(f'body_len {body_len} 超出帧长度 {len(data)}')
     body = data[body_start: body_start + body_len]
@@ -148,7 +153,7 @@ def parse_register_body(body: bytes) -> dict:
         terminal_model= body[9:17].decode('ascii', errors='replace').strip('\x00').strip()
         terminal_id   = body[17:24].decode('ascii',errors='replace').strip('\x00').strip()
         plate_color   = body[24] if len(body) > 24 else 0
-        plate_no      = body[25:].decode('gbk', errors='replace').strip() if len(body) > 25 else ''
+        plate_no      = body[25:25+64].decode('gbk', errors='replace').strip() if len(body) > 25 else ''
         return {
             'manufacturer':  manufacturer,
             'terminal_model':terminal_model,

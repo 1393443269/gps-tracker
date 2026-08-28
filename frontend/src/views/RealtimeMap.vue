@@ -206,8 +206,9 @@ function connectSocket() {
 
   socket.on('alarm', (data) => {
     ElNotification({
-      title:   `⚠ 报警: ${data.phone}`,
-      message: `${data.alarmDesc} | ${data.time}`,
+      title:   `⚠ 报警: ${_esc(data.phone || '未知设备')}`,
+      message: `${_esc(data.alarmDesc || '报警')} | ${_esc(data.time || '')}`,
+      dangerouslyUseHTMLString: false,
       type:    'error',
       duration: 6000,
     })

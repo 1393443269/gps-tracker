@@ -102,6 +102,10 @@ def _extract_latlng(data, source):
         if not loc or ',' not in str(loc):
             return None
         lng_s, lat_s = str(loc).split(',')[:2]
-        return {'lat': float(lat_s), 'lng': float(lng_s), 'source': source}
+        lat_f = float(lat_s)
+        lng_f = float(lng_s)
+        if not (-90 <= lat_f <= 90) or not (-180 <= lng_f <= 180):
+            return None  # 非法坐标，高德返回异常值
+        return {'lat': lat_f, 'lng': lng_f, 'source': source}
     except Exception:
         return None

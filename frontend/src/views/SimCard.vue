@@ -239,13 +239,19 @@ function _esc(s) {
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;')
 }
 function highlight(text) {
-  const safe = _esc(text)
+  if (!text && text !== 0) return ''
+  const safeText = _esc(String(text))
   const kw = keyword.value.trim()
-  if (!kw) return safe
-  // 转义正则特殊字符，避免用户输入含 . * 等导致匹配异常
-  const escKw = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return safe.replace(new RegExp(escKw, 'gi'),
-    m => `<mark style="background:#ffe58f;color:inherit;padding:0 1px;border-radius:2px;">${m}</mark>`)
+  if (!kw) return safeText
+  // 先转义正则特殊字符，再转义 HTML 实体，在已转义的文本中精确匹配
+  const regEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const safeKw = _esc(String(kw))
+  if (!safeKw) return safeText
+  // m 来自 safeText（已经过 _esc 处理），是安全的 HTML 实体字符串
+  return safeText.replace(
+    new RegExp(regEscape(safeKw), 'gi'),
+    m => `<mark style="background:#fef08a;padding:0 2px;border-radius:2px;">${m}</mark>`
+  )
 }
 
 // ── 样式辅助 ─────────────────────────────────────────────────────────────────

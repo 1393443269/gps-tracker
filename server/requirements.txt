@@ -9,3 +9,4 @@ gevent>=23.0.0               # 协程 I/O，配合 Gunicorn gevent worker
 gevent-websocket>=0.10.1     # Gunicorn GeventWebSocketWorker，支持 WS 升级
 gunicorn>=21.0.0             # 生产 WSGI 服务器（替换 Flask dev server）
 psycogreen>=1.0.2            # psycopg2 gevent 等待回调，DB I/O 协作式非阻塞
+bcrypt>=4.0.0
