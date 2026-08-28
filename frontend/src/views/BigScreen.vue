@@ -605,22 +605,30 @@ function toggleFullscreen() {
   }
 }
 
+function handleResize() {
+  Object.values(charts).forEach(c => c?.resize())
+}
+
+function handleFullscreenChange() {
+  isFullscreen.value = !!document.fullscreenElement
+  setTimeout(() => Object.values(charts).forEach(c => c?.resize()), 200)
+}
+
 onMounted(async () => {
   loadPlatform()
   updateTime()
   clockTimer = setInterval(updateTime, 1000)
   await loadData()
   dataTimer = setInterval(loadData, 30000)
-  window.addEventListener('resize', () => Object.values(charts).forEach(c => c?.resize()))
-  document.addEventListener('fullscreenchange', () => {
-    isFullscreen.value = !!document.fullscreenElement
-    setTimeout(() => Object.values(charts).forEach(c => c?.resize()), 200)
-  })
+  window.addEventListener('resize', handleResize)
+  document.addEventListener('fullscreenchange', handleFullscreenChange)
 })
 
 onUnmounted(() => {
   clearInterval(clockTimer)
   clearInterval(dataTimer)
+  window.removeEventListener('resize', handleResize)
+  document.removeEventListener('fullscreenchange', handleFullscreenChange)
   Object.values(charts).forEach(c => c?.dispose())
 })
 </script>

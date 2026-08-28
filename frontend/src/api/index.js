@@ -242,20 +242,6 @@ export const portalApi = {
   },
 }
 
-// ── 统一自适应 API（自动选管理员或客户端点；当前未被页面引用，保留备用） ──────────
-export const unifiedApi = {
-  deviceList:   (p)    => isAdmin() ? deviceApi.list(p)          : portalApi.deviceList(p),
-  summary:      ()     => isAdmin() ? deviceApi.summary()         : portalApi.summary(),
-  latest:       (ph)   => isAdmin() ? locationApi.latest(ph)      : portalApi.latest(ph),
-  history:      (ph,p) => isAdmin() ? locationApi.history(ph,p)   : portalApi.history(ph,p),
-  alarmList:    (p)    => isAdmin() ? alarmApi.list(p)            : portalApi.alarms(p),
-  handleAlarm:  (id,d) => isAdmin() ? alarmApi.handle(id,d)       : portalApi.handleAlarm(id,d),
-  fenceList:    (p)    => isAdmin() ? fenceApi.list(p)            : portalApi.fences(p),
-  createFence:  (d)    => isAdmin() ? fenceApi.create(d)          : portalApi.createFence(d),
-  removeFence:  (id)   => isAdmin() ? fenceApi.remove(id)         : portalApi.removeFence(id),
-  fenceDevices: (id,ph)=> isAdmin() ? fenceApi.updateDevices(id,ph): portalApi.fenceDevices(id,ph),
-}
-
 // ── 电子围栏 ──────────────────────────────────────────────────────────────────
 export const fenceApi = {
   list:          (params)     => http.get('/fences', { params }),
