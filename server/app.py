@@ -47,10 +47,10 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── 应用初始化 ─────────────────────────────────────────────────────────────────
-app = Flask(__name__)
-CORS(app)
-_SIO_MODE = 'gevent' if _GEVENT_AVAILABLE else 'threading'
-socketio = SocketIO(app, cors_allowed_origins='*', async_mode=_SIO_MODE, logger=False, engineio_logger=False)
+# app / socketio / CORS 已下沉至 core/extensions.py(中立单例源头),用于打破
+# 「后台线程用 socketio ↔ socketio 定义在 app.py」的循环 import。此处 import
+# 保持本文件内所有 @app.route / @socketio.on / socketio.emit 用法不变。
+from core.extensions import app, socketio
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 支持通过环境变量指定数据目录（Docker 挂载卷场景）
