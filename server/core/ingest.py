@@ -541,7 +541,6 @@ def _emit_alarm(event, data, phone, alarm_type):
 
 def handle_register(sock, phone, serial, body):
     info      = p.parse_register_body(body)
-    auth_code = uuid.uuid4().hex[:8].upper()
     now       = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     # 若 plate_no 字段携带了完整 IMEI（15 位纯数字），以 IMEI 作为设备标识
@@ -553,8 +552,12 @@ def handle_register(sock, phone, serial, body):
         canonical_phone = resolve_phone(phone)
         plate_no_store  = plate_no_raw
 
-    existing = db_query_one("SELECT id FROM device WHERE phone=?", (canonical_phone,))
+    existing = db_query_one("SELECT id, auth_code FROM device WHERE phone=?", (canonical_phone,))
     if existing:
+        # 关键:已存在设备保留原 auth_code,不重新生成。真实 808 设备把首次注册拿到的
+        # auth_code 持久化在设备侧,若重连时又发注册而平台刷新了 auth_code,设备存的旧码
+        # 会与库里对不上,导致后续鉴权永久失败、设备死循环重连。仅原码为空时才补一个。
+        auth_code = existing.get('auth_code') or uuid.uuid4().hex[:8].upper()
         db_exec(
             "UPDATE device SET manufacturer=?,terminal_model=?,terminal_id=?,"
             "plate_no=?,plate_color=?,auth_code=?,updated_at=? WHERE phone=?",
@@ -562,6 +565,7 @@ def handle_register(sock, phone, serial, body):
              plate_no_store, info.get('plate_color'), auth_code, now, canonical_phone)
         )
     else:
+        auth_code = uuid.uuid4().hex[:8].upper()   # 首次注册才生成新鉴权码
         # org_id 显式写 1（根组织）；管理员可在设备管理界面手动迁移到子组织
         db_exec(
             "INSERT INTO device (phone,manufacturer,terminal_model,terminal_id,"
@@ -569,6 +573,12 @@ def handle_register(sock, phone, serial, body):
             (canonical_phone, info.get('manufacturer'), info.get('terminal_model'),
              info.get('terminal_id'), plate_no_store, info.get('plate_color'), auth_code)
         )
+
+    # 关键:按 canonical(device 表主键 = 下发时用的 phone)登记会话,否则用 IMEI 注册的设备
+    # 会话 key 是报文头 BCD 号(≤12位)、而下发查的是 15 位 IMEI,导致"在线却下发不到"。
+    if canonical_phone:
+        with sessions_lock:
+            sessions[canonical_phone] = sock
 
     resp = p.build_register_resp(phone, next_serial(), serial, 0, auth_code)
     sock.sendall(resp)
@@ -588,6 +598,10 @@ def handle_auth(sock, phone, serial, body):
         sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0102, 0))
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         db_exec("UPDATE device SET status=1, online_time=? WHERE phone=?", (now, canonical))
+        # 按 canonical 登记会话(设备可能只发鉴权不发注册),保证指令下发能按 device 表 phone 命中
+        if canonical:
+            with sessions_lock:
+                sessions[canonical] = sock
         log.info("[808] 鉴权成功: phone=%s", canonical)
     else:
         log.warning("[808] 鉴权失败断开连接 phone=%s auth=%s", canonical, auth_code)
@@ -836,13 +850,17 @@ def handle_g618g_frame(conn, frame, phone_holder):
 
 # 808 TCP 服务监听端口(与 app.py 原定义一致)。start_tcp_server 绑定此端口。
 TCP_PORT = 9090
+# TCP 读空闲超时(秒)。默认 300s——低功耗/人员定位设备静止态心跳常配 3~5 分钟甚至更长,
+# 旧值 90s 会误杀长心跳设备致其频繁掉线重连。可用环境变量 TCP_CLIENT_TIMEOUT 按现场设备调整
+# (建议设为设备最大心跳周期 × 2~3)。
+TCP_CLIENT_TIMEOUT = int(os.environ.get('TCP_CLIENT_TIMEOUT', '300'))
 
 def handle_client(conn, addr):
     log.info("[TCP] 新连接: %s:%d", addr[0], addr[1])
     buf   = bytearray()
     phone = None
     proto = None   # None=未定, '808', 'g618'
-    conn.settimeout(90)
+    conn.settimeout(TCP_CLIENT_TIMEOUT)
 
     try:
         while True:
@@ -927,9 +945,11 @@ def handle_client(conn, addr):
     finally:
         conn.close()
         if phone:
+            # 清理所有指向本连接的会话 key(可能存了两份:报文头 BCD 号 + canonical/IMEI),
+            # identity-checked——只删值仍是本 conn 的,避免误删该设备重连后的新连接。
             with sessions_lock:
-                if sessions.get(phone) is conn:   # 仅当仍是自己这条连接才清除，避免删掉重连的新连接
-                    sessions.pop(phone, None)
+                for _k in [k for k, v in sessions.items() if v is conn]:
+                    sessions.pop(_k, None)
             _fence_cleanup(phone)   # 清理围栏状态，防内存泄漏和 phone 复用时状态污染
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             try:
@@ -1003,9 +1023,18 @@ def _mqtt_on_message(client, userdata, msg):
 
         device = db_query_one("SELECT id FROM device WHERE phone=?", (phone,))
         if not device:
-            # 未注册设备上报数据：跳过落库，避免产生 device_id=NULL 的孤儿记录
-            log.warning("[MQTT] 未知设备 phone=%s，消息已跳过（请先在设备管理中注册该设备）", phone)
-            return
+            # MQTT 设备无 808/G618G 那样的注册帧,若一律丢弃则纯 MQTT 设备永远无法自助上线、
+            # 数据静默丢失。与 G618G 自动建档一致:未知设备自动建档(org_id=1,来源标记 MQTT),
+            # 管理员可在设备管理界面迁移组织。broker 已启用密码认证,能连入的即可信来源。
+            _now0 = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            db_exec("INSERT INTO device (phone,name,manufacturer,terminal_model,status,"
+                    "org_id,lifecycle,created_at,updated_at) VALUES (?,?,?,?,1,1,1,?,?)",
+                    (phone, 'MQTT-' + phone[-6:], 'MQTT', 'MQTT', _now0, _now0))
+            log.info("[MQTT] 未知设备 phone=%s 已自动建档", phone)
+            device = db_query_one("SELECT id FROM device WHERE phone=?", (phone,))
+            if not device:
+                log.warning("[MQTT] 设备 phone=%s 自动建档后仍查不到,跳过", phone)
+                return
         device_id = device['id']
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
