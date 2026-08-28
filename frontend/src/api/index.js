@@ -79,6 +79,7 @@ export const deviceApi = {
   list:              (params)       => http.get('/devices', { params }),
   get:               (id)           => http.get(`/devices/${id}`),
   create:            (data)         => http.post('/devices', data),
+  batchImport:       (rows)         => http.post('/devices/import', { rows }),
   update:            (id, data)     => http.put(`/devices/${id}`, data),
   summary:           (cfg)          => http.get('/devices/summary', cfg),
   batchLifecycle:    (ids, lifecycle) => http.put('/devices/batch_lifecycle', { ids, lifecycle }),

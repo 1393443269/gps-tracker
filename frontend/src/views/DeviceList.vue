@@ -22,6 +22,7 @@
       <el-col :span="9" style="text-align:right;display:flex;gap:8px;justify-content:flex-end;">
         <el-button type="primary" :icon="Search" @click="loadData(1)">搜索</el-button>
         <el-button v-if="isAdmin()" type="success" :icon="Plus" @click="openCreate">新增设备</el-button>
+        <el-button v-if="isAdmin()" :icon="Upload" @click="openImport">批量导入</el-button>
       </el-col>
     </el-row>
 
@@ -164,6 +165,44 @@
       </template>
     </el-dialog>
 
+    <!-- 批量导入弹窗 -->
+    <el-dialog v-model="importVisible" title="批量导入设备" width="560px">
+      <div style="font-size:13px;color:#606266;line-height:1.9;margin-bottom:12px;">
+        <p style="margin:0 0 6px;">1. 下载模板,按列填写设备信息(<b>IMEI/设备号必填</b>,其余选填)。</p>
+        <p style="margin:0 0 6px;">2. 支持 <b>.xlsx</b> 和 <b>.csv</b> 格式。已存在的设备号会自动跳过。</p>
+        <el-button size="small" :icon="Download" @click="downloadTemplate">下载导入模板</el-button>
+      </div>
+
+      <el-upload drag :auto-upload="false" :show-file-list="false" accept=".xlsx,.csv"
+        :on-change="onFilePicked">
+        <el-icon class="el-icon--upload"><Upload /></el-icon>
+        <div class="el-upload__text">把文件拖到这里,或<em>点击选择文件</em></div>
+      </el-upload>
+
+      <div v-if="importPreview.length" style="margin-top:12px;font-size:13px;">
+        已解析 <b>{{ importPreview.length }}</b> 条记录,点「开始导入」提交。
+      </div>
+
+      <div v-if="importResult" style="margin-top:12px;">
+        <el-alert :closable="false"
+          :type="importResult.failed ? 'warning' : 'success'"
+          :title="`导入完成:成功 ${importResult.created} 台,跳过 ${importResult.skipped} 台,失败 ${importResult.failed} 台`" />
+        <el-table v-if="importResultRows.length" :data="importResultRows" size="small" border
+          max-height="220" style="margin-top:10px;">
+          <el-table-column prop="row" label="行" width="60" />
+          <el-table-column prop="phone" label="IMEI/设备号" min-width="140" />
+          <el-table-column prop="statusText" label="结果" width="80" />
+          <el-table-column prop="reason" label="说明" min-width="120" />
+        </el-table>
+      </div>
+
+      <template #footer>
+        <el-button @click="importVisible = false">关闭</el-button>
+        <el-button type="primary" :disabled="!importPreview.length" :loading="importing"
+          @click="submitImport">开始导入</el-button>
+      </template>
+    </el-dialog>
+
     <!-- 批量分配围栏弹窗 -->
     <el-dialog v-model="batchFenceVisible" title="批量分配围栏" width="460px" @open="onBatchFenceOpen">
       <div style="margin-bottom:10px;font-size:13px;color:#606266;">
@@ -193,9 +232,10 @@
 
 <script setup>
 import { ref, reactive, onMounted, onUnmounted } from 'vue'
-import { Search, ArrowDown, Plus } from '@element-plus/icons-vue'
+import { Search, ArrowDown, Plus, Upload, Download } from '@element-plus/icons-vue'
 import { deviceApi, commandApi, fenceApi, portalApi, isAdmin } from '@/api'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import * as XLSX from 'xlsx'
 
 // ── 生命周期枚举 ──────────────────────────────────────────────────────────────
 const LC_OPTIONS = [
@@ -257,6 +297,90 @@ async function submitCreate() {
     loadData(1)
   } catch {} finally {
     createSaving.value = false
+  }
+}
+
+// ── 批量导入 ─────────────────────────────────────────────────────────────────
+const importVisible = ref(false)
+const importing     = ref(false)
+const importPreview = ref([])      // 解析出的行 [{phone,name,plateNo,terminalModel,remark}]
+const importResult  = ref(null)    // {created,skipped,failed,details}
+const importResultRows = ref([])   // 表格展示用(details 加中文结果)
+
+// 模板/导入的表头映射:支持中文表头,也兼容英文字段名
+const HEADER_MAP = {
+  'IMEI/设备号': 'phone', 'IMEI': 'phone', '设备号': 'phone', 'phone': 'phone',
+  '名称': 'name', 'name': 'name',
+  '位置/车牌': 'plateNo', '位置': 'plateNo', '车牌': 'plateNo', 'plateNo': 'plateNo',
+  '型号': 'terminalModel', 'terminalModel': 'terminalModel',
+  '备注': 'remark', 'remark': 'remark',
+}
+
+function openImport() {
+  importPreview.value = []
+  importResult.value  = null
+  importResultRows.value = []
+  importVisible.value = true
+}
+
+function downloadTemplate() {
+  const ws = XLSX.utils.aoa_to_sheet([
+    ['IMEI/设备号', '名称', '位置/车牌', '型号', '备注'],
+    ['123456789012345', '示例设备A', '沪A12345', 'EC800M', '选填'],
+  ])
+  ws['!cols'] = [{ wch: 20 }, { wch: 14 }, { wch: 14 }, { wch: 12 }, { wch: 16 }]
+  const wb = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(wb, ws, '设备导入')
+  XLSX.writeFile(wb, '设备批量导入模板.xlsx')
+}
+
+function onFilePicked(file) {
+  importResult.value = null
+  importResultRows.value = []
+  const reader = new FileReader()
+  reader.onload = (e) => {
+    try {
+      const wb = XLSX.read(e.target.result, { type: 'array' })
+      const ws = wb.Sheets[wb.SheetNames[0]]
+      const raw = XLSX.utils.sheet_to_json(ws, { defval: '' })   // 首行作表头
+      const rows = []
+      for (const r of raw) {
+        const obj = {}
+        for (const k in r) {
+          const field = HEADER_MAP[String(k).trim()]
+          if (field) obj[field] = String(r[k]).trim()
+        }
+        if (obj.phone) rows.push(obj)   // 只保留有设备号的行
+      }
+      if (!rows.length) {
+        ElMessage.warning('未解析到有效数据,请确认表头含「IMEI/设备号」且有内容')
+        importPreview.value = []
+        return
+      }
+      importPreview.value = rows
+      ElMessage.success(`已解析 ${rows.length} 条记录`)
+    } catch (err) {
+      ElMessage.error('文件解析失败,请确认格式为 .xlsx 或 .csv')
+      importPreview.value = []
+    }
+  }
+  reader.readAsArrayBuffer(file.raw)
+}
+
+async function submitImport() {
+  if (!importPreview.value.length) return
+  importing.value = true
+  try {
+    const res = await deviceApi.batchImport(importPreview.value)
+    importResult.value = res.data
+    const STAT = { created: '成功', skipped: '跳过', failed: '失败' }
+    importResultRows.value = (res.data.details || []).map(d => ({
+      ...d, statusText: STAT[d.status] || d.status,
+    }))
+    importPreview.value = []   // 提交后清空,避免重复导入
+    loadData(1)
+  } catch {} finally {
+    importing.value = false
   }
 }
 

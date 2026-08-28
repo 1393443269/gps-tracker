@@ -1911,6 +1911,63 @@ def create_device():
     return ok({'message': '创建成功'})
 
 
+@app.post('/api/devices/import')
+def import_devices():
+    """批量导入设备。请求体:{"rows":[{phone,name,plateNo,terminalModel,remark}, ...]}
+    规则:IMEI/设备号(phone)必填;库内已存在或本批内重复的跳过;其余建档。
+    返回:{created, skipped, failed, details:[{row,phone,status,reason}]}
+    """
+    data = request.get_json() or {}
+    rows = data.get('rows')
+    if not isinstance(rows, list) or not rows:
+        return fail('导入数据为空')
+    if len(rows) > 5000:
+        return fail('单次导入不能超过 5000 条,请分批导入')
+
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    created = skipped = failed = 0
+    details = []
+    seen_in_batch = set()   # 本批内已处理的 phone,防止文件内自身重复
+
+    for idx, r in enumerate(rows):
+        rownum = idx + 1
+        if not isinstance(r, dict):
+            failed += 1
+            details.append({'row': rownum, 'phone': '', 'status': 'failed', 'reason': '行格式错误'})
+            continue
+        phone = (str(r.get('phone') or '')).strip()
+        if not phone:
+            failed += 1
+            details.append({'row': rownum, 'phone': '', 'status': 'failed', 'reason': 'IMEI/设备号为空'})
+            continue
+        if phone in seen_in_batch:
+            skipped += 1
+            details.append({'row': rownum, 'phone': phone, 'status': 'skipped', 'reason': '文件内重复'})
+            continue
+        seen_in_batch.add(phone)
+        if db_query_one("SELECT id FROM device WHERE phone=?", (phone,)):
+            skipped += 1
+            details.append({'row': rownum, 'phone': phone, 'status': 'skipped', 'reason': '设备号已存在'})
+            continue
+        try:
+            db_exec(
+                "INSERT INTO device (phone,name,plate_no,manufacturer,terminal_model,"
+                "terminal_id,plate_color,auth_code,status,org_id,lifecycle,remark,created_at,updated_at)"
+                " VALUES (?,?,?,?,?,?,1,'DEFAULT',0,1,0,?,?,?)",
+                (phone, str(r.get('name', '') or ''), str(r.get('plateNo', '') or ''),
+                 str(r.get('manufacturer', '') or ''), str(r.get('terminalModel', '') or ''),
+                 str(r.get('terminalId', '') or ''), str(r.get('remark', '') or ''), now, now)
+            )
+            created += 1
+            details.append({'row': rownum, 'phone': phone, 'status': 'created', 'reason': ''})
+        except Exception as e:
+            failed += 1
+            details.append({'row': rownum, 'phone': phone, 'status': 'failed', 'reason': str(e)[:120]})
+
+    add_op_log('设备批量导入', f'导入 {created} 台,跳过 {skipped} 台,失败 {failed} 台')
+    return ok({'created': created, 'skipped': skipped, 'failed': failed, 'details': details})
+
+
 @app.get('/api/devices/<int:did>')
 def get_device(did):
     sids = _org_scope_ids(request)
