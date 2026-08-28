@@ -3162,14 +3162,34 @@ def delete_customer(cid):
             stack.extend(children)
         return result
     all_sub_ids = _all_descendants(cid)
-    # 1. 回收所有后代客户的设备，再删后代客户记录
+    all_cids    = [cid] + all_sub_ids   # 本客户 + 全部后代
+
+    # 1. 收集所有客户名下的设备 ID，用于级联清理
+    device_ids = []
+    for aid in all_cids:
+        rows = db_query("SELECT id FROM device WHERE customer_id=?", (aid,))
+        device_ids.extend(r['id'] for r in rows)
+
+    # 2. 级联清理：删除这些设备的报警记录（历史轨迹保留，设备归还管理员池后仍可查）
+    alarm_count = 0
+    for did in device_ids:
+        cur = db_query("SELECT COUNT(*) AS cnt FROM alarm_record WHERE device_id=?", (did,))
+        alarm_count += (cur[0]['cnt'] if cur else 0)
+        db_exec("DELETE FROM alarm_record WHERE device_id=?", (did,))
+
+    # 3. 回收所有后代客户的设备，再删后代客户记录
     for sid in all_sub_ids:
         db_exec("UPDATE device SET customer_id=NULL WHERE customer_id=?", (sid,))
         db_exec("DELETE FROM customer WHERE id=?", (sid,))
-    # 2. 将该客户自身的设备归还到管理员池，再删自身
+
+    # 4. 将该客户自身的设备归还到管理员池，再删自身
     db_exec("UPDATE device SET customer_id=NULL WHERE customer_id=?", (cid,))
     db_exec("DELETE FROM customer WHERE id=?", (cid,))
-    add_op_log('客户删除', f'删除客户 {row["name"]}（含 {len(all_sub_ids)} 个子账户），已回收设备至管理员设备池')
+
+    add_op_log('客户删除',
+               f'删除客户 {row["name"]}（含 {len(all_sub_ids)} 个子账户）；'
+               f'回收设备 {len(device_ids)} 台至管理员池；'
+               f'清理报警记录 {alarm_count} 条')
     return ok()
 
 
@@ -5083,9 +5103,13 @@ def _mqtt_on_message(client, userdata, msg):
         if lat == 0 and lng == 0:
             return
 
-        device    = db_query_one("SELECT id FROM device WHERE phone=?", (phone,))
-        device_id = device['id'] if device else None
-        now       = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        device = db_query_one("SELECT id FROM device WHERE phone=?", (phone,))
+        if not device:
+            # 未注册设备上报数据：跳过落库，避免产生 device_id=NULL 的孤儿记录
+            log.warning("[MQTT] 未知设备 phone=%s，消息已跳过（请先在设备管理中注册该设备）", phone)
+            return
+        device_id = device['id']
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         db_exec(
             "INSERT INTO location_record (device_id,phone,lat,lng,altitude,speed,direction,gps_time,created_at) "
