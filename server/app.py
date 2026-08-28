@@ -839,6 +839,130 @@ def init_db():
     log.info("数据库初始化完成: %s", DB_PATH)
 
 
+# ── PG 专用：location_record 按月分区 ─────────────────────────────────────────
+
+def _setup_pg_partitions():
+    """PG 专用：确保 location_record 是按月分区表，并预建当前月 + 未来 3 个月的分区。
+    - 表为空时自动重建为分区表；有数据时仅打印警告，不强制迁移。
+    - SQLite 后端直接返回，无副作用。
+    """
+    if DB_BACKEND != 'postgres':
+        return
+    import datetime as _dt
+    conn = get_db()
+    try:
+        # ① 查询 location_record 的表类型（p=分区表 r=普通表）
+        cur = conn.execute(
+            "SELECT c.relkind FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relname = ? AND n.nspname = 'public'",
+            ('location_record',)
+        )
+        row = cur.fetchone()
+        relkind = row['relkind'] if row else None
+
+        if relkind == 'r':
+            # 普通表——检查行数，空表才安全重建
+            cnt_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM location_record", ()
+            ).fetchone()
+            cnt = cnt_row['cnt'] if cnt_row else 0
+            if cnt == 0:
+                conn.execute("DROP TABLE IF EXISTS location_record CASCADE", ())
+                conn.execute(
+                    "CREATE TABLE location_record ("
+                    "  id          BIGSERIAL,"
+                    "  device_id   INTEGER,"
+                    "  phone       TEXT             NOT NULL,"
+                    "  lat         DOUBLE PRECISION NOT NULL,"
+                    "  lng         DOUBLE PRECISION NOT NULL,"
+                    "  altitude    INTEGER,"
+                    "  speed       INTEGER,"
+                    "  direction   INTEGER,"
+                    "  alarm_flag  INTEGER          DEFAULT 0,"
+                    "  status_flag INTEGER          DEFAULT 0,"
+                    "  mileage     INTEGER,"
+                    "  gps_time    TEXT,"
+                    "  created_at  TIMESTAMPTZ      DEFAULT NOW(),"
+                    "  PRIMARY KEY (id, created_at)"
+                    ") PARTITION BY RANGE (created_at)",
+                    ()
+                )
+                log.info("[PG分区] location_record 已转为按月分区表")
+            else:
+                log.warning(
+                    "[PG分区] location_record 已有 %d 条数据，跳过自动重建。"
+                    "如需分区，请手动迁移后 DROP TABLE location_record CASCADE 再重启。", cnt
+                )
+                return
+
+        elif relkind == 'p':
+            log.debug("[PG分区] location_record 已是分区表，跳过重建")
+        else:
+            log.warning("[PG分区] location_record 不存在或状态未知(relkind=%s)，跳过", relkind)
+            return
+
+        # ② 预建当前月 + 未来 3 个月的分区
+        now = _dt.datetime.now()
+        for i in range(4):
+            base = now.month - 1 + i          # 0-based 月偏移
+            y,  m  = now.year + base // 12,       base % 12 + 1
+            ny, nm = now.year + (base+1) // 12, (base+1) % 12 + 1
+            pname = f"location_record_{y}_{m:02d}"
+            try:
+                conn.execute(
+                    f"CREATE TABLE IF NOT EXISTS {pname}"
+                    f" PARTITION OF location_record"
+                    f" FOR VALUES FROM ('{y}-{m:02d}-01') TO ('{ny}-{nm:02d}-01')",
+                    ()
+                )
+                log.info("[PG分区] 分区 %s 已就绪", pname)
+            except Exception as _pe:
+                log.debug("[PG分区] 跳过分区 %s: %s", pname, _pe)
+
+        # ③ 父表建索引（PG 自动传播到所有子分区）
+        try:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_loc_phone_time"
+                " ON location_record (phone, gps_time)",
+                ()
+            )
+        except Exception as _ie:
+            log.debug("[PG分区] 建索引跳过: %s", _ie)
+
+    except Exception as _e:
+        log.error("[PG分区] 分区初始化失败: %s", _e)
+    finally:
+        conn.close()
+
+
+_partition_maintainer_started = False
+_partition_maintainer_lock    = threading.Lock()
+
+def _partition_maintainer_loop():
+    """每 24 小时预建一次分区，保证月末跨月时子表已存在。"""
+    import time as _t
+    while True:
+        _t.sleep(24 * 3600)   # 启动时 _setup_pg_partitions() 已建好，先睡一天
+        try:
+            _setup_pg_partitions()
+        except Exception as _e:
+            log.warning("[PG分区] 维护线程异常: %s", _e)
+
+def start_partition_maintainer():
+    """启动分区维护后台线程（幂等）。SQLite 后端调用无副作用。"""
+    global _partition_maintainer_started
+    with _partition_maintainer_lock:
+        if _partition_maintainer_started:
+            return
+        _partition_maintainer_started = True
+    if DB_BACKEND != 'postgres':
+        return
+    threading.Thread(target=_partition_maintainer_loop, daemon=True,
+                     name='partition-maintainer').start()
+    log.info("[PG分区] 分区维护线程已启动")
+
+
 # ── 会话管理 ───────────────────────────────────────────────────────────────────
 
 sessions      = {}        # phone → socket
@@ -5041,6 +5165,8 @@ def _serve_spa(path):
 
 if __name__ == '__main__':
     init_db()
+    _setup_pg_partitions()      # PG：location_record 转分区表 + 预建未来月份（SQLite 跳过）
+    start_partition_maintainer()  # PG：每日预建分区的维护线程
 
     # 启动位置异步批量落库线程（削减 SQLite 写锁争用）
     start_batch_writer()

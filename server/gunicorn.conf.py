@@ -32,9 +32,12 @@ def post_fork(server, worker):
     - 父进程只加载 app 模块做预热，不开任何 I/O 线程
     """
     import threading
-    from app import init_db, start_batch_writer, start_tcp_server, start_mqtt_subscriber
+    from app import (init_db, start_batch_writer, start_tcp_server, start_mqtt_subscriber,
+                     _setup_pg_partitions, start_partition_maintainer)
 
     init_db()
+    _setup_pg_partitions()       # PG：location_record 按月分区初始化（SQLite 跳过）
+    start_partition_maintainer() # PG：每日预建分区的维护线程
     start_batch_writer()
 
     threading.Thread(target=start_tcp_server,      daemon=True, name='tcp-808').start()
