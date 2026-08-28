@@ -263,6 +263,7 @@ def get_db():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")   # 提升并发写性能
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")  # 锁竞争时最多等 5 秒而非立即报 database is locked
     return _ConnWrapper(conn, 'sqlite')
 
 _db_lock = threading.Lock()
@@ -1383,27 +1384,26 @@ def handle_auth(sock, phone, serial, body):
     # 严格比对鉴权码，不允许万能 DEFAULT 绕过
     auth_ok = row and row.get('auth_code') == auth_code
     if auth_ok:
+        # 先应答设备（不被数据库写锁阻塞，避免高并发下设备超时断连），再异步更新状态
+        sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0102, 0))
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         db_exec("UPDATE device SET status=1, online_time=? WHERE phone=?", (now, canonical))
-        result = 0
         log.info("[808] 鉴权成功: phone=%s", canonical)
     else:
-        result = 1
         log.warning("[808] 鉴权失败断开连接 phone=%s auth=%s", canonical, auth_code)
         # 鉴权失败：从 sessions 中删除，防止未鉴权设备被下发指令
         with sessions_lock:
             sessions.pop(canonical, None)
-        sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0102, result))
+        sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0102, 1))
         return 'close'
-
-    sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0102, result))
 
 
 def handle_heartbeat(sock, phone, serial):
     canonical = resolve_phone(phone)
+    # 先回心跳应答再更新状态，避免应答被数据库写锁阻塞
+    sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0002, 0))
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     db_exec("UPDATE device SET status=1, online_time=? WHERE phone=?", (now, canonical))
-    sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0002, 0))
     log.debug("[808] 心跳: phone=%s", canonical)
 
 
@@ -1707,12 +1707,19 @@ def handle_client(conn, addr):
                     else:
                         conn.sendall(p.build_generic_resp(ph, next_serial(), serial, msg_id, 3))
                         log.debug("[808] 未知消息 ID=0x%04X phone=%s", msg_id, ph)
+                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
+                    # 客户端超时/主动断连导致的写回失败，属正常现象，不刷 ERROR 堆栈
+                    log.debug("[808] 客户端断连(处理中) ID=0x%04X addr=%s: %s", msg_id, addr, e)
+                    break
                 except Exception as e:
                     log.error("[808] 处理消息异常 ID=0x%04X: %s", msg_id, e, exc_info=True)
 
             if _should_close:
                 break
 
+    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
+        # 设备断连是常态（信号弱、超时重连），降级为 DEBUG，避免高并发下日志风暴
+        log.debug("[808] 连接断开: %s %s", addr, e)
     except Exception as e:
         log.error("[808] 连接异常: %s %s", addr, e)
     finally:
