@@ -103,16 +103,14 @@ import re as _re
 
 
 # ── 高频位置写入的异步批量落库（削减 SQLite 全局写锁争用）────────────────────────
+# 共享容器(队列/缓存/锁)已抽至 core/state.py;此处 import 保持调用处不变。
+# 重业务函数(_get_device_id/enqueue_location/_batch_writer_loop)仍在本文件。
 import queue as _queue
-
-_loc_queue     = _queue.Queue(maxsize=100000)  # 有界队列防 OOM；满时丢弃最新帧并告警
-_dev_latest    = {}                 # phone -> 设备最新状态（多次上报只落最后一次）
-_dev_latest_lk = threading.Lock()
-_devid_cache: dict = {}            # phone → (device_id, expire_ts)；10 分钟 TTL
-_DEVID_CACHE_TTL = 600
-_alarm_last_ts: dict = {}          # (phone, alarm_type) → last_alarm_unix_ts
-_alarm_last_ts_lock = threading.Lock()
-_ALARM_DEBOUNCE_SEC = 60           # 同类型报警至少间隔 60 秒
+from core.state import (
+    _loc_queue, _dev_latest, _dev_latest_lk,
+    _devid_cache, _DEVID_CACHE_TTL,
+    _alarm_last_ts, _alarm_last_ts_lock, _ALARM_DEBOUNCE_SEC,
+)
 
 def _get_device_id(phone):
     import time as _t
@@ -802,39 +800,15 @@ def start_partition_maintainer():
 
 
 # ── 会话管理 ───────────────────────────────────────────────────────────────────
-
-sessions      = {}        # phone → socket
-sessions_lock = threading.Lock()
-_serial       = [0]
-_serial_lock  = threading.Lock()
-
-# 围栏状态：记录每台设备当前"在哪些围栏内"，用于检测穿越
-# phone → set of fence_id
-fence_device_inside: dict = {}
-_fence_lock = threading.Lock()   # 保护下面四个围栏状态字典的并发读写
-
-# ── P0: 防抖 ─────────────────────────────────────────────────────────────────
-# 连续读数一致 FENCE_DEBOUNCE_N 次才确认状态切换，避免边界抖动重复告警
-FENCE_DEBOUNCE_N = 3
-fence_device_pending: dict = {}        # phone → {fence_id: (last_state:bool|None, count:int)}
-
-# ── P1: 停留超时 ──────────────────────────────────────────────────────────────
-fence_device_enter_time:    dict = {}  # phone → {fence_id: datetime} 进入时刻
-fence_device_dwell_alarmed: dict = {}  # phone → set of fence_id（已触发滞留告警，离开时清除）
-
-def _fence_cleanup(phone):
-    """设备下线时清理四个围栏状态字典，防止内存泄漏和 phone 复用时的状态污染。"""
-    with _fence_lock:
-        fence_device_inside.pop(phone, None)
-        fence_device_pending.pop(phone, None)
-        fence_device_enter_time.pop(phone, None)
-        fence_device_dwell_alarmed.pop(phone, None)
-
-
-def next_serial():
-    with _serial_lock:
-        _serial[0] = (_serial[0] + 1) & 0xFFFF
-        return _serial[0]
+# 会话表/流水号/围栏状态字典/清理函数/next_serial 已抽至 core/state.py。
+# 这是打破「TCP 线程 ↔ REST 路由」双向耦合的关键:两侧都从 core.state 单向 import。
+# 此处 import 保持本文件内所有原调用处不变。
+from core.state import (
+    sessions, sessions_lock, _serial, _serial_lock,
+    fence_device_inside, _fence_lock, FENCE_DEBOUNCE_N,
+    fence_device_pending, fence_device_enter_time, fence_device_dwell_alarmed,
+    _fence_cleanup, next_serial,
+)
 
 
 def resolve_phone(bcd_phone: str) -> str:
