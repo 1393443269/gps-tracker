@@ -453,6 +453,8 @@ function riskLevelLabel(l) {
 
 // ── XSS 防护：HTML 转义 ───────────────────────────────────────────────────────
 const _esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+// 颜色安全校验：只允许 #RGB 或 #RRGGBB 格式
+const _safeColor = (c) => /^#[0-9a-fA-F]{3,6}$/.test(c) ? c : '#409EFF'
 
 // ── 地图 ─────────────────────────────────────────────────────────────────────
 let map = null
@@ -568,7 +570,7 @@ function renderFences() {
           new maplibregl.Popup({ closeButton: true, maxWidth: '220px' })
             .setLngLat(e.lngLat)
             .setHTML([
-              `<b style="font-size:14px;color:${_esc(color)};">${_esc(f.name)}</b>`,
+              `<b style="font-size:14px;color:${_safeColor(color)};">${_esc(f.name)}</b>`,
               `<div style="margin-top:4px;font-size:12px;color:#555;">类型：${_esc(fenceTypeLabel(f.fence_type))}</div>`,
               f.fence_type === 'circle' ? `<div style="font-size:12px;color:#555;">半径：${_esc(String(f.radius))} m</div>` : '',
               devCount ? `<div style="font-size:12px;color:#409EFF;">关联设备：${_esc(String(devCount))} 台</div>` : '',

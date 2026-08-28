@@ -533,7 +533,8 @@ async function loadCmdHistory(reset = true) {
 function logout() {
   localStorage.removeItem('customer_token')
   localStorage.removeItem('customer_info')
-  router.push('/customer-login')
+  localStorage.removeItem('user_role')   // 新增：清理 user_role 防止状态残留
+  router.push('/login')                  // 改为当前有效路由
 }
 </script>
 

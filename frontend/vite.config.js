@@ -7,6 +7,15 @@ export default defineConfig({
   resolve: {
     alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) }
   },
+  build: {
+    minify: 'terser',
+    terserOptions: {
+      compress: {
+        drop_console: true,    // 生产构建删除所有 console.* 调用
+        drop_debugger: true,
+      }
+    }
+  },
   server: {
     port: 5173,
     allowedHosts: true,

@@ -287,10 +287,12 @@ function openModal(row) {
 async function save() {
   if (!form.value.name) { ElMessage.error('客户名称不能为空'); return }
   try {
-    if (form.value.id) {
-      await subApi.update(form.value.id, form.value)
+    const payload = { ...form.value }
+    if (!payload.password) delete payload.password  // 编辑时不发空密码，避免覆盖原密码
+    if (payload.id) {
+      await subApi.update(payload.id, payload)
     } else {
-      await subApi.create(form.value)
+      await subApi.create(payload)
     }
     ElMessage.success('保存成功')
     modalVisible.value = false

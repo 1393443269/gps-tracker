@@ -1,6 +1,13 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
 
+// 过滤后端原始错误信息，避免暴露内部实现
+const _safeMsg = (msg) => {
+  const dangerous = ['Error', 'Exception', 'SQL', 'sqlite', 'postgres', 'Traceback', '/app/', 'line ']
+  if (!msg || dangerous.some(k => msg.includes(k))) return '操作失败，请稍后重试'
+  return msg
+}
+
 const http = axios.create({
   baseURL: '/api',
   timeout: 10000
@@ -40,7 +47,7 @@ http.interceptors.response.use(
       return Promise.reject(err)
     }
     // 登录页上 401 静默（doLogin 自己处理），其余错误弹出提示
-    if (!onLogin || status !== 401) ElMessage.error(msg)
+    if (!onLogin || status !== 401) ElMessage.error(_safeMsg(msg))
     return Promise.reject(err)
   }
 )
@@ -179,7 +186,7 @@ portalHttp.interceptors.response.use(res => res.data, err => {
     window.location.href = '/login'
     return Promise.reject(err)
   }
-  if (!onLogin || status !== 401) ElMessage.error(err.response?.data?.msg || '请求失败')
+  if (!onLogin || status !== 401) ElMessage.error(_safeMsg(err.response?.data?.msg || '请求失败'))
   return Promise.reject(err)
 })
 export const portalApi = {

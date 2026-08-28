@@ -15,7 +15,7 @@ workers = 1
 worker_class = 'geventwebsocket.gunicorn.workers.GeventWebSocketWorker'
 worker_connections = 1000
 bind = '0.0.0.0:8080'
-timeout = 120          # 超过此秒无响应则 worker 被 kill 并重启
+timeout = 600          # Socket.IO 长连接场景；gevent worker 不依赖此值做心跳
 keepalive = 5          # HTTP keep-alive 秒数（与 Nginx upstream keepalive 配合）
 
 # ── 日志 ─────────────────────────────────────────────────────────────────────

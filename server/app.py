@@ -305,16 +305,21 @@ import queue as _queue
 _loc_queue     = _queue.Queue(maxsize=100000)  # 有界队列防 OOM；满时丢弃最新帧并告警
 _dev_latest    = {}                 # phone -> 设备最新状态（多次上报只落最后一次）
 _dev_latest_lk = threading.Lock()
-_devid_cache   = {}                 # phone -> device_id，免每次上报查库
+_devid_cache: dict = {}            # phone → (device_id, expire_ts)；10 分钟 TTL
+_DEVID_CACHE_TTL = 600
+_alarm_last_ts: dict = {}          # (phone, alarm_type) → last_alarm_unix_ts
+_ALARM_DEBOUNCE_SEC = 60           # 同类型报警至少间隔 60 秒
 
 def _get_device_id(phone):
-    did = _devid_cache.get(phone)
-    if did is not None:
-        return did
+    import time as _t
+    now = _t.time()
+    entry = _devid_cache.get(phone)
+    if entry and now < entry[1]:
+        return entry[0]
     row = db_query_one("SELECT id FROM device WHERE phone=?", (phone,))
     did = row['id'] if row else 0
     if did:
-        _devid_cache[phone] = did
+        _devid_cache[phone] = (did, now + _DEVID_CACHE_TTL)
     return did
 
 def enqueue_location(loc_row, dev_state):
@@ -1101,133 +1106,123 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
     now_time  = now_ts.time()
     speed_kmh = speed_raw / 10.0          # 808 协议单位 → km/h
 
+    # 收集需要在锁外执行的告警动作（db_exec/emit 不能在锁内调用，避免死锁）
+    _alarm_actions = []   # list of callables
+    _attend_actions = []  # list of (fence_id, fence_name, action)
+
     with _fence_lock:
         prev_inside = set(fence_device_inside.get(phone, set()))
-    new_inside  = set()
+        new_inside  = set()
 
-    for f in fences:
-        fid = f['id']
+        for f in fences:
+            fid = f['id']
 
-        # ── P2: 生效时间段过滤 ─────────────────────────────────────────────
-        vs = (f['valid_start'] or '').strip()
-        ve = (f['valid_end']   or '').strip()
-        if vs and ve:
-            try:
-                if not (_time.fromisoformat(vs) <= now_time <= _time.fromisoformat(ve)):
-                    # 不在生效时段：保持原确认状态，不触发任何告警
-                    if fid in prev_inside:
-                        new_inside.add(fid)
-                    continue
-            except ValueError:
-                pass  # 时间格式非法则不过滤
+            # ── P2: 生效时间段过滤 ─────────────────────────────────────────────
+            vs = (f['valid_start'] or '').strip()
+            ve = (f['valid_end']   or '').strip()
+            if vs and ve:
+                try:
+                    if not (_time.fromisoformat(vs) <= now_time <= _time.fromisoformat(ve)):
+                        # 不在生效时段：保持原确认状态，不触发任何告警
+                        if fid in prev_inside:
+                            new_inside.add(fid)
+                        continue
+                except ValueError:
+                    pass  # 时间格式非法则不过滤
 
-        # 当前点位是否在围栏内
-        currently_inside = _is_inside_fence(lat, lng, f)
+            # 当前点位是否在围栏内
+            currently_inside = _is_inside_fence(lat, lng, f)
 
-        # ── P0: 防抖 - 连续 FENCE_DEBOUNCE_N 次同状态才确认切换 ────────────
-        pending = fence_device_pending.setdefault(phone, {})
-        prev_state, count = pending.get(fid, (None, 0))
-        if prev_state == currently_inside:
-            count += 1
-        else:
-            count = 1
-        pending[fid] = (currently_inside, count)
+            # ── P0: 防抖 - 连续 FENCE_DEBOUNCE_N 次同状态才确认切换 ────────────
+            pending = fence_device_pending.setdefault(phone, {})
+            prev_state, count = pending.get(fid, (None, 0))
+            if prev_state == currently_inside:
+                count += 1
+            else:
+                count = 1
+            pending[fid] = (currently_inside, count)
 
-        was_inside = fid in prev_inside
+            was_inside = fid in prev_inside
 
-        # 防抖未达标：保持原确认状态，继续积累
-        if count < FENCE_DEBOUNCE_N:
-            if was_inside:
+            # 防抖未达标：保持原确认状态，继续积累
+            if count < FENCE_DEBOUNCE_N:
+                if was_inside:
+                    new_inside.add(fid)
+                continue
+
+            # ── 防抖通过，以 currently_inside 为新确认状态 ──────────────────────
+            confirmed_inside = currently_inside
+            if confirmed_inside:
                 new_inside.add(fid)
-            continue
 
-        # ── 防抖通过，以 currently_inside 为新确认状态 ──────────────────────
-        confirmed_inside = currently_inside
-        if confirmed_inside:
-            new_inside.add(fid)
+            # ── 状态刚切换：进入围栏 ──────────────────────────────────────────
+            if confirmed_inside and not was_inside:
+                if f['alarm_enter']:
+                    desc = f'进入围栏: {f["name"]}'
+                    _f = dict(f)  # 捕获当前围栏快照，避免闭包引用循环变量
+                    _alarm_actions.append(('enter', device_id, phone, 100, desc, lat, lng, speed_raw, gps_time, _f))
+                    log.info("[围栏] %s 进入围栏「%s」", phone, f['name'])
+                # 考勤记录（独立于报警开关，进出都记）
+                _attend_actions.append((f['id'], f['name'], 'enter'))
+                # 记录进入时刻，重置滞留告警标记
+                fence_device_enter_time.setdefault(phone, {})[fid] = now_ts
+                fence_device_dwell_alarmed.get(phone, set()).discard(fid)
 
-        # ── 状态刚切换：进入围栏 ──────────────────────────────────────────
-        if confirmed_inside and not was_inside:
-            if f['alarm_enter']:
-                desc = f'进入围栏: {f["name"]}'
-                db_exec(
-                    "INSERT INTO alarm_record (device_id,phone,alarm_type,alarm_desc,"
-                    "lat,lng,speed,alarm_time,status) VALUES (?,?,?,?,?,?,?,?,0)",
-                    (device_id, phone, 100, desc, lat, lng, speed_raw, gps_time)
-                )
-                _emit_alarm('alarm', {
-                    'phone': phone, 'alarmType': 100, 'alarmDesc': desc,
-                    'lat': lat, 'lng': lng, 'time': gps_time, 'fenceName': f['name'],
-                }, phone, 100)
-                log.info("[围栏] %s 进入围栏「%s」", phone, f['name'])
-            # 考勤记录（独立于报警开关，进出都记）
-            _record_attendance(f['id'], f['name'], phone, 'enter', gps_time)
-            # 记录进入时刻，重置滞留告警标记
-            fence_device_enter_time.setdefault(phone, {})[fid] = now_ts
-            fence_device_dwell_alarmed.get(phone, set()).discard(fid)
+            # ── 状态刚切换：离开围栏 ──────────────────────────────────────────
+            elif not confirmed_inside and was_inside:
+                if f['alarm_exit']:
+                    desc = f'离开围栏: {f["name"]}'
+                    _f = dict(f)
+                    _alarm_actions.append(('exit', device_id, phone, 101, desc, lat, lng, speed_raw, gps_time, _f))
+                    log.info("[围栏] %s 离开围栏「%s」", phone, f['name'])
+                # 考勤记录（独立于报警开关，进出都记）
+                _attend_actions.append((f['id'], f['name'], 'exit'))
+                # 清除进入时刻和滞留告警标记
+                fence_device_enter_time.get(phone, {}).pop(fid, None)
+                fence_device_dwell_alarmed.get(phone, set()).discard(fid)
 
-        # ── 状态刚切换：离开围栏 ──────────────────────────────────────────
-        elif not confirmed_inside and was_inside:
-            if f['alarm_exit']:
-                desc = f'离开围栏: {f["name"]}'
-                db_exec(
-                    "INSERT INTO alarm_record (device_id,phone,alarm_type,alarm_desc,"
-                    "lat,lng,speed,alarm_time,status) VALUES (?,?,?,?,?,?,?,?,0)",
-                    (device_id, phone, 101, desc, lat, lng, speed_raw, gps_time)
-                )
-                _emit_alarm('alarm', {
-                    'phone': phone, 'alarmType': 101, 'alarmDesc': desc,
-                    'lat': lat, 'lng': lng, 'time': gps_time, 'fenceName': f['name'],
-                }, phone, 101)
-                log.info("[围栏] %s 离开围栏「%s」", phone, f['name'])
-            # 考勤记录（独立于报警开关，进出都记）
-            _record_attendance(f['id'], f['name'], phone, 'exit', gps_time)
-            # 清除进入时刻和滞留告警标记
-            fence_device_enter_time.get(phone, {}).pop(fid, None)
-            fence_device_dwell_alarmed.get(phone, set()).discard(fid)
+            # ── 持续在围栏内：检查滞留超时 & 围栏超速 ────────────────────────
+            elif confirmed_inside and was_inside:
+                # P1: 停留超时
+                dwell_limit = f['alarm_dwell']   # 秒, 0=关闭
+                if dwell_limit > 0:
+                    enter_t = fence_device_enter_time.get(phone, {}).get(fid)
+                    if enter_t:
+                        elapsed = (now_ts - enter_t).total_seconds()
+                        if elapsed > dwell_limit:
+                            already = fid in fence_device_dwell_alarmed.get(phone, set())
+                            if not already:
+                                mins = int(elapsed // 60)
+                                desc = f'停留超时: {f["name"]}（已停留{mins}分钟）'
+                                _f = dict(f)
+                                _alarm_actions.append(('dwell', device_id, phone, 102, desc, lat, lng, speed_raw, gps_time, _f))
+                                fence_device_dwell_alarmed.setdefault(phone, set()).add(fid)
+                                log.info("[围栏] %s 在「%s」停留超时 %.0f秒", phone, f['name'], elapsed)
 
-        # ── 持续在围栏内：检查滞留超时 & 围栏超速 ────────────────────────
-        elif confirmed_inside and was_inside:
-            # P1: 停留超时
-            dwell_limit = f['alarm_dwell']   # 秒, 0=关闭
-            if dwell_limit > 0:
-                enter_t = fence_device_enter_time.get(phone, {}).get(fid)
-                if enter_t:
-                    elapsed = (now_ts - enter_t).total_seconds()
-                    if elapsed > dwell_limit:
-                        already = fid in fence_device_dwell_alarmed.get(phone, set())
-                        if not already:
-                            mins = int(elapsed // 60)
-                            desc = f'停留超时: {f["name"]}（已停留{mins}分钟）'
-                            db_exec(
-                                "INSERT INTO alarm_record (device_id,phone,alarm_type,alarm_desc,"
-                                "lat,lng,speed,alarm_time,status) VALUES (?,?,?,?,?,?,?,?,0)",
-                                (device_id, phone, 102, desc, lat, lng, speed_raw, gps_time)
-                            )
-                            _emit_alarm('alarm', {
-                                'phone': phone, 'alarmType': 102, 'alarmDesc': desc,
-                                'lat': lat, 'lng': lng, 'time': gps_time, 'fenceName': f['name'],
-                            }, phone, 102)
-                            fence_device_dwell_alarmed.setdefault(phone, set()).add(fid)
-                            log.info("[围栏] %s 在「%s」停留超时 %.0f秒", phone, f['name'], elapsed)
+                # P2: 围栏内超速（每报文都检查，不去重——驾驶员应持续收到超速提示）
+                speed_lim = f['speed_limit']     # km/h, 0=关闭
+                if speed_lim > 0 and speed_kmh > speed_lim:
+                    desc = f'围栏内超速: {f["name"]}（{speed_kmh:.1f}km/h，限{speed_lim}km/h）'
+                    _f = dict(f)
+                    _alarm_actions.append(('speed', device_id, phone, 103, desc, lat, lng, speed_raw, gps_time, _f))
+                    log.info("[围栏] %s 围栏「%s」超速 %.1f>%dkm/h", phone, f['name'], speed_kmh, speed_lim)
 
-            # P2: 围栏内超速（每报文都检查，不去重——驾驶员应持续收到超速提示）
-            speed_lim = f['speed_limit']     # km/h, 0=关闭
-            if speed_lim > 0 and speed_kmh > speed_lim:
-                desc = f'围栏内超速: {f["name"]}（{speed_kmh:.1f}km/h，限{speed_lim}km/h）'
-                db_exec(
-                    "INSERT INTO alarm_record (device_id,phone,alarm_type,alarm_desc,"
-                    "lat,lng,speed,alarm_time,status) VALUES (?,?,?,?,?,?,?,?,0)",
-                    (device_id, phone, 103, desc, lat, lng, speed_raw, gps_time)
-                )
-                _emit_alarm('alarm', {
-                    'phone': phone, 'alarmType': 103, 'alarmDesc': desc,
-                    'lat': lat, 'lng': lng, 'time': gps_time, 'fenceName': f['name'],
-                }, phone, 103)
-                log.info("[围栏] %s 围栏「%s」超速 %.1f>%dkm/h", phone, f['name'], speed_kmh, speed_lim)
-
-    with _fence_lock:
         fence_device_inside[phone] = new_inside
+
+    # ── 锁外执行 DB 写入和 Socket 推送（避免在锁内调用 IO 操作） ──────────────
+    for act in _alarm_actions:
+        _kind, _did, _ph, _atype, _desc, _lat, _lng, _spd, _gt, _f = act
+        db_exec(
+            "INSERT INTO alarm_record (device_id,phone,alarm_type,alarm_desc,"
+            "lat,lng,speed,alarm_time,status) VALUES (?,?,?,?,?,?,?,?,0)",
+            (_did, _ph, _atype, _desc, _lat, _lng, _spd, _gt)
+        )
+        _emit_alarm('alarm', {
+            'phone': _ph, 'alarmType': _atype, 'alarmDesc': _desc,
+            'lat': _lat, 'lng': _lng, 'time': _gt, 'fenceName': _f['name'],
+        }, _ph, _atype)
+    for _fid, _fname, _action in _attend_actions:
+        _record_attendance(_fid, _fname, phone, _action, gps_time)
 
 
 # ── 808 消息处理函数 ────────────────────────────────────────────────────────────
@@ -1403,22 +1398,27 @@ def handle_location(sock, phone, serial, body):
 
     # 处理报警（使用 canonical phone，与 device 表保持一致）
     if alarm_flag:
+        import time as _t
         for bit, desc in ALARM_DEFS:
             if alarm_flag & (1 << bit):
-                db_exec(
-                    "INSERT INTO alarm_record (device_id,phone,alarm_type,alarm_desc,"
-                    "lat,lng,speed,alarm_time,status) VALUES (?,?,?,?,?,?,?,?,0)",
-                    (device_id, canonical, bit, desc, lat, lng, speed, gps_time)
-                )
-                log.warning("[808] 报警! phone=%s type=%d desc=%s", phone, bit, desc)
-                _emit_alarm('alarm', {
-                    'phone':     canonical,
-                    'alarmType': bit,
-                    'alarmDesc': desc,
-                    'lat':       lat,
-                    'lng':       lng,
-                    'time':      gps_time,
-                }, canonical, bit)
+                _alarm_key = (canonical, bit)
+                _now_ts = _t.time()
+                if _now_ts - _alarm_last_ts.get(_alarm_key, 0) >= _ALARM_DEBOUNCE_SEC:
+                    _alarm_last_ts[_alarm_key] = _now_ts
+                    db_exec(
+                        "INSERT INTO alarm_record (device_id,phone,alarm_type,alarm_desc,"
+                        "lat,lng,speed,alarm_time,status) VALUES (?,?,?,?,?,?,?,?,0)",
+                        (device_id, canonical, bit, desc, lat, lng, speed, gps_time)
+                    )
+                    log.warning("[808] 报警! phone=%s type=%d desc=%s", phone, bit, desc)
+                    _emit_alarm('alarm', {
+                        'phone':     canonical,
+                        'alarmType': bit,
+                        'alarmDesc': desc,
+                        'lat':       lat,
+                        'lng':       lng,
+                        'time':      gps_time,
+                    }, canonical, bit)
 
     # 查该设备的角色颜色/形状，随推送带给前端地图渲染
     role_row = db_query_one(
@@ -1591,6 +1591,9 @@ def handle_client(conn, addr):
                 break
 
             buf.extend(data)
+            if len(buf) > 65536:  # 64KB 上限，恶意无标志字节数据保护
+                log.warning("[TCP] 缓冲区超限(>64KB)，断开连接 addr=%s", addr)
+                break
 
             # ── 协议识别：首字节 0xBD → G618G；0x7E → JT/T808 ──
             if proto is None and len(buf) >= 1:
@@ -2098,6 +2101,8 @@ def batch_command_devices():
     text   = (data.get('text') or '').strip()
     if not phones:
         return fail('phones 不能为空', 400)
+    if len(phones) > 500:
+        return fail('单次批量下发不超过 500 台设备', 400)
     if not text:
         return fail('指令内容不能为空', 400)
     sent, offline = 0, 0
@@ -2240,9 +2245,13 @@ def latest_location(phone):
 @app.get('/api/locations/<phone>/history')
 def location_history(phone):
     page, size = _page_params(100, max_size=1000)
-    start  = request.args.get('start')
-    end    = request.args.get('end')
+    start  = request.args.get('start', '')
+    end    = request.args.get('end', '')
     offset = (page - 1) * size
+    if start and not _DATE_RE.match(start):
+        return fail('start 日期格式错误，应为 YYYY-MM-DD', 400)
+    if end and not _DATE_RE.match(end):
+        return fail('end 日期格式错误，应为 YYYY-MM-DD', 400)
     if start and end:
         total   = db_scalar("SELECT COUNT(*) FROM location_record WHERE phone=? AND gps_time BETWEEN ? AND ?", (phone, start, end))
         records = db_query("SELECT * FROM location_record WHERE phone=? AND gps_time BETWEEN ? AND ? ORDER BY gps_time ASC LIMIT ? OFFSET ?",
@@ -2614,7 +2623,8 @@ def send_text():
         conn.sendall(p.encode_message(0x8300, phone, next_serial(), body))
         return ok()
     except Exception as e:
-        return fail(str(e))
+        log.warning("[指令下发] 失败 phone=%s err=%s", phone, e)
+        return fail('指令下发失败，请稍后重试')
 
 @app.post('/api/commands/control')
 def terminal_control():
@@ -2642,7 +2652,8 @@ def terminal_control():
         add_op_log('终端控制', f'phone={phone} {sent}')
         return ok({'sent': sent})
     except Exception as e:
-        return fail(str(e))
+        log.warning("[指令下发] 失败 phone=%s err=%s", phone, e)
+        return fail('指令下发失败，请稍后重试')
 
 @app.post('/api/commands/track')
 def location_track():
@@ -2669,7 +2680,8 @@ def location_track():
         add_op_log('位置跟踪', f'phone={phone} {sent}')
         return ok({'sent': sent})
     except Exception as e:
-        return fail(str(e))
+        log.warning("[指令下发] 失败 phone=%s err=%s", phone, e)
+        return fail('指令下发失败，请稍后重试')
 
 
 # ── G618G 下行指令接口 ─────────────────────────────────────────────────────────
@@ -2723,7 +2735,8 @@ def g618g_command():
     except Exception as e:
         db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
                 (phone, 'G618G-'+phone[-6:], cmd, 'fail', str(e)))
-        return fail(str(e))
+        log.warning("[指令下发] 失败 phone=%s err=%s", phone, e)
+        return fail('指令下发失败，请稍后重试')
 
 
 # ── 天禧(智令 *XXX#)下行指令接口 ───────────────────────────────────────────────
@@ -2781,7 +2794,8 @@ def zhiling_command():
     except Exception as e:
         db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
                 (phone, resolve_phone(phone), f'{cmd} {cmd_str}', 'fail', str(e)))
-        return fail(str(e))
+        log.warning("[指令下发] 失败 phone=%s err=%s", phone, e)
+        return fail('指令下发失败，请稍后重试')
 
 
 # ── 蓝牙信标位置对照表管理（major/minor → 坐标）────────────────────────────────
@@ -3148,12 +3162,19 @@ def update_customer(cid):
 @app.post('/api/upload/avatar')
 def upload_avatar():
     """上传头像图片，返回可访问的 URL。仅接受图片类型。"""
+    import imghdr as _imghdr
     f = request.files.get('file')
     if not f or not f.filename:
         return fail('未收到文件', 400)
     ext = os.path.splitext(f.filename)[1].lower()
     if ext not in _ALLOWED_IMG_EXT:
         return fail('仅支持 jpg/png/gif/webp 图片', 400)
+    # 新增：读文件头验证真实 MIME
+    file_bytes = f.read(512)
+    f.seek(0)
+    img_type = _imghdr.what(None, h=file_bytes)
+    if img_type not in ('jpeg', 'png', 'gif', 'webp'):
+        return fail('文件内容与扩展名不符，请上传真实图片文件', 400)
     # 用时间戳+随机串命名，避免覆盖和路径穿越
     fname = f'avatar_{uuid.uuid4().hex}{ext}'
     fpath = os.path.join(UPLOAD_DIR, fname)
@@ -3175,13 +3196,13 @@ def serve_upload(filename):
         cust_ok  = bool(_verify_token(cust_tok))
         if not admin_ok and not cust_ok:
             return fail('未授权', 401)
-    safe = os.path.normpath(filename).replace('\\', '/')
-    if safe.startswith('..') or safe.startswith('/'):
+    full_path = os.path.realpath(os.path.join(UPLOAD_DIR, filename))
+    upload_root = os.path.realpath(UPLOAD_DIR)
+    if not full_path.startswith(upload_root + os.sep) and full_path != upload_root:
         return fail('非法路径', 400)
-    fpath = os.path.join(UPLOAD_DIR, safe)
-    if not os.path.isfile(fpath):
+    if not os.path.isfile(full_path):
         return fail('文件不存在', 404)
-    return _send_abs(fpath)
+    return _send_abs(full_path)
 
 
 @app.delete('/api/customers/<int:cid>')
@@ -3346,9 +3367,13 @@ def create_mark_point():
     name = (d.get('name') or '').strip()
     if not name or d.get('lat') is None or d.get('lng') is None:
         return fail('name/lat/lng 不能为空', 400)
+    lat = float(d['lat'])
+    lng = float(d['lng'])
+    if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+        return fail('坐标超出有效范围', 400)
     db_exec(
         "INSERT INTO mark_point (name,lat,lng,remark) VALUES (?,?,?,?)",
-        (name, float(d['lat']), float(d['lng']), d.get('remark', ''))
+        (name, lat, lng, d.get('remark', ''))
     )
     return ok()
 
@@ -3368,10 +3393,13 @@ def create_risk_point():
     name = (d.get('name') or '').strip()
     if not name or d.get('lat') is None or d.get('lng') is None:
         return fail('name/lat/lng 不能为空', 400)
+    lat = float(d['lat'])
+    lng = float(d['lng'])
+    if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+        return fail('坐标超出有效范围', 400)
     db_exec(
         "INSERT INTO risk_point (name,lat,lng,level,remark) VALUES (?,?,?,?,?)",
-        (name, float(d['lat']), float(d['lng']),
-         d.get('level', 'medium'), d.get('remark', ''))
+        (name, lat, lng, d.get('level', 'medium'), d.get('remark', ''))
     )
     return ok()
 
@@ -3466,8 +3494,11 @@ def report_summary():
             [start_raw, end_raw]
         )
     else:
+        from datetime import timedelta
+        _start_date = (datetime.now() - timedelta(days=days - 1)).strftime('%Y-%m-%d')
         alarm_period = db_scalar(
-            f"SELECT COUNT(*) FROM alarm_record WHERE date(alarm_time) >= date('now','-{days-1} days')"
+            "SELECT COUNT(*) FROM alarm_record WHERE date(alarm_time) >= ?",
+            [_start_date]
         )
 
     sim_total    = db_scalar("SELECT COUNT(*) FROM sim_card")
@@ -3488,22 +3519,29 @@ def report_summary():
             [start_raw, end_raw]
         )
     else:
+        from datetime import timedelta as _td
+        _rstart_date = (datetime.now() - _td(days=days - 1)).strftime('%Y-%m-%d')
         recharge_period = db_scalar(
-            f"SELECT COALESCE(SUM(amount),0) FROM recharge WHERE date(created_at) >= date('now','-{days-1} days')"
+            "SELECT COALESCE(SUM(amount),0) FROM recharge WHERE date(created_at) >= ?",
+            [_rstart_date]
         )
 
     # 趋势：按实际天数
     trend_days = min(days, 30)
+    from datetime import timedelta as _trd
+    _trend_date = (datetime.now() - _trd(days=trend_days - 1)).strftime('%Y-%m-%d')
     alarm_trend = db_query(
-        f"SELECT date(alarm_time) as day, COUNT(*) as cnt FROM alarm_record "
-        f"WHERE date(alarm_time) >= date('now','-{trend_days-1} days') GROUP BY day ORDER BY day"
+        "SELECT date(alarm_time) as day, COUNT(*) as cnt FROM alarm_record "
+        "WHERE date(alarm_time) >= ? GROUP BY day ORDER BY day",
+        [_trend_date]
     )
     alarm_types = db_query(
         "SELECT alarm_desc, COUNT(*) as cnt FROM alarm_record GROUP BY alarm_desc ORDER BY cnt DESC LIMIT 6"
     )
     loc_trend = db_query(
-        f"SELECT date(gps_time) as day, COUNT(*) as cnt FROM location_record "
-        f"WHERE date(gps_time) >= date('now','-{trend_days-1} days') GROUP BY day ORDER BY day"
+        "SELECT date(gps_time) as day, COUNT(*) as cnt FROM location_record "
+        "WHERE date(gps_time) >= ? GROUP BY day ORDER BY day",
+        [_trend_date]
     )
 
     # 客户排名（按名下设备数）
@@ -3911,9 +3949,13 @@ def portal_location_history(phone):
     if not dev:
         return fail('设备不存在或无权限', 403)
     page, size = _page_params(100, max_size=1000)
-    start  = request.args.get('start')
-    end    = request.args.get('end')
+    start  = request.args.get('start', '')
+    end    = request.args.get('end', '')
     offset = (page - 1) * size
+    if start and not _DATE_RE.match(start):
+        return fail('start 日期格式错误，应为 YYYY-MM-DD', 400)
+    if end and not _DATE_RE.match(end):
+        return fail('end 日期格式错误，应为 YYYY-MM-DD', 400)
     if start and end:
         total   = db_scalar("SELECT COUNT(*) FROM location_record WHERE phone=? AND gps_time BETWEEN ? AND ?",
                              (phone, start, end))
@@ -4059,7 +4101,8 @@ def portal_send_text():
                 (phone, dev['name'] or phone, text, '已发送'))
         return ok()
     except Exception as e:
-        return fail(str(e))
+        log.warning("[指令下发] 失败 phone=%s err=%s", phone, e)
+        return fail('指令下发失败，请稍后重试')
 
 
 @app.get('/api/customer/commands/history')
@@ -4569,9 +4612,15 @@ def portal_create_recharge():
     amount = float(d.get('amount', 0) or 0)
     if amount <= 0:
         return fail('充值金额必须大于 0', 400)
-    new_balance = round(float(sim['balance']) + amount, 2)
-    new_status  = '正常' if sim['status'] == '欠费' and new_balance >= 0 else sim['status']
-    db_exec("UPDATE sim_card SET balance=?, status=? WHERE id=?", (new_balance, new_status, sim_id))
+    # 原子 UPDATE：消除余额读写竞态
+    db_exec(
+        "UPDATE sim_card SET balance = ROUND(balance + ?, 2), "
+        "status = CASE WHEN status='欠费' AND (balance + ?) >= 0 THEN '正常' ELSE status END "
+        "WHERE id=?",
+        (amount, amount, sim_id)
+    )
+    updated = db_query_one("SELECT balance FROM sim_card WHERE id=?", (sim_id,))
+    new_balance = float(updated['balance']) if updated else 0.0
     cust = db_query_one("SELECT name FROM customer WHERE id=?", (cid,))
     db_exec("INSERT INTO recharge (sim_id, iccid, amount, method, plan, remark, operator) "
             "VALUES (?,?,?,?,?,?,?)",
