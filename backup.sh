@@ -8,8 +8,10 @@ set -euo pipefail
 BACKUP_DIR=/opt/backups
 KEEP_DAYS=14
 STAMP=$(date +%Y%m%d_%H%M%S)
-# Docker Compose 项目名（取决于启动目录名，默认为目录名 dome；若不同请修改此变量）
-COMPOSE_PROJECT=dome
+# Docker Compose 项目名（Docker 卷名前缀 = 项目名，默认取 compose 启动目录名）。
+# 服务器部署在 /opt/gps-tracker，故项目名为 gps-tracker，卷全名如
+# gps-tracker_tracker_uploads。若你的启动目录不同，用 `docker volume ls` 查实际前缀后改此值。
+COMPOSE_PROJECT=gps-tracker
 
 mkdir -p "$BACKUP_DIR"
 
@@ -24,14 +26,21 @@ docker exec tracker-postgres pg_dump \
     | gzip > "$BACKUP_DIR/pg_${STAMP}.sql.gz"
 echo "[$(date '+%F %T')] PostgreSQL 备份完成: pg_${STAMP}.sql.gz ($(du -sh "$BACKUP_DIR/pg_${STAMP}.sql.gz" | cut -f1))"
 
-# 2. 备份上传文件（头像/Logo 等，存在 uploads_data volume 中）
-echo "[$(date '+%F %T')] 正在备份上传文件..."
-docker run --rm \
-    -v "${COMPOSE_PROJECT}_uploads_data:/uploads:ro" \
-    -v "$BACKUP_DIR":/backup \
-    alpine \
-    tar -czf "/backup/uploads_${STAMP}.tar.gz" -C /uploads . 2>/dev/null \
-    || echo "[警告] 上传文件 volume 暂无数据或卷名不匹配（期望: ${COMPOSE_PROJECT}_uploads_data）"
+# 2. 备份上传文件（头像/Logo 等，存在 tracker_uploads volume 中）
+#    卷全名 = 项目名前缀 + compose 里的卷名 tracker_uploads
+UPLOADS_VOLUME="${COMPOSE_PROJECT}_tracker_uploads"
+echo "[$(date '+%F %T')] 正在备份上传文件（卷: ${UPLOADS_VOLUME}）..."
+if ! docker volume inspect "$UPLOADS_VOLUME" >/dev/null 2>&1; then
+    echo "[严重] 上传文件卷 ${UPLOADS_VOLUME} 不存在！请用 'docker volume ls' 核对实际卷名并修正 COMPOSE_PROJECT。本次上传文件未备份。"
+else
+    docker run --rm \
+        -v "${UPLOADS_VOLUME}:/uploads:ro" \
+        -v "$BACKUP_DIR":/backup \
+        alpine \
+        tar -czf "/backup/uploads_${STAMP}.tar.gz" -C /uploads . 2>/dev/null \
+        && echo "[$(date '+%F %T')] 上传文件备份完成: uploads_${STAMP}.tar.gz" \
+        || echo "[严重] 上传文件打包失败（卷存在但读取出错），请检查。"
+fi
 
 # 3. 备份 compose 配置（脱敏：只备份结构，不包含 .env 敏感值）
 #    .env 文件含密钥，不应出现在备份包里——使用方自行保管密钥
@@ -57,6 +66,6 @@ ls -lh "$BACKUP_DIR"/backup_*.tar.gz 2>/dev/null | tail -5
 # 恢复 PostgreSQL：
 #   gunzip -c backup_YYYYMMDD_HHMMSS.tar.gz | tar -xO pg_*.sql.gz | gunzip | \
 #     docker exec -i tracker-postgres psql -U gps -d gps
-# 恢复上传文件：
+# 恢复上传文件：（卷名 = 项目名前缀 + tracker_uploads，与备份时一致）
 #   tar -xzf backup_YYYYMMDD_HHMMSS.tar.gz uploads_*.tar.gz -O | \
-#     docker run --rm -i -v dome_uploads_data:/uploads alpine tar -xz -C /uploads
+#     docker run --rm -i -v gps-tracker_tracker_uploads:/uploads alpine tar -xz -C /uploads
