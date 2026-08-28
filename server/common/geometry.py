@@ -4,6 +4,9 @@
 """
 import math
 import json as _json
+import logging
+
+log = logging.getLogger(__name__)
 
 
 def _haversine_m(lat1, lng1, lat2, lng2):
@@ -39,6 +42,9 @@ def _is_inside_fence(lat, lng, fence):
             if isinstance(coords, str):
                 coords = _json.loads(coords)
             return bool(coords) and _point_in_polygon(lng, lat, coords)
-    except Exception:
-        pass
+    except Exception as e:
+        # 围栏数据损坏(坐标为 None、coordinates JSON 无效、除零等)会使判定恒为"外部",
+        # 导致进出告警静默失效。记 warning 便于排查,不再吞异常。
+        log.warning("[围栏] 几何判定异常 fence_id=%s type=%s: %s",
+                    (fence or {}).get('id'), (fence or {}).get('fence_type'), e)
     return False

@@ -687,6 +687,22 @@ def _page_params(default_size=20, max_size=_MAX_PAGE_SIZE):
         size = default_size
     return page, size
 
+
+def _num_or_none(v, cast=float, lo=None, hi=None):
+    """把请求值安全转成数值:转换失败或超出 [lo,hi] 范围返回 None(供接口判定并返回 400),
+    避免裸 int()/float() 遇脏输入直接抛未捕获异常导致 500。"""
+    if v is None or v == '':
+        return None
+    try:
+        n = cast(v)
+    except (ValueError, TypeError):
+        return None
+    if lo is not None and n < lo:
+        return None
+    if hi is not None and n > hi:
+        return None
+    return n
+
 def ok(data=None):
     resp = jsonify({'code': 200, 'msg': 'success', 'data': data})
     resp.headers['Cache-Control'] = 'no-store'
@@ -1348,7 +1364,10 @@ def list_alarms():
 
     conds, params = [], []
     if status is not None and status != '':
-        conds.append("a.status=?"); params.append(int(status))
+        _st = _num_or_none(status, int)
+        if _st is None:
+            return fail('status 参数无效', 400)
+        conds.append("a.status=?"); params.append(_st)
     if phone:
         conds.append("a.phone=?"); params.append(phone)
 
@@ -2430,8 +2449,10 @@ def create_fence():
         return fail('name 不能为空', 400)
     ae    = 1 if d.get('alarm_enter', True) else 0
     ax    = 1 if d.get('alarm_exit',  True) else 0
-    adwl  = int(d.get('alarm_dwell',  0))
-    spdl  = int(d.get('speed_limit',  0))
+    adwl  = _num_or_none(d.get('alarm_dwell', 0), int, lo=0)
+    spdl  = _num_or_none(d.get('speed_limit', 0), int, lo=0)
+    if adwl is None or spdl is None:
+        return fail('alarm_dwell/speed_limit 需为非负整数', 400)
     vs    = str(d.get('valid_start',  '') or '')
     ve    = str(d.get('valid_end',    '') or '')
 
@@ -2439,12 +2460,19 @@ def create_fence():
     EXTRA_VALS = (ae, ax, adwl, spdl, vs, ve, admin_org)
 
     if fence_type == 'circle':
-        if d.get('lat') is None or d.get('lng') is None:
-            return fail('圆形围栏需要 lat/lng', 400)
+        # 坐标/半径范围校验:非法值会使围栏永远命中不了(静默失效,进出告警不触发),
+        # 必须拦在入库前而非存进去。
+        lat = _num_or_none(d.get('lat'), float, lo=-90,  hi=90)
+        lng = _num_or_none(d.get('lng'), float, lo=-180, hi=180)
+        radius = _num_or_none(d.get('radius', 2000), int, lo=1)
+        if lat is None or lng is None:
+            return fail('圆形围栏需要合法的 lat(-90~90)/lng(-180~180)', 400)
+        if radius is None:
+            return fail('radius 需为正整数', 400)
         db_exec(
             f"INSERT INTO geo_fence (name,fence_type,lat,lng,radius,color,devices,{EXTRA_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (name, 'circle', float(d['lat']), float(d['lng']),
-             int(d.get('radius', 2000)), d.get('color', '#409EFF'), d.get('devices', '')) + EXTRA_VALS
+            (name, 'circle', lat, lng,
+             radius, d.get('color', '#409EFF'), d.get('devices', '')) + EXTRA_VALS
         )
     elif fence_type == 'polygon':
         coords = d.get('coordinates')

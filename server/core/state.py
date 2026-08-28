@@ -50,6 +50,11 @@ def _fence_cleanup(phone):
         fence_device_pending.pop(phone, None)
         fence_device_enter_time.pop(phone, None)
         fence_device_dwell_alarmed.pop(phone, None)
+    # 顺带清理设备ID缓存与报警去重时间戳,防止长期运行内存无界增长
+    _devid_cache.pop(phone, None)
+    with _alarm_last_ts_lock:
+        for _k in [k for k in _alarm_last_ts if k[0] == phone]:
+            _alarm_last_ts.pop(_k, None)
 
 
 def next_serial():

@@ -534,7 +534,7 @@ def _emit_alarm(event, data, phone, alarm_type):
     # 短信推送：记录消耗（真实短信网关需另接），此处累加已用条数
     if rule.get('notify_sms', 0):
         try:
-            db_exec("UPDATE platform_setting SET sms_used=sms_used+1 WHERE org_id=1 AND sms_enabled=1")
+            db_exec("UPDATE platform_setting SET sms_used=sms_used+1 WHERE org_id=? AND sms_enabled=1", (org_id,))
         except Exception:
             pass
 
@@ -592,8 +592,10 @@ def handle_auth(sock, phone, serial, body):
     else:
         log.warning("[808] 鉴权失败断开连接 phone=%s auth=%s", canonical, auth_code)
         # 鉴权失败：从 sessions 中删除，防止未鉴权设备被下发指令
+        # identity-checked pop：仅当存的还是本条连接才清除，避免误删重连的新连接
         with sessions_lock:
-            sessions.pop(canonical, None)
+            if sessions.get(canonical) is sock:
+                sessions.pop(canonical, None)
         sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0102, 1))
         return 'close'
 
@@ -926,7 +928,8 @@ def handle_client(conn, addr):
         conn.close()
         if phone:
             with sessions_lock:
-                sessions.pop(phone, None)
+                if sessions.get(phone) is conn:   # 仅当仍是自己这条连接才清除，避免删掉重连的新连接
+                    sessions.pop(phone, None)
             _fence_cleanup(phone)   # 清理围栏状态，防内存泄漏和 phone 复用时状态污染
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             try:
