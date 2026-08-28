@@ -14,8 +14,9 @@ USER appuser
 
 # 复制业务代码
 COPY app.py protocol.py protocol_g618g.py protocol_zhiling.py geo_resolve.py gunicorn.conf.py ./
-# 拆分出的模块包(common/ 等);后续新增子包目录都要在此补上,否则容器内 import 失败
+# 拆分出的模块包(common/ core/ 等);后续新增子包目录都要在此补上,否则容器内 import 失败
 COPY common/ ./common/
+COPY core/ ./core/
 
 # 数据目录（SQLite 落盘，docker-compose 挂载卷到此处）
 RUN mkdir -p /app/data
