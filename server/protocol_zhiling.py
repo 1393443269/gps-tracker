@@ -13,6 +13,10 @@
 
 def _build_cmd(cmd: str, *params) -> str:
     """构造智令指令字符串: *CMD,p1,p2,...#"""
+    _ILLEGAL = (',', '#', '*')
+    for p in params:
+        if isinstance(p, str) and any(c in p for c in _ILLEGAL):
+            raise ValueError(f"指令参数含非法字符: {p!r}")
     parts = [str(p) for p in params if p is not None]
     return '*' + cmd + ',' + ','.join(parts) + '#'
 

@@ -14,8 +14,12 @@ G618G 等设备上报的 WiFi(BSSID+RSSI)与基站(MCC/MNC/LAC/CID+RSSI)本身�
 """
 import os
 import json
+import logging
+import urllib.error
 import urllib.request
 import urllib.parse
+
+log = logging.getLogger(__name__)
 
 AMAP_KEY = os.environ.get('AMAP_KEY', '').strip()
 AMAP_LOCATION_URL = 'https://restapi.amap.com/v3/assistant/location'  # 占位：以实际开通的定位接口为准
@@ -36,7 +40,11 @@ def _http_get(url: str, params: dict):
         req = urllib.request.Request(url + '?' + qs, headers={'User-Agent': 'gps-tracker/1.0'})
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
             return json.loads(resp.read().decode('utf-8', errors='replace'))
-    except Exception:
+    except urllib.error.URLError as e:
+        log.warning("[geo] 网络请求失败 (url 不含 key): %s", e.reason)
+        return None
+    except Exception as e:
+        log.warning("[geo] 请求异常: %s", type(e).__name__)
         return None
 
 

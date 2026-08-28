@@ -6,6 +6,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# 创建非特权用户，避免容器以 root 运行
+RUN useradd -r -u 1001 -s /sbin/nologin appuser \
+    && mkdir -p /app/data /app/uploads \
+    && chown -R appuser:appuser /app
+USER appuser
+
 # 复制业务代码
 COPY app.py protocol.py protocol_g618g.py protocol_zhiling.py geo_resolve.py gunicorn.conf.py ./
 

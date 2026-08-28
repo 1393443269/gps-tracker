@@ -45,9 +45,8 @@ def split_frames(buf: bytes):
         # 找下一个 token 作为本帧结束
         nxt = buf.find(TOKEN, len(TOKEN))
         if nxt < 0:
-            # 没有下一个 token，剩下的全是本帧（可能不完整）——本协议一包一批完整报文
-            frames.append(buf)
-            return frames, b''
+            # 没有下一个 token，剩余数据不完整，留待下次收到更多数据后再处理
+            return frames, buf
         frames.append(buf[:nxt])
         buf = buf[nxt:]
 
@@ -75,10 +74,14 @@ def parse(frame: bytes):
 
     try:
         if msg_id == 0xF0:      # 请求连接（含 IMEI）
+            if len(p) < 8:
+                return {**r, 'type': 'register', 'parse_error': 'short payload'}
             imei = _u64(p, 0)
             r.update(type='register', imei=str(imei), version=_u16(p, 8) if len(p) >= 10 else 0)
 
         elif msg_id == 0xF9:    # 心跳/电量信号
+            if len(p) < 11:
+                return {**r, 'type': 'heartbeat', 'parse_error': 'short payload'}
             r.update(type='heartbeat',
                      bat_type=p[0], bat_raw=_u16(p, 1),
                      signal_type=p[3], signal=_i16(p, 4),
@@ -87,11 +90,15 @@ def parse(frame: bytes):
                      battery_pct=_bat_pct(p[0], _u16(p, 1)))
 
         elif msg_id == 0x02:    # 报警上传-1
+            if len(p) < 2:
+                return {**r, 'type': 'alarm', 'parse_error': 'short payload'}
             warn = _u16(p, 0)
             r.update(type='alarm', warn_bits=warn, alarms=_decode_warn02(warn),
                      timestamp=_u32(p, 2) if len(p) >= 6 else None)
 
         elif msg_id == 0x21:    # 报警上传-2（关机类型）
+            if len(p) < 6:
+                return {**r, 'type': 'alarm2', 'parse_error': 'short payload'}
             atype = _u16(p, 0)
             warn = _u32(p, 2)
             r.update(type='alarm2', alarm_type=atype, warn_bits=warn,
@@ -99,6 +106,8 @@ def parse(frame: bytes):
                      timestamp=_u32(p, 6) if len(p) >= 10 else None)
 
         elif msg_id == 0x03:    # GPS/BDS 位置
+            if len(p) < 19:
+                return {**r, 'type': 'location', 'parse_error': 'short payload'}
             lon = _double(p, 0)
             lat = _double(p, 8)
             ns = chr(p[16]); ew = chr(p[17]); st = chr(p[18])
@@ -108,20 +117,30 @@ def parse(frame: bytes):
                      timestamp=_u32(p, 19) if len(p) >= 23 else None)
 
         elif msg_id == 0xA4:    # WiFi + 基站
+            if len(p) < 5:
+                return {**r, 'type': 'wifi_lbs', 'parse_error': 'short payload'}
             r.update(type='wifi_lbs', **_parse_a4(p))
 
         elif msg_id == 0xD6:    # 蓝牙信标
+            if len(p) < 2:
+                return {**r, 'type': 'ble', 'parse_error': 'short payload'}
             r.update(type='ble', **_parse_d6(p))
 
         elif msg_id == 0xF3:    # SIM ICCID
+            if len(p) < 10:
+                return {**r, 'type': 'iccid', 'parse_error': 'short payload'}
             r.update(type='iccid', iccid=p[:10].hex())
 
         elif msg_id == 0xC3:    # 充电状态（上报）
+            if len(p) < 1:
+                return {**r, 'type': 'charge', 'parse_error': 'short payload'}
             r.update(type='charge', status=p[0],
                      status_text={0: '开始充电', 1: '结束充电', 2: '充满'}.get(p[0], '未知'),
                      timestamp=_u32(p, 1) if len(p) >= 5 else None)
 
         elif msg_id == 0xA9:    # 状态参数（版本）
+            if len(p) < 2:
+                return {**r, 'type': 'version', 'parse_error': 'short payload'}
             r.update(type='version', **_parse_a9(p))
 
         elif msg_id == 0xE9:    # 设备状态（频率）
@@ -132,6 +151,8 @@ def parse(frame: bytes):
                      health_freq=_u16(p, 7) if len(p) >= 9 else None)
 
         elif msg_id == 0xC0:    # 下行反馈
+            if len(p) < 1:
+                return {**r, 'type': 'cmd_ack', 'parse_error': 'short payload'}
             n = p[0]
             r.update(type='cmd_ack', ack_ids=list(p[1:1 + n]))
 
@@ -170,17 +191,27 @@ def _decode_warn21(w):
 
 def _parse_a4(p):
     o = 0
+    if o + 4 > len(p):
+        return {'timestamp': None, 'cells': [], 'wifis': []}
     ts = _u32(p, o); o += 4
+    if o + 1 > len(p):
+        return {'timestamp': ts, 'cells': [], 'wifis': []}
     cell_cnt = p[o]; o += 1
     cells = []
     for _ in range(cell_cnt):
+        if o + 12 > len(p):
+            break
         cells.append({'mcc': _u16(p, o), 'mnc': _u16(p, o + 2),
                       'lac': _u16(p, o + 4), 'cell_id': _u32(p, o + 6),
                       'rssi': _i16(p, o + 10)})
         o += 12
+    if o + 1 > len(p):
+        return {'timestamp': ts, 'cells': cells, 'wifis': []}
     wifi_cnt = p[o]; o += 1
     wifis = []
     for _ in range(wifi_cnt):
+        if o + 10 > len(p):
+            break
         mac = ':'.join('%02X' % b for b in p[o:o + 6])
         wifis.append({'bssid': mac, 'rssi': _i32(p, o + 6)})
         o += 10
@@ -189,14 +220,22 @@ def _parse_a4(p):
 
 def _parse_d6(p):
     o = 0
+    if o + 2 > len(p):
+        return {'timestamp': None, 'beacons': []}
     typ = p[o]; o += 1
     groups = p[o]; o += 1
     beacons = []
     ts = None
     for _ in range(groups):
+        if o + 4 > len(p):
+            break
         ts = _u32(p, o); o += 4
+        if o + 1 > len(p):
+            break
         cnt = p[o]; o += 1
         for _ in range(cnt):
+            if o + 5 > len(p):
+                break
             major = _u16(p, o); minor = _u16(p, o + 2)
             rssi = struct.unpack_from('<b', p, o + 4)[0]
             beacons.append({'major': major, 'minor': minor, 'rssi': rssi})

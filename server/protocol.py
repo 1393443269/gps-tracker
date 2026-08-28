@@ -125,6 +125,8 @@ def parse_header(data: bytes) -> dict:
     serial    = struct.unpack('>H', data[10:12])[0]
 
     body_start = 16 if sub_pkg and len(data) >= 16 else 12
+    if body_start + body_len > len(data):
+        raise ValueError(f'body_len {body_len} 超出帧长度 {len(data)}')
     body = data[body_start: body_start + body_len]
 
     return {
@@ -318,7 +320,7 @@ def _parse_bcd_time(data: bytes, offset: int) -> datetime:
     try:
         return datetime(2000 + b(0), b(1), b(2), b(3), b(4), b(5))
     except Exception:
-        return datetime.now()
+        return None  # 不用服务器时间伪造设备时间戳
 
 
 # ── BCD 工具 ──────────────────────────────────────────────────────────────────

@@ -237,11 +237,15 @@ def get_db():
     if DB_BACKEND == 'postgres':
         pool = _get_pg_pool()
         raw  = pool.getconn()
-        # 关键：开 autocommit，对齐 SQLite 的自动提交语义。
-        # 否则 psycopg2 默认把多条语句包进一个事务，某条(如 ALTER 列已存在被 try/except 忽略)
-        # 失败会把事务打成中止态，后续全部报 InFailedSqlTransaction，真正的首错被掩盖。
-        raw.autocommit = True
-        return _ConnWrapper(raw, 'postgres', pool=pool)  # close() 时归还连接池
+        try:
+            # 关键：开 autocommit，对齐 SQLite 的自动提交语义。
+            # 否则 psycopg2 默认把多条语句包进一个事务，某条(如 ALTER 列已存在被 try/except 忽略)
+            # 失败会把事务打成中止态，后续全部报 InFailedSqlTransaction，真正的首错被掩盖。
+            raw.autocommit = True
+            return _ConnWrapper(raw, 'postgres', pool=pool)  # close() 时归还连接池
+        except Exception:
+            pool.putconn(raw)   # autocommit 设置异常时归还连接，防止泄漏
+            raise
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")   # 提升并发写性能
@@ -251,8 +255,16 @@ def get_db():
 _db_lock = threading.Lock()
 
 def db_exec(sql, params=()):
-    """线程安全的写操作"""
-    with _db_lock:
+    """写操作：SQLite 用全局锁防并发写冲突；PG 连接池各连接独立，无需全局锁。"""
+    if DB_BACKEND == 'sqlite':
+        with _db_lock:
+            conn = get_db()
+            try:
+                conn.execute(sql, params)
+                conn.commit()
+            finally:
+                conn.close()
+    else:
         conn = get_db()
         try:
             conn.execute(sql, params)
@@ -358,11 +370,15 @@ def _batch_writer_loop():
             log.critical("[批量写] 连续 3 次落库失败，%d 条位置记录已丢弃！请检查数据库连接。", len(rows))
 
 _batch_writer_started = False
+_batch_writer_start_lock = threading.Lock()
+
 def start_batch_writer():
+    """启动批量写线程，加锁防止多 worker 并发调用时双启。"""
     global _batch_writer_started
-    if _batch_writer_started:
-        return
-    _batch_writer_started = True
+    with _batch_writer_start_lock:
+        if _batch_writer_started:
+            return
+        _batch_writer_started = True
     threading.Thread(target=_batch_writer_loop, daemon=True).start()
     log.info("[批量写] 位置异步批量落库线程已启动")
 
@@ -1664,6 +1680,8 @@ def create_device():
 def get_device(did):
     row = db_query_one("SELECT * FROM device WHERE id=?", (did,))
     if not row: return fail('设备不存在', 404)
+    row = dict(row)
+    row.pop('auth_code', None)   # 鉴权码属设备内部凭据，不对外暴露
     return ok(row)
 
 @app.put('/api/devices/<int:did>')
@@ -2659,8 +2677,7 @@ def delete_beacon(bid):
 def list_beacon_reports():
     """信标上报记录（分页）。可按 phone 过滤。"""
     phone = request.args.get('phone', '')
-    page  = max(1, int(request.args.get('page', 1)))
-    size  = min(100, int(request.args.get('size', 20)))
+    page, size = _page_params(20, max_size=100)
     offset = (page - 1) * size
     conds, params = [], []
     if phone:
@@ -2824,11 +2841,18 @@ def create_recharge():
     amount = float(d.get('amount', 0))
     if not sim_id or amount <= 0:
         return fail('sim_id 和 amount 不能为空', 400)
-    row = db_query_one("SELECT id, iccid, balance, status FROM sim_card WHERE id=?", (sim_id,))
+    row = db_query_one("SELECT id, iccid FROM sim_card WHERE id=?", (sim_id,))
     if not row: return fail('SIM卡不存在', 404)
-    new_balance = float(row['balance']) + amount
-    new_status  = '正常' if row['status'] == '欠费' and new_balance >= 0 else row['status']
-    db_exec("UPDATE sim_card SET balance=?, status=? WHERE id=?", (new_balance, new_status, sim_id))
+    # 原子 UPDATE：balance = balance + amount，再用 CASE 修正欠费状态
+    # 避免先 SELECT 再计算再 UPDATE 之间的余额竞态
+    db_exec(
+        "UPDATE sim_card SET balance = ROUND(balance + ?, 2), "
+        "status = CASE WHEN status='欠费' AND (balance + ?) >= 0 THEN '正常' ELSE status END "
+        "WHERE id=?",
+        (amount, amount, sim_id)
+    )
+    updated = db_query_one("SELECT balance FROM sim_card WHERE id=?", (sim_id,))
+    new_balance = float(updated['balance']) if updated else 0.0
     db_exec("INSERT INTO recharge (sim_id,iccid,amount,method,plan,remark,operator) VALUES (?,?,?,?,?,?,?)",
             (sim_id, row['iccid'], amount, d.get('method','支付宝'),
              d.get('plan',''), d.get('remark',''), d.get('operator','管理员')))
@@ -3496,18 +3520,20 @@ def _require_secret(env_name: str) -> str:
 _ADMIN_SECRET = _require_secret('ADMIN_SECRET')
 
 def _make_admin_token(admin_id: int) -> str:
+    import hmac as _hmac
     ts  = int(_time_mod.time())
     raw = f"admin:{admin_id}:{ts}"
-    sig = hashlib.sha256(f"{raw}:{_ADMIN_SECRET}".encode()).hexdigest()[:20]
+    sig = _hmac.new(_ADMIN_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()  # 完整 256 bit
     return base64.b64encode(f"{raw}:{sig}".encode()).decode()
 
 def _verify_admin_token(token: str):
+    import hmac as _hmac
     try:
         decoded = base64.b64decode(token).decode()
         _, aid_s, ts_s, sig = decoded.rsplit(':', 3)
         raw = f"admin:{aid_s}:{ts_s}"
-        expected = hashlib.sha256(f"{raw}:{_ADMIN_SECRET}".encode()).hexdigest()[:20]
-        if sig != expected:
+        expected = _hmac.new(_ADMIN_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
+        if not _hmac.compare_digest(sig, expected):   # 常量时间比较，防时序攻击
             return None
         if _time_mod.time() - int(ts_s) > 30 * 24 * 3600:
             return None
@@ -3600,19 +3626,21 @@ def admin_change_password():
 _PORTAL_SECRET = _require_secret('PORTAL_SECRET')
 
 def _make_token(customer_id: int) -> str:
+    import hmac as _hmac
     ts  = int(_time_mod.time())
     raw = f"{customer_id}:{ts}"
-    sig = hashlib.sha256(f"{raw}:{_PORTAL_SECRET}".encode()).hexdigest()[:20]
+    sig = _hmac.new(_PORTAL_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
     return base64.b64encode(f"{raw}:{sig}".encode()).decode()
 
 def _verify_token(token: str):
     """返回 customer_id(int) 或 None（无效/过期）"""
+    import hmac as _hmac
     try:
         decoded = base64.b64decode(token).decode()
         cid_s, ts_s, sig = decoded.rsplit(':', 2)
         raw = f"{cid_s}:{ts_s}"
-        expected = hashlib.sha256(f"{raw}:{_PORTAL_SECRET}".encode()).hexdigest()[:20]
-        if sig != expected:
+        expected = _hmac.new(_PORTAL_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
+        if not _hmac.compare_digest(sig, expected):
             return None
         if _time_mod.time() - int(ts_s) > 30 * 24 * 3600:  # 30天有效
             return None
@@ -3636,7 +3664,7 @@ def portal_login():
     if not login_name or not password:
         return fail('账号和密码不能为空', 400)
     row = db_query_one(
-        "SELECT id, name, login_name FROM customer WHERE login_name=? AND password_hash=?",
+        "SELECT id, name, login_name FROM customer WHERE login_name=? AND password_hash=? AND status='活跃'",
         (login_name, _hash_pw(password))
     )
     if not row:
@@ -4277,9 +4305,15 @@ def portal_recharge_sim(sid):
     amount = float(d.get('amount', 0))
     if amount <= 0:
         return fail('充值金额必须大于 0', 400)
-    new_balance = round(float(sim['balance']) + amount, 2)
-    new_status  = '正常' if sim['status'] == '欠费' and new_balance >= 0 else sim['status']
-    db_exec("UPDATE sim_card SET balance=?, status=? WHERE id=?", (new_balance, new_status, sid))
+    # 原子 UPDATE：消除余额读写竞态
+    db_exec(
+        "UPDATE sim_card SET balance = ROUND(balance + ?, 2), "
+        "status = CASE WHEN status='欠费' AND (balance + ?) >= 0 THEN '正常' ELSE status END "
+        "WHERE id=?",
+        (amount, amount, sid)
+    )
+    updated = db_query_one("SELECT balance FROM sim_card WHERE id=?", (sid,))
+    new_balance = float(updated['balance']) if updated else 0.0
     cust = db_query_one("SELECT name FROM customer WHERE id=?", (cid,))
     db_exec("INSERT INTO recharge (sim_id, iccid, amount, method, plan, remark, operator) "
             "VALUES (?,?,?,?,?,?,?)",
@@ -4992,7 +5026,11 @@ _DIST = os.path.normpath(os.path.join(BASE_DIR, '..', 'frontend', 'dist'))
 def _serve_spa(path):
     # 尝试直接返回静态文件（assets/ 等）
     if path:
-        fp = os.path.join(_DIST, path.replace('/', os.sep))
+        fp = os.path.realpath(os.path.join(_DIST, path.replace('/', os.sep)))
+        dist_root = os.path.realpath(_DIST)
+        # realpath 检查：防止 ../../../etc/passwd 之类路径穿越
+        if not fp.startswith(dist_root + os.sep) and fp != dist_root:
+            return fail('非法路径', 400)
         if os.path.isfile(fp):
             return _send_abs(fp)
     # 其余全部返回 index.html（Vue Router 接管）
