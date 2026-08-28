@@ -28,6 +28,11 @@ http.interceptors.response.use(
     const status   = err.response?.status
     const msg      = err.response?.data?.msg || '请求失败'
     const onLogin  = window.location.pathname.startsWith('/login')
+    // 静默请求(如顶栏后台轮询):失败不弹错、不强制跳登录。
+    // 用于避免页面加载瞬间 token 未就绪时,轮询抢先请求的 401 惊扰用户。
+    if (err.config?.silent401 && status === 401) {
+      return Promise.reject(err)
+    }
     if (status === 401 && !onLogin) {
       const url = err.config?.url || ''
       if (localStorage.getItem('customer_token')) {
@@ -75,7 +80,7 @@ export const deviceApi = {
   get:               (id)           => http.get(`/devices/${id}`),
   create:            (data)         => http.post('/devices', data),
   update:            (id, data)     => http.put(`/devices/${id}`, data),
-  summary:           ()             => http.get('/devices/summary'),
+  summary:           (cfg)          => http.get('/devices/summary', cfg),
   batchLifecycle:    (ids, lifecycle) => http.put('/devices/batch_lifecycle', { ids, lifecycle }),
   withCustomer:      (params)       => http.get('/devices/with_customer', { params }),
   bindCustomer:      (id, customerId) => http.post(`/devices/${id}/bind_customer`, { customer_id: customerId }),
@@ -96,7 +101,7 @@ export const locationApi = {
 
 // ── 报警 ─────────────────────────────────────────────────────────────────────
 export const alarmApi = {
-  list:        (params)     => http.get('/alarms', { params }),
+  list:        (params, cfg) => http.get('/alarms', { params, ...cfg }),
   handle:      (id, data)   => http.put(`/alarms/${id}/handle`, data),
   batchHandle: (ids, data)  => http.post('/alarms/batch_handle', { ids, ...data }),
 }

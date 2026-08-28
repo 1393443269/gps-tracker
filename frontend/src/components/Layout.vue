@@ -237,12 +237,13 @@ let timer
 
 async function refreshStats() {
   try {
-    const res = isAdmin.value ? await deviceApi.summary() : await portalApi.summary()
+    // silent401:顶栏后台轮询,页面加载瞬间 token 未就绪时的 401 应静默,不弹错/不跳登录
+    const res = isAdmin.value ? await deviceApi.summary({ silent401: true }) : await portalApi.summary()
     onlineCount.value = (res.data?.online ?? 0) + (res.data?.alarm ?? 0)
   } catch {}
   try {
     const res = isAdmin.value
-      ? await alarmApi.list({ status: 0, size: 1 })
+      ? await alarmApi.list({ status: 0, size: 1 }, { silent401: true })
       : await portalApi.alarms({ status: 0, size: 1 })
     alarmCount.value = res.data?.total ?? 0
   } catch {}
