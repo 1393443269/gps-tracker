@@ -762,6 +762,10 @@ def list_devices():
         f"r.icon_type AS role_icon {base} "
         f"{where} ORDER BY device.updated_at DESC LIMIT ? OFFSET ?",
         params + [size, offset])
+    # auth_code 是设备 JT808 鉴权码(内部凭据),与单设备详情接口一致,列表也不得外泄,
+    # 否则任意管理员可拉全平台鉴权码离线伪造设备身份。
+    for _r in records:
+        _r.pop('auth_code', None)
     return ok({'records': records, 'total': total, 'page': page, 'size': size})
 
 @app.post('/api/devices')
@@ -1153,8 +1157,11 @@ def batch_command_devices():
         return fail('单次批量下发不超过 500 台设备', 400)
     if not text:
         return fail('指令内容不能为空', 400)
-    sent, offline = 0, 0
+    sent, offline, denied = 0, 0, 0
     for phone in phones:
+        if not _device_in_scope(phone):
+            denied += 1                  # 越权设备静默跳过,不下发也不泄露存在性
+            continue
         with sessions_lock:
             conn = sessions.get(phone)
         if not conn:
@@ -1167,7 +1174,7 @@ def batch_command_devices():
         except Exception:
             offline += 1
     add_op_log('批量下发', f'向 {len(phones)} 台设备下发指令，成功 {sent} 台')
-    return ok({'sent': sent, 'offline': offline})
+    return ok({'sent': sent, 'offline': offline, 'denied': denied})
 
 
 @app.get('/api/devices/export')
@@ -1386,14 +1393,31 @@ def batch_handle_alarms():
     if not ids:
         return fail('ids 不能为空', 400)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    ph  = ','.join('?' * len(ids))
+    # 先按当前管理员组织范围筛出可处理的报警 id(报警经 device.org_id 隔离),
+    # 越权 id 静默忽略,防止跨组织把他人未处理报警标记为已处理、掩盖真实告警。
+    sids = _org_scope_ids(request)
+    id_ph = ','.join('?' * len(ids))
+    if sids is None:
+        allowed_ids = list(ids)          # 超管,无限制
+    elif not sids:
+        return fail('无可处理的报警', 404)
+    else:
+        org_ph = ','.join('?' * len(sids))
+        rows = db_query(
+            f"SELECT a.id FROM alarm_record a LEFT JOIN device d ON a.phone=d.phone "
+            f"WHERE a.id IN ({id_ph}) AND d.org_id IN ({org_ph})",
+            list(ids) + sids)
+        allowed_ids = [r['id'] for r in rows]
+    if not allowed_ids:
+        return fail('无可处理的报警', 404)
+    ph  = ','.join('?' * len(allowed_ids))
     db_exec(
         f"UPDATE alarm_record SET status=1, handler=?, handle_note=?, handle_time=? "
         f"WHERE id IN ({ph}) AND status=0",
-        [data.get('handler', '管理员'), data.get('note', ''), now] + list(ids)
+        [data.get('handler', '管理员'), data.get('note', ''), now] + allowed_ids
     )
-    add_op_log('批量处理报警', f'批量处理 {len(ids)} 条报警')
-    return ok({'handled': len(ids)})
+    add_op_log('批量处理报警', f'批量处理 {len(allowed_ids)} 条报警')
+    return ok({'handled': len(allowed_ids)})
 
 
 # ── 报警规则接口 ───────────────────────────────────────────────────────────────
@@ -1672,6 +1696,21 @@ def update_platform_setting():
 
 # ── 指令下发接口 ──
 
+def _device_in_scope(phone):
+    """校验设备 phone 是否在当前管理员的组织可见范围内。
+    返回 True=有权限(含超管无限制);False=无权限或设备不存在。
+    用于指令下发等按 phone 操作的接口,防止低权限管理员越权控制他人设备。"""
+    sids = _org_scope_ids(request)
+    if sids is None:
+        return True                      # 超管,无限制
+    if not sids:
+        return False                     # 空范围
+    ph = ','.join('?' * len(sids))
+    return db_query_one(
+        f"SELECT 1 FROM device WHERE phone=? AND org_id IN ({ph})",
+        [phone] + sids) is not None
+
+
 @app.post('/api/commands/text')
 def send_text():
     data  = request.get_json() or {}
@@ -1679,6 +1718,8 @@ def send_text():
     text  = data.get('text', '')
     if not phone or not text:
         return fail('phone 和 text 不能为空')
+    if not _device_in_scope(phone):
+        return fail('设备不存在或无权限', 403)
     with sessions_lock:
         conn = sessions.get(phone)
     if not conn:
@@ -1700,6 +1741,8 @@ def terminal_control():
     data  = request.get_json() or {}
     phone = data.get('phone', '')
     proto = data.get('proto', 'zhiling')
+    if not _device_in_scope(phone):
+        return fail('设备不存在或无权限', 403)
     with sessions_lock:
         conn = sessions.get(phone)
     if not conn:
@@ -1731,6 +1774,8 @@ def location_track():
     proto    = data.get('proto', 'zhiling')
     interval = int(data.get('interval', 30))
     duration = int(data.get('duration', 0))
+    if not _device_in_scope(phone):
+        return fail('设备不存在或无权限', 403)
     with sessions_lock:
         conn = sessions.get(phone)
     if not conn:
@@ -1780,6 +1825,8 @@ def g618g_command():
     cmd   = data.get('cmd', '')
     if not phone or not cmd:
         return fail('phone 和 cmd 不能为空')
+    if not _device_in_scope(phone):
+        return fail('设备不存在或无权限', 403)
     builder = _G618G_CMD_MAP.get(cmd)
     if not builder:
         return fail(f'不支持的 G618G 指令: {cmd}，支持: {", ".join(_G618G_CMD_MAP.keys())}')
@@ -1838,6 +1885,8 @@ def zhiling_command():
     cmd   = data.get('cmd', '')
     if not phone or not cmd:
         return fail('phone 和 cmd 不能为空')
+    if not _device_in_scope(phone):
+        return fail('设备不存在或无权限', 403)
     spec = zl.AVAILABLE_COMMANDS.get(cmd)
     if not spec:
         return fail(f'不支持的天禧指令: {cmd}，支持: {", ".join(zl.AVAILABLE_COMMANDS.keys())}')
@@ -2421,10 +2470,20 @@ def create_fence():
     add_op_log('围栏新增', f'新建{fence_type}围栏 {name}')
     return ok()
 
+def _admin_fence_or_none(fid):
+    """取管理员有权操作的围栏(本组织范围内的全局围栏 customer_id IS NULL),
+    与 list_fences 的可见范围一致。无权/不存在返回 None,防止跨组织或删客户私有围栏。"""
+    sids = _org_scope_ids(request)
+    conds, params = _org_where(sids, ["id=?"], [fid])
+    where = " AND ".join(conds)
+    return db_query_one(
+        f"SELECT name FROM geo_fence WHERE {where} AND customer_id IS NULL", params)
+
+
 @app.delete('/api/fences/<int:fid>')
 def delete_fence(fid):
-    row = db_query_one("SELECT name FROM geo_fence WHERE id=?", (fid,))
-    if not row: return fail('围栏不存在', 404)
+    row = _admin_fence_or_none(fid)
+    if not row: return fail('围栏不存在或无权限', 404)
     db_exec("DELETE FROM geo_fence WHERE id=?", (fid,))
     add_op_log('围栏删除', f'删除围栏 {row["name"]}')
     return ok()
@@ -2432,8 +2491,8 @@ def delete_fence(fid):
 @app.route('/api/fences/<int:fid>/devices', methods=['PUT'])
 def update_fence_devices(fid):
     """更新围栏关联的设备（手机号列表）"""
-    row = db_query_one("SELECT name FROM geo_fence WHERE id=?", (fid,))
-    if not row: return fail('围栏不存在', 404)
+    row = _admin_fence_or_none(fid)
+    if not row: return fail('围栏不存在或无权限', 404)
     d = request.get_json() or {}
     phones = d.get('phones', [])            # 传入手机号数组
     devices_str = ','.join(str(p) for p in phones if p)
@@ -2447,10 +2506,20 @@ def batch_delete_fences():
     ids = d.get('ids', [])
     if not ids:
         return fail('ids 不能为空', 400)
-    placeholders = ','.join('?' * len(ids))
-    db_exec(f"DELETE FROM geo_fence WHERE id IN ({placeholders})", tuple(ids))
-    add_op_log('围栏批量删除', f'批量删除 {len(ids)} 条围栏')
-    return ok()
+    # 仅删除当前管理员可见范围内的全局围栏,越权 id 静默忽略(不误删他人/客户围栏)
+    sids = _org_scope_ids(request)
+    id_ph = ','.join('?' * len(ids))
+    conds, params = _org_where(sids, [f"id IN ({id_ph})"], list(ids))
+    where = " AND ".join(conds)
+    allowed = db_query(
+        f"SELECT id FROM geo_fence WHERE {where} AND customer_id IS NULL", params)
+    allowed_ids = [r['id'] for r in allowed]
+    if not allowed_ids:
+        return fail('无可删除的围栏', 404)
+    del_ph = ','.join('?' * len(allowed_ids))
+    db_exec(f"DELETE FROM geo_fence WHERE id IN ({del_ph})", tuple(allowed_ids))
+    add_op_log('围栏批量删除', f'批量删除 {len(allowed_ids)} 条围栏')
+    return ok({'deleted': len(allowed_ids)})
 
 # ── 标注点 ────────────────────────────────────────────────────────────────────
 @app.get('/api/mark_points')
