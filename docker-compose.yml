@@ -79,13 +79,16 @@ services:
   mqtt:
     container_name: tracker-mqtt
     image: eclipse-mosquitto:2
-    # MQTT 仅供 backend 内部使用，不对外暴露主机端口（防止外部直连）
-    expose:
-      - "1883"
-      - "9001"
+    # 走 MQTT 上报的 G618 设备需从外部直连 broker，故映射到宿主机端口。
+    # 安全依赖 passwd 认证文件（MQTT_USER/MQTT_PASS），broker 非匿名开放；
+    # mosquitto.conf 应设 allow_anonymous false。生产建议再叠加防火墙/安全组限制来源 IP。
+    ports:
+      - "1883:1883"   # MQTT TCP（G618 设备接入）
+      - "9001:9001"   # MQTT over WebSocket
     restart: unless-stopped
     networks:
       - internal
+      - gps_public
     volumes:
       - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - ./passwd:/mosquitto/config/passwd:ro
