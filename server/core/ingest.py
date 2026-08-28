@@ -16,13 +16,26 @@ import threading
 import time as _time_mod
 import queue as _queue
 import logging
+import math
+import uuid
+from datetime import datetime
 
-from core.db import db_query_one, db_exec, get_db, _db_lock, DB_BACKEND
+import protocol as p
+import protocol_g618g as g618
+import geo_resolve
+
+from core.db import db_query_one, db_query, db_exec, get_db, _db_lock, DB_BACKEND
 import core.db as _dbmod
 from core.state import (
     _loc_queue, _dev_latest, _dev_latest_lk,
     _devid_cache, _DEVID_CACHE_TTL,
+    sessions, sessions_lock, next_serial,
+    fence_device_inside, _fence_lock, FENCE_DEBOUNCE_N,
+    fence_device_pending, fence_device_enter_time, fence_device_dwell_alarmed,
+    _alarm_last_ts, _alarm_last_ts_lock, _ALARM_DEBOUNCE_SEC,
 )
+from core.extensions import socketio
+from common.geometry import _is_inside_fence
 
 log = logging.getLogger(__name__)
 
@@ -293,3 +306,521 @@ def _record_attendance(fence_id, fence_name, phone, action, event_time):
         )
     except Exception as e:
         log.error("[考勤] 记录失败: %s", e)
+
+
+# ── 客户链解析 / Socket.IO 推送 ───────────────────────────────────────────────
+
+def _customer_ancestors(cid):
+    """返回客户 cid 及其所有上级客户 id（上级能看下级设备，故推送要覆盖整条链）"""
+    result = []
+    seen = set()
+    cur = cid
+    while cur and cur not in seen:
+        seen.add(cur)
+        result.append(cur)
+        row = db_query_one("SELECT parent_id FROM customer WHERE id=?", (cur,))
+        cur = row.get('parent_id') if row else None
+    return result
+
+def _sio_emit(event: str, data: dict, phone: str):
+    """
+    推送 Socket.IO 事件：
+    - 管理员/超管：按设备 org_id 推到 org_{id} 房间 + broadcast（超管）
+    - 客户：只推到设备归属客户及其上级客户的 cust_{id} 房间（严格按 customer 隔离，
+      不再按 org 广播，避免同组织其他客户收到不属于自己的设备轨迹）
+    """
+    # customer_id 会随绑定变化，实时查库不缓存；org_id 用缓存
+    row = db_query_one("SELECT org_id, customer_id FROM device WHERE phone=?", (phone,))
+    org_id = int(row.get('org_id') or 1) if row else 1
+    cid    = row.get('customer_id') if row else None
+    socketio.emit(event, data, room=f'org_{org_id}')   # 该组织管理员
+    socketio.emit(event, data, room='broadcast')        # 超级管理员
+    # 归属客户及其上级客户
+    if cid:
+        for c in _customer_ancestors(cid):
+            socketio.emit(event, data, room=f'cust_{c}')
+
+
+# ── 电子围栏：穿越检测 ────────────────────────────────────────────────────────
+
+def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, status_flag=0):
+    """
+    每次收到 0x0200 位置报文后调用。
+    P1: GPS质量过滤 → P2: 时间窗口过滤 → P0: 防抖确认 → 进/出/滞留超时/围栏超速告警
+
+    alarm_type 约定:
+      100 = 进入围栏   101 = 离开围栏
+      102 = 停留超时   103 = 围栏内超速
+    """
+    import json as _json
+    from datetime import datetime as _dt, time as _time
+
+    # ── P1: GPS 质量过滤 ──────────────────────────────────────────────────────
+    # JT/T 808 status_flag bit1: 0=未定位, 1=已定位；(0,0) 坐标也视为无效
+    if (lat == 0 and lng == 0) or not (status_flag & 0x02):
+        return
+
+    # 查询该设备关联的所有围栏（devices 字段是逗号分隔的 phone 列表）
+    fences = db_query(
+        """SELECT id, name, fence_type, lat, lng, radius, coordinates,
+                  COALESCE(alarm_enter,1)   alarm_enter,
+                  COALESCE(alarm_exit,1)    alarm_exit,
+                  COALESCE(alarm_dwell,0)   alarm_dwell,
+                  COALESCE(speed_limit,0)   speed_limit,
+                  COALESCE(valid_start,'')  valid_start,
+                  COALESCE(valid_end,'')    valid_end
+           FROM geo_fence
+           WHERE devices = ?
+              OR devices LIKE ?
+              OR devices LIKE ?
+              OR devices LIKE ?""",
+        (phone, f'{phone},%', f'%,{phone}', f'%,{phone},%')
+    )
+    if not fences:
+        return
+
+    now_ts    = _dt.now()
+    now_time  = now_ts.time()
+    speed_kmh = speed_raw / 10.0          # 808 协议单位 → km/h
+
+    # 收集需要在锁外执行的告警动作（db_exec/emit 不能在锁内调用，避免死锁）
+    _alarm_actions = []   # list of callables
+    _attend_actions = []  # list of (fence_id, fence_name, action)
+
+    with _fence_lock:
+        prev_inside = set(fence_device_inside.get(phone, set()))
+        new_inside  = set()
+
+        for f in fences:
+            fid = f['id']
+
+            # ── P2: 生效时间段过滤 ─────────────────────────────────────────────
+            vs = (f['valid_start'] or '').strip()
+            ve = (f['valid_end']   or '').strip()
+            if vs and ve:
+                try:
+                    if not (_time.fromisoformat(vs) <= now_time <= _time.fromisoformat(ve)):
+                        # 不在生效时段：保持原确认状态，不触发任何告警
+                        if fid in prev_inside:
+                            new_inside.add(fid)
+                        continue
+                except ValueError:
+                    pass  # 时间格式非法则不过滤
+
+            # 当前点位是否在围栏内
+            currently_inside = _is_inside_fence(lat, lng, f)
+
+            # ── P0: 防抖 - 连续 FENCE_DEBOUNCE_N 次同状态才确认切换 ────────────
+            pending = fence_device_pending.setdefault(phone, {})
+            prev_state, count = pending.get(fid, (None, 0))
+            if prev_state == currently_inside:
+                count += 1
+            else:
+                count = 1
+            pending[fid] = (currently_inside, count)
+
+            was_inside = fid in prev_inside
+
+            # 防抖未达标：保持原确认状态，继续积累
+            if count < FENCE_DEBOUNCE_N:
+                if was_inside:
+                    new_inside.add(fid)
+                continue
+
+            # ── 防抖通过，以 currently_inside 为新确认状态 ──────────────────────
+            confirmed_inside = currently_inside
+            if confirmed_inside:
+                new_inside.add(fid)
+
+            # ── 状态刚切换：进入围栏 ──────────────────────────────────────────
+            if confirmed_inside and not was_inside:
+                if f['alarm_enter']:
+                    desc = f'进入围栏: {f["name"]}'
+                    _f = dict(f)  # 捕获当前围栏快照，避免闭包引用循环变量
+                    _alarm_actions.append(('enter', device_id, phone, 100, desc, lat, lng, speed_raw, gps_time, _f))
+                    log.info("[围栏] %s 进入围栏「%s」", phone, f['name'])
+                # 考勤记录（独立于报警开关，进出都记）
+                _attend_actions.append((f['id'], f['name'], 'enter'))
+                # 记录进入时刻，重置滞留告警标记
+                fence_device_enter_time.setdefault(phone, {})[fid] = now_ts
+                fence_device_dwell_alarmed.get(phone, set()).discard(fid)
+
+            # ── 状态刚切换：离开围栏 ──────────────────────────────────────────
+            elif not confirmed_inside and was_inside:
+                if f['alarm_exit']:
+                    desc = f'离开围栏: {f["name"]}'
+                    _f = dict(f)
+                    _alarm_actions.append(('exit', device_id, phone, 101, desc, lat, lng, speed_raw, gps_time, _f))
+                    log.info("[围栏] %s 离开围栏「%s」", phone, f['name'])
+                # 考勤记录（独立于报警开关，进出都记）
+                _attend_actions.append((f['id'], f['name'], 'exit'))
+                # 清除进入时刻和滞留告警标记
+                fence_device_enter_time.get(phone, {}).pop(fid, None)
+                fence_device_dwell_alarmed.get(phone, set()).discard(fid)
+
+            # ── 持续在围栏内：检查滞留超时 & 围栏超速 ────────────────────────
+            elif confirmed_inside and was_inside:
+                # P1: 停留超时
+                dwell_limit = f['alarm_dwell']   # 秒, 0=关闭
+                if dwell_limit > 0:
+                    enter_t = fence_device_enter_time.get(phone, {}).get(fid)
+                    if enter_t:
+                        elapsed = (now_ts - enter_t).total_seconds()
+                        if elapsed > dwell_limit:
+                            already = fid in fence_device_dwell_alarmed.get(phone, set())
+                            if not already:
+                                mins = int(elapsed // 60)
+                                desc = f'停留超时: {f["name"]}（已停留{mins}分钟）'
+                                _f = dict(f)
+                                _alarm_actions.append(('dwell', device_id, phone, 102, desc, lat, lng, speed_raw, gps_time, _f))
+                                fence_device_dwell_alarmed.setdefault(phone, set()).add(fid)
+                                log.info("[围栏] %s 在「%s」停留超时 %.0f秒", phone, f['name'], elapsed)
+
+                # P2: 围栏内超速（每报文都检查，不去重——驾驶员应持续收到超速提示）
+                speed_lim = f['speed_limit']     # km/h, 0=关闭
+                if speed_lim > 0 and speed_kmh > speed_lim:
+                    desc = f'围栏内超速: {f["name"]}（{speed_kmh:.1f}km/h，限{speed_lim}km/h）'
+                    _f = dict(f)
+                    _alarm_actions.append(('speed', device_id, phone, 103, desc, lat, lng, speed_raw, gps_time, _f))
+                    log.info("[围栏] %s 围栏「%s」超速 %.1f>%dkm/h", phone, f['name'], speed_kmh, speed_lim)
+
+        fence_device_inside[phone] = new_inside
+
+    # ── 锁外执行 DB 写入和 Socket 推送（避免在锁内调用 IO 操作） ──────────────
+    for act in _alarm_actions:
+        _kind, _did, _ph, _atype, _desc, _lat, _lng, _spd, _gt, _f = act
+        db_exec(
+            "INSERT INTO alarm_record (device_id,phone,alarm_type,alarm_desc,"
+            "lat,lng,speed,alarm_time,status) VALUES (?,?,?,?,?,?,?,?,0)",
+            (_did, _ph, _atype, _desc, _lat, _lng, _spd, _gt)
+        )
+        _emit_alarm('alarm', {
+            'phone': _ph, 'alarmType': _atype, 'alarmDesc': _desc,
+            'lat': _lat, 'lng': _lng, 'time': _gt, 'fenceName': _f['name'],
+        }, _ph, _atype)
+    for _fid, _fname, _action in _attend_actions:
+        _record_attendance(_fid, _fname, phone, _action, gps_time)
+
+
+# ── 808 消息处理函数 ────────────────────────────────────────────────────────────
+
+ALARM_DEFS = [
+    (0,  'SOS 紧急报警'),
+    (1,  '超速报警'),
+    (2,  '疲劳驾驶报警'),
+    (8,  '主电源断开'),
+    (25, '碰撞报警'),
+    (26, '侧翻报警'),
+]
+
+
+def _emit_alarm(event, data, phone, alarm_type):
+    """按报警规则决定是否推送到前端；附带 level/ringType 供前端提示。
+    规则关闭则完全静默（不推送）。按设备所属组织取规则。"""
+    dev = db_query_one("SELECT org_id FROM device WHERE phone=?", (phone,))
+    org_id = (dev.get('org_id') if dev else 1) or 1
+    rule = _get_alarm_rule(alarm_type, org_id)
+    if not rule.get('enabled', 1):
+        return   # 该类报警已被规则关闭
+    if rule.get('notify_page', 1):
+        data = dict(data)
+        data['level']    = rule.get('level', '普通级别')
+        data['ringType'] = rule.get('ring_type', '响几声')
+        _sio_emit(event, data, phone)
+    # 短信推送：记录消耗（真实短信网关需另接），此处累加已用条数
+    if rule.get('notify_sms', 0):
+        try:
+            db_exec("UPDATE platform_setting SET sms_used=sms_used+1 WHERE org_id=1 AND sms_enabled=1")
+        except Exception:
+            pass
+
+
+def handle_register(sock, phone, serial, body):
+    info      = p.parse_register_body(body)
+    auth_code = uuid.uuid4().hex[:8].upper()
+    now       = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # 若 plate_no 字段携带了完整 IMEI（15 位纯数字），以 IMEI 作为设备标识
+    plate_no_raw = info.get('plate_no', '') or ''
+    if len(plate_no_raw) == 15 and plate_no_raw.isdigit():
+        canonical_phone = plate_no_raw      # 用完整 IMEI 作为 phone
+        plate_no_store  = ''               # plate_no 字段留空
+    else:
+        canonical_phone = resolve_phone(phone)
+        plate_no_store  = plate_no_raw
+
+    existing = db_query_one("SELECT id FROM device WHERE phone=?", (canonical_phone,))
+    if existing:
+        db_exec(
+            "UPDATE device SET manufacturer=?,terminal_model=?,terminal_id=?,"
+            "plate_no=?,plate_color=?,auth_code=?,updated_at=? WHERE phone=?",
+            (info.get('manufacturer'), info.get('terminal_model'), info.get('terminal_id'),
+             plate_no_store, info.get('plate_color'), auth_code, now, canonical_phone)
+        )
+    else:
+        # org_id 显式写 1（根组织）；管理员可在设备管理界面手动迁移到子组织
+        db_exec(
+            "INSERT INTO device (phone,manufacturer,terminal_model,terminal_id,"
+            "plate_no,plate_color,auth_code,status,org_id) VALUES (?,?,?,?,?,?,?,0,1)",
+            (canonical_phone, info.get('manufacturer'), info.get('terminal_model'),
+             info.get('terminal_id'), plate_no_store, info.get('plate_color'), auth_code)
+        )
+
+    resp = p.build_register_resp(phone, next_serial(), serial, 0, auth_code)
+    sock.sendall(resp)
+    log.info("[808] 终端注册: phone=%s canonical=%s auth_code=%s", phone, canonical_phone, auth_code)
+
+
+def handle_auth(sock, phone, serial, body):
+    code_len  = body[0] if body else 0
+    auth_code = body[1:1 + code_len].decode('ascii', errors='replace') if len(body) > 1 else ''
+
+    canonical = resolve_phone(phone)
+    row = db_query_one("SELECT id, auth_code, status FROM device WHERE phone=?", (canonical,))
+    # 严格比对鉴权码，不允许万能 DEFAULT 绕过
+    auth_ok = row and row.get('auth_code') == auth_code
+    if auth_ok:
+        # 先应答设备（不被数据库写锁阻塞，避免高并发下设备超时断连），再异步更新状态
+        sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0102, 0))
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        db_exec("UPDATE device SET status=1, online_time=? WHERE phone=?", (now, canonical))
+        log.info("[808] 鉴权成功: phone=%s", canonical)
+    else:
+        log.warning("[808] 鉴权失败断开连接 phone=%s auth=%s", canonical, auth_code)
+        # 鉴权失败：从 sessions 中删除，防止未鉴权设备被下发指令
+        with sessions_lock:
+            sessions.pop(canonical, None)
+        sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0102, 1))
+        return 'close'
+
+
+def handle_heartbeat(sock, phone, serial):
+    canonical = resolve_phone(phone)
+    # 先回心跳应答再更新状态，避免应答被数据库写锁阻塞
+    sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0002, 0))
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    db_exec("UPDATE device SET status=1, online_time=? WHERE phone=?", (now, canonical))
+    log.debug("[808] 心跳: phone=%s", canonical)
+
+
+def handle_location(sock, phone, serial, body):
+    loc = p.parse_location_body(body)
+    if loc is None:
+        log.error("[808] 位置解析失败: phone=%s body_len=%d", phone, len(body))
+        return
+
+    canonical  = resolve_phone(phone)
+    lat        = loc['lat']
+    lng        = loc['lng']
+    speed      = loc['speed']
+    direction  = loc['direction']
+    altitude   = loc['altitude']
+    alarm_flag  = loc['alarm_flag']
+    status_flag = loc['status_flag']    # bit1=1 表示已定位，围栏检测用
+    _gt = loc.get('gps_time')
+    gps_time = (_gt.strftime('%Y-%m-%d %H:%M:%S')
+                if _gt else datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    mileage     = loc.get('mileage')
+
+    # GPS 字段合理性校验
+    if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+        log.warning("[808] 非法坐标丢弃 phone=%s lat=%s lng=%s", phone, lat, lng)
+        return
+    speed = min(max(speed, 0), 5000)   # 限速 5000 km/h（合理上限）
+    direction = int(direction) % 360   # 方向截断到 0-359
+
+    device_id = _get_device_id(canonical)   # 缓存查询，免每次上报查库
+
+    # 位置记录 + 设备最新状态：异步批量落库（削减写锁争用，大幅降低上报延迟）
+    status = 2 if alarm_flag else 1
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    enqueue_location(
+        (device_id, canonical, lat, lng, altitude, speed, direction,
+         alarm_flag, loc['status_flag'], mileage, gps_time),
+        (canonical, lat, lng, speed, gps_time, status, now)
+    )
+
+    # 处理报警（使用 canonical phone，与 device 表保持一致）
+    if alarm_flag:
+        import time as _t
+        for bit, desc in ALARM_DEFS:
+            if alarm_flag & (1 << bit):
+                _alarm_key = (canonical, bit)
+                _now_ts = _t.time()
+                with _alarm_last_ts_lock:
+                    last_ts = _alarm_last_ts.get(_alarm_key, 0)
+                    if _now_ts - last_ts >= _ALARM_DEBOUNCE_SEC:
+                        _alarm_last_ts[_alarm_key] = _now_ts
+                        should_alarm = True
+                    else:
+                        should_alarm = False
+                if should_alarm:
+                    db_exec(
+                        "INSERT INTO alarm_record (device_id,phone,alarm_type,alarm_desc,"
+                        "lat,lng,speed,alarm_time,status) VALUES (?,?,?,?,?,?,?,?,0)",
+                        (device_id, canonical, bit, desc, lat, lng, speed, gps_time)
+                    )
+                    log.warning("[808] 报警! phone=%s type=%d desc=%s", phone, bit, desc)
+                    _emit_alarm('alarm', {
+                        'phone':     canonical,
+                        'alarmType': bit,
+                        'alarmDesc': desc,
+                        'lat':       lat,
+                        'lng':       lng,
+                        'time':      gps_time,
+                    }, canonical, bit)
+
+    # 查该设备的角色颜色/形状，随推送带给前端地图渲染
+    role_row = db_query_one(
+        "SELECT r.name AS role_name, r.color AS role_color, r.icon_type AS role_icon "
+        "FROM device LEFT JOIN device_role r ON device.role_id = r.id WHERE device.phone=?",
+        (canonical,))
+    role_name  = role_row.get('role_name')  if role_row else None
+    role_color = role_row.get('role_color') if role_row else None
+    role_icon  = role_row.get('role_icon')  if role_row else None
+
+    # WebSocket 推送位置到前端（仅向该设备所属组织的客户端推送）
+    _sio_emit('location_update', {
+        'phone':     canonical,
+        'lat':       lat,
+        'lng':       lng,
+        'speed':     round(speed / 10.0, 1),
+        'direction': direction,
+        'altitude':  altitude,
+        'alarm':     bool(alarm_flag),
+        'alarmFlag': alarm_flag,
+        'time':      gps_time,
+        'roleName':  role_name,
+        'roleColor': role_color,
+        'roleIcon':  role_icon,
+    }, canonical)
+
+    log.debug("[808] 位置: phone=%s lat=%.6f lng=%.6f speed=%.1fkm/h alarm=%d",
+              phone, lat, lng, speed / 10.0, alarm_flag)
+
+    # ── 电子围栏穿越检测 ──────────────────────────────────────────────────────
+    try:
+        check_fence_crossing(canonical, lat, lng, device_id, gps_time,
+                              speed_raw=speed, status_flag=status_flag)
+    except Exception as e:
+        log.error("[围栏检测] 异常: %s", e)
+
+    # 应答
+    sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0200, 0))
+
+
+def handle_g618g_frame(conn, frame, phone_holder):
+    """处理一个 G618G 上报帧：解析并落库。phone_holder 是 [phone] 单元素列表（可变引用）。"""
+    r = g618.parse(frame)
+    typ = r.get('type')
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    if typ == 'register':          # 0xF0 建立连接：记录 IMEI、回复 F1、登记会话
+        imei = r.get('imei')
+        phone_holder[0] = imei
+        with sessions_lock:
+            sessions[imei] = conn
+        # 设备不存在则自动创建
+        row = db_query_one("SELECT id FROM device WHERE phone=?", (imei,))
+        if not row:
+            db_exec("INSERT INTO device (phone,name,manufacturer,terminal_model,status,"
+                    "org_id,lifecycle,created_at,updated_at) VALUES (?,?,?,?,1,1,1,?,?)",
+                    (imei, 'G618G-'+imei[-6:], 'OFERT', 'G618G', now, now))
+        else:
+            db_exec("UPDATE device SET status=1,online_time=?,updated_at=? WHERE phone=?", (now, now, imei))
+        # 回复 F1（时间戳用当前秒）
+        import time as _t
+        conn.sendall(g618.build_login_reply(int(_t.time())))
+        log.info("[G618G] 设备上线 IMEI=%s", imei)
+
+    elif typ == 'heartbeat':       # 0xF9 心跳：回复保持连接 + 更新电量
+        conn.sendall(g618.build_heartbeat_reply())
+        imei = phone_holder[0]
+        if imei:
+            db_exec("UPDATE device SET updated_at=? WHERE phone=?", (now, imei))
+
+    elif typ == 'location':        # 0x03 位置：更新设备最新位置 + 写轨迹（走异步批量）
+        imei = phone_holder[0]
+        if imei and r.get('valid'):
+            _lat = r.get('lat', 0)
+            _lng = r.get('lng', 0)
+            if not (math.isfinite(_lat) and math.isfinite(_lng)):
+                log.warning("[G618G] NaN/Inf 坐标丢弃 phone=%s", imei)
+                return typ
+            if not (-90 <= _lat <= 90) or not (-180 <= _lng <= 180):
+                log.warning("[G618G] 非法坐标丢弃 phone=%s lat=%s lng=%s", imei, _lat, _lng)
+                return typ
+            gps_time = datetime.fromtimestamp(r['timestamp']).strftime('%Y-%m-%d %H:%M:%S') if r.get('timestamp') else now
+            did = _get_device_id(imei)
+            enqueue_location(
+                (did, imei, r['lat'], r['lng'], 0, 0, 0, 0, 2, None, gps_time),
+                (imei, r['lat'], r['lng'], 0, gps_time, 1, now)
+            )
+
+    elif typ in ('alarm', 'alarm2'):   # 0x02/0x21 报警
+        imei = phone_holder[0]
+        if imei:
+            did = _get_device_id(imei)
+            desc = '、'.join(r.get('alarms') or ['报警'])
+            db_exec("INSERT INTO alarm_record (device_id,phone,alarm_type,alarm_desc,alarm_time,status) "
+                    "VALUES (?,?,?,?,?,0)", (did, imei, r.get('warn_bits', 0), desc, now))
+            has_sos = any('SOS' in a for a in (r.get('alarms') or []))
+            _emit_alarm('alarm', {'phone': imei, 'alarmDesc': desc, 'time': now},
+                        imei, 0 if has_sos else 99)
+
+    elif typ == 'iccid':           # 0xF3 SIM ICCID
+        imei = phone_holder[0]
+        if imei:
+            db_exec("UPDATE device SET remark=? WHERE phone=?", ('ICCID:'+r['iccid'], imei))
+
+    elif typ == 'charge':          # 0xC3 充电状态
+        pass   # 可扩展：记录充电事件
+
+    elif typ == 'wifi_lbs':        # 0xA4 WiFi+基站：调第三方服务换算经纬度后落库
+        imei = phone_holder[0]
+        if imei:
+            ts = r.get('timestamp')
+            gps_time = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else now
+            # 优先 WiFi 定位，其次基站定位；未配置 AMAP_KEY 时 resolve 返回 None
+            fix = None
+            if geo_resolve.enabled():
+                fix = geo_resolve.resolve_wifi(r.get('wifis') or []) \
+                      or geo_resolve.resolve_lbs(r.get('cells') or [])
+            if fix:
+                did = _get_device_id(imei)
+                # loc_type: 3=WiFi, 4=基站(区别于 GPS=2)
+                loc_type = 3 if fix['source'] == 'wifi' else 4
+                enqueue_location(
+                    (did, imei, fix['lat'], fix['lng'], 0, 0, 0, 0, loc_type, None, gps_time),
+                    (imei, fix['lat'], fix['lng'], 0, gps_time, 1, now)
+                )
+            else:
+                # 未配 Key 或换算失败：仅调试日志，不落坐标（数据不丢，可后续补算）
+                log.debug("[G618G] WiFi/基站定位未换算 imei=%s wifi=%d cell=%d key=%s",
+                          imei, len(r.get('wifis') or []), len(r.get('cells') or []),
+                          'Y' if geo_resolve.enabled() else 'N')
+
+    elif typ == 'ble':             # 0xD6 蓝牙信标：结构化落库到 beacon_report(坐标靠对照表后补)
+        imei = phone_holder[0]
+        if imei:
+            ts = r.get('timestamp')
+            rt = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else now
+            for b in (r.get('beacons') or []):
+                # 查信标对照表，命中且有坐标则一并记录
+                loc = db_query_one(
+                    "SELECT lat, lng FROM beacon_location WHERE major=? AND minor=?",
+                    (b.get('major'), b.get('minor')))
+                lat = loc['lat'] if loc else None
+                lng = loc['lng'] if loc else None
+                db_exec("INSERT INTO beacon_report (phone,major,minor,rssi,lat,lng,report_time) "
+                        "VALUES (?,?,?,?,?,?,?)",
+                        (imei, b.get('major'), b.get('minor'), b.get('rssi'), lat, lng, rt))
+                # 命中且有坐标：同时更新设备最新位置(定位类型 5=蓝牙信标)
+                if lat is not None and lng is not None:
+                    did = _get_device_id(imei)
+                    enqueue_location(
+                        (did, imei, lat, lng, 0, 0, 0, 0, 5, None, rt),
+                        (imei, lat, lng, 0, rt, 1, now)
+                    )
+
+    return typ
