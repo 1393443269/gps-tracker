@@ -23,8 +23,8 @@ services:
       - PORTAL_SECRET=${PORTAL_SECRET}
       - MQTT_USER=${MQTT_USER}
       - MQTT_PASS=${MQTT_PASS}
-      # 高德 Web 服务 Key（WiFi/基站坐标换算，可选）
-      # - AMAP_KEY=${AMAP_KEY}
+      # 腾讯位置服务 Key（WiFi/基站/蓝牙坐标换算，可选；不配则这类定位不出点）
+      - TENCENT_LBS_KEY=${TENCENT_LBS_KEY:-}
       # 生产必须为 0；本地调试才设为 1
       - DEBUG_MODE=0
     ports:
