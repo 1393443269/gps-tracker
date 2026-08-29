@@ -36,14 +36,20 @@ import { deviceApi, portalApi, isAdmin } from '@/api'
 import { ElNotification, ElMessage } from 'element-plus'
 import { TDT_MAP_STYLE } from '@/utils/mapStyle'
 
+// ── 常量：GeoJSON source / layer 标识 ──────────────────────────────────────────
+const SRC_ID   = 'devices'
+const LAYER_ID = 'devices-circle'
+
 // ── 响应式状态 ────────────────────────────────────────────────────────────────
 const wsConnected  = ref(false)
-const markerStore  = reactive({})  // phone → { marker, popup, info }
+// phone → GeoJSON Point feature（替代原 markerStore，无 DOM Marker）
+// feature.properties 承载渲染 + 面板所需的全部字段
+const featureStore = reactive({})
 const allOnlineDevices = ref([])   // status=1 的全量设备列表
 
-// 合并：有坐标的来自 markerStore，无坐标的来自 allOnlineDevices
+// 合并：有坐标的来自 featureStore(feature.properties)，无坐标的来自 allOnlineDevices
 const onlineDevices = computed(() => {
-  const withLoc = Object.values(markerStore).map(v => ({ ...v.info, hasLoc: true }))
+  const withLoc = Object.values(featureStore).map(f => ({ ...f.properties, hasLoc: true }))
   const phones  = new Set(withLoc.map(d => d.phone))
   const noLoc   = allOnlineDevices.value
     .filter(d => !phones.has(String(d.phone)))
@@ -52,35 +58,20 @@ const onlineDevices = computed(() => {
   return [...withLoc, ...noLoc]
 })
 
-const deviceList = computed(() => Object.values(markerStore).map(v => v.info))
+const deviceList = computed(() => Object.values(featureStore).map(f => f.properties))
 
 let map
 let socket
+let popup           // 单个可复用 popup，点击设备点时按需展示
 let onlineTimer = null
 
-// ── 标记元素（按角色颜色+形状渲染，报警时红色高亮） ─────────────────────────────
-function applyMarkerStyle(el, info) {
-  const alarm = info.alarm
-  // 报警时统一红色高亮；否则用角色颜色，无角色回落默认蓝
-  const color = alarm ? '#f56c6c' : (info.roleColor || '#409eff')
-  const shape = info.roleIcon || '圆形'
-  el.className = alarm ? 'dev-marker dev-marker-alarm' : 'dev-marker'
-  const css = [
-    'width:14px', 'height:14px',
-    `background:${color}`, 'border:2px solid #fff',
-    'box-shadow:0 0 6px rgba(0,0,0,.4)', 'cursor:pointer',
-    'clip-path:none', 'border-radius:0',
-  ]
-  // 菱形/星形用 clip-path（不用 transform:rotate——会被 maplibre 定位的 transform 覆盖）
-  if (shape === '圆形')      css.push('border-radius:50%')
-  else if (shape === '菱形') css.push('clip-path:polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)')
-  else if (shape === '星形') css.push('clip-path:polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%)')
-  else                       css.push('border-radius:2px')  // 方形
-  el.style.cssText = css.join(';')
-  return el
+// ── 颜色/半径：data-driven paint 会读取 properties.color / properties.radius ─────
+// 报警时统一红色高亮并放大；否则用角色颜色，无角色回落默认蓝
+function markerColor(info) {
+  return info.alarm ? '#f56c6c' : (info.roleColor || '#409eff')
 }
-function makeMarkerEl(info) {
-  return applyMarkerStyle(document.createElement('div'), info)
+function markerRadius(info) {
+  return info.alarm ? 9 : 7
 }
 
 // HTML 转义，防止 XSS（phone/time 等字段来自服务端）
@@ -101,54 +92,71 @@ function popupHtml(info) {
     ${info.alarm ? '<span style="color:red;">⚠ 报警中</span>' : '正常'}`
 }
 
-// ── 更新/新建标记 ─────────────────────────────────────────────────────────────
-function updateMarker(info) {
-  const { phone, lat, lng } = info
-  if (!lat || !lng) return
+// ── 构建单个设备的 GeoJSON feature（properties 含渲染 + 面板字段） ───────────────
+function makeFeature(info) {
+  const props = {
+    ...info,
+    phone: String(info.phone),
+    color:  markerColor(info),
+    radius: markerRadius(info),
+    // 报警标志，供 paint 表达式做描边/动画区分（circle 无法做形状，用颜色+大小近似）
+    alarmFlag: info.alarm ? 1 : 0,
+  }
+  return {
+    type: 'Feature',
+    geometry: { type: 'Point', coordinates: [info.lng, info.lat] },
+    properties: props,
+  }
+}
 
-  if (markerStore[phone]) {
-    const { marker, popup } = markerStore[phone]
-    const prev = markerStore[phone].info || {}
+// ── 把 featureStore 全量刷进 source（setData 整个 FeatureCollection） ────────────
+function refreshSource() {
+  const src = map && map.getSource(SRC_ID)
+  if (!src) return
+  src.setData({
+    type: 'FeatureCollection',
+    features: Object.values(featureStore),
+  })
+}
+
+// ── 更新/新建设备点（替代原 updateMarker，写内存映射后刷 source） ────────────────
+function updateFeature(info, { refresh = true } = {}) {
+  const { lat, lng } = info
+  if (!lat || !lng) return
+  const phone = String(info.phone)
+
+  if (featureStore[phone]) {
+    const prev = featureStore[phone].properties || {}
     // 合并：新推送可能不含角色字段（如报警事件），沿用已有的
     const merged = {
-      ...prev, ...info,
+      ...prev, ...info, phone,
       name:      info.name      ?? prev.name      ?? '',
       roleName:  info.roleName  ?? prev.roleName,
       roleColor: info.roleColor ?? prev.roleColor,
       roleIcon:  info.roleIcon  ?? prev.roleIcon,
     }
-    marker.setLngLat([lng, lat])
-    applyMarkerStyle(marker.getElement(), merged)   // 按角色颜色+形状重绘
-    popup.setHTML(popupHtml(merged))
-    markerStore[phone].info = merged
+    featureStore[phone] = makeFeature(merged)
   } else {
-    const popup = new maplibregl.Popup({ closeButton: true, maxWidth: '240px' })
-      .setHTML(popupHtml(info))
-
-    const marker = new maplibregl.Marker({ element: makeMarkerEl(info) })
-      .setLngLat([lng, lat])
-      .setPopup(popup)
-      .addTo(map)
-
-    markerStore[phone] = { marker, popup, info: { ...info } }
+    featureStore[phone] = makeFeature({ ...info, phone })
   }
+
+  if (refresh) refreshSource()
 }
 
-// ── 清理离线设备的标记（对比在线 phone 集合，移除不在集合内的 marker） ──────────
-function pruneMarkers(onlinePhones) {
+// ── 清理离线设备（对比在线 phone 集合，移除不在集合内的 feature，保留原清理语义） ──
+function pruneFeatures(onlinePhones) {
   const keep = new Set([...onlinePhones].map(p => String(p)))
-  for (const ph of Object.keys(markerStore)) {
+  for (const ph of Object.keys(featureStore)) {
     if (!keep.has(String(ph))) {
-      markerStore[ph].marker.remove()
-      delete markerStore[ph]
+      delete featureStore[ph]
     }
   }
 }
 
 function flyTo(phone) {
-  const item = markerStore[phone]
-  if (item) {
-    map.flyTo({ center: [item.info.lng, item.info.lat], zoom: 15 })
+  const f = featureStore[String(phone)]
+  if (f) {
+    map.flyTo({ center: f.geometry.coordinates, zoom: 15 })
   }
 }
 
@@ -164,7 +172,7 @@ async function loadInitialPositions() {
     for (const d of records) {
       if (d.last_lat && d.last_lng) {
         locatedPhones.add(String(d.phone))
-        updateMarker({
+        updateFeature({
           phone: d.phone,
           name:  d.name || '',
           lat:   d.last_lat,
@@ -175,17 +183,19 @@ async function loadInitialPositions() {
           roleName:  d.role_name,
           roleColor: d.role_color,
           roleIcon:  d.role_icon,
-        })
+        }, { refresh: false })
       }
     }
-    // 移除已离线（不再返回坐标）设备的标记，避免 markerStore 无限增长
-    pruneMarkers(locatedPhones)
+    // 移除已离线（不再返回坐标）设备的点，避免 featureStore 无限增长
+    pruneFeatures(locatedPhones)
+    // 全量刷一次 source（批量加载时避免逐点 setData）
+    refreshSource()
   } catch (e) {
     console.warn('[RealtimeMap] 初始位置加载失败:', e)
   }
 }
 
-// ── 在线设备列表刷新（不更新地图标记，只刷新面板） ───────────────────────────────
+// ── 在线设备列表刷新（不更新地图点，只刷新面板） ─────────────────────────────────
 async function loadOnlineDevices() {
   try {
     const res = isAdmin()
@@ -195,6 +205,48 @@ async function loadOnlineDevices() {
   } catch (e) {
     console.warn('[RealtimeMap] 在线设备列表刷新失败:', e)
   }
+}
+
+// ── 地图 source / layer / 交互初始化 ────────────────────────────────────────────
+function initDeviceLayer() {
+  // 空的 FeatureCollection source，后续 setData 增量刷新
+  map.addSource(SRC_ID, {
+    type: 'geojson',
+    data: { type: 'FeatureCollection', features: [] },
+  })
+
+  // circle layer：颜色/半径用 data-driven 表达式按设备属性区分（在线/报警/角色色）
+  map.addLayer({
+    id: LAYER_ID,
+    type: 'circle',
+    source: SRC_ID,
+    paint: {
+      'circle-color': ['get', 'color'],
+      'circle-radius': ['coalesce', ['get', 'radius'], 7],
+      'circle-stroke-width': 2,
+      // 报警点白描边加粗高亮（circle 做不了形状，用颜色+大小+描边近似原形状区分）
+      'circle-stroke-color': ['case', ['==', ['get', 'alarmFlag'], 1], '#ffffff', '#ffffff'],
+      'circle-opacity': 0.95,
+    },
+  })
+
+  // 可复用 popup（点击时按需展示，不再每设备常驻 DOM popup）
+  popup = new maplibregl.Popup({ closeButton: true, maxWidth: '240px' })
+
+  // 点击设备点 → 弹 popup 显示详情
+  map.on('click', LAYER_ID, (e) => {
+    const feat = e.features && e.features[0]
+    if (!feat) return
+    const info = feat.properties || {}
+    popup
+      .setLngLat(feat.geometry.coordinates)
+      .setHTML(popupHtml(info))
+      .addTo(map)
+  })
+
+  // hover：鼠标样式区分可点击的设备点
+  map.on('mouseenter', LAYER_ID, () => { map.getCanvas().style.cursor = 'pointer' })
+  map.on('mouseleave', LAYER_ID, () => { map.getCanvas().style.cursor = '' })
 }
 
 // ── Socket.IO ─────────────────────────────────────────────────────────────────
@@ -214,7 +266,8 @@ function connectSocket() {
   })
 
   socket.on('location_update', (data) => {
-    updateMarker({
+    // 更新对应 feature 的坐标和属性，再 setData 整个 FeatureCollection
+    updateFeature({
       phone: data.phone,
       lat:   data.lat,
       lng:   data.lng,
@@ -251,6 +304,7 @@ onMounted(async () => {
 
     await new Promise(r => map.once('load', r))
 
+    initDeviceLayer()
     await loadInitialPositions()
     connectSocket()
     // 每 15 秒刷新在线设备列表（面板实时显示无坐标设备）
@@ -269,18 +323,16 @@ onUnmounted(() => {
     socket.disconnect()
     socket = null
   }
+  // 清理 popup（GeoJSON 方案下无 DOM Marker，泄漏问题自然消失）
+  if (popup) {
+    popup.remove()
+    popup = null
+  }
+  // map.remove() 会一并销毁 source/layer 及其绑定的事件监听
   map?.remove()
+  map = null
 })
 </script>
-
-<!-- 非 scoped：marker 元素是 JS 动态创建的 DOM，scoped 选择器匹配不到 -->
-<style>
-@keyframes pulse {
-  0%, 100% { box-shadow: 0 0 4px rgba(245,108,108,.5); }
-  50%       { box-shadow: 0 0 14px rgba(245,108,108,.9); }
-}
-.dev-marker-alarm { animation: pulse 1s infinite; }
-</style>
 
 <style scoped>
 .device-panel {
