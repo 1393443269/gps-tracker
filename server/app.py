@@ -278,6 +278,17 @@ def init_db():
         created_at  TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
     );
 
+    -- 围栏↔设备关联表(查询加速层)：与 geo_fence.devices 逗号串并存双写。
+    -- devices 字段仍是唯一真相源、UI/兼容查询继续依赖；本表仅用于消除
+    -- ingest 每帧热路径 "devices LIKE '%phone%'" 的前导通配全表扫，走
+    -- idx_fence_device_phone 等值索引。任何改 devices 处必须同步此表。
+    CREATE TABLE IF NOT EXISTS fence_device (
+        fence_id INTEGER NOT NULL,
+        phone    TEXT    NOT NULL,
+        PRIMARY KEY (fence_id, phone)
+    );
+    CREATE INDEX IF NOT EXISTS idx_fence_device_phone ON fence_device(phone);
+
     CREATE TABLE IF NOT EXISTS mark_point (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         name       TEXT NOT NULL,
@@ -637,6 +648,24 @@ def init_db():
         conn.commit()
     except Exception:
         pass
+
+    # ── fence_device 存量回填 ────────────────────────────────────────────────
+    # 把现有 geo_fence.devices 逗号串拆开灌进关联表。INSERT OR IGNORE 幂等：
+    # 主键 (fence_id, phone) 去重，重启多次不会产生重复行，也不覆盖已双写数据。
+    try:
+        _rows = conn.execute("SELECT id, devices FROM geo_fence").fetchall()
+        for _r in _rows:
+            _fid  = _r['id']
+            _devs = _r['devices'] or ''
+            for _ph in _devs.split(','):
+                _ph = _ph.strip()
+                if _ph:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO fence_device (fence_id, phone) VALUES (?,?)",
+                        (_fid, _ph))
+        conn.commit()
+    except Exception:
+        log.exception("fence_device 回填失败(不阻断启动)")
 
     conn.close()
     log.info("数据库初始化完成: %s", DB_PATH)
@@ -2547,6 +2576,30 @@ def delete_customer(cid):
 
 # ── 电子围栏接口 ───────────────────────────────────────────────────────────────
 
+def _sync_fence_devices(fence_id, devices_str, conn=None):
+    """把某围栏的关联设备(fence_device 表)与其 devices 逗号串全量对齐：
+    先删该围栏所有关联行，再按新 devices 逐条 INSERT OR IGNORE。
+    devices 字段仍是真相源，本表是查询加速层——凡改 geo_fence.devices 处均须调用此函数。
+
+    conn 为 None 时走 db_exec(自带 _db_lock，用于未持锁的调用点)；
+    传入 conn 时直接用该连接(调用方已持 _db_lock 并自行 commit，避免 SQLite 重入死锁)。
+    删除围栏(devices_str 传空串/None)时只做清理，等价于清空关联。
+    """
+    phones = [p.strip() for p in (devices_str or '').split(',') if p.strip()]
+    if conn is not None:
+        conn.execute("DELETE FROM fence_device WHERE fence_id=?", (fence_id,))
+        for ph in phones:
+            conn.execute(
+                "INSERT OR IGNORE INTO fence_device (fence_id, phone) VALUES (?,?)",
+                (fence_id, ph))
+    else:
+        db_exec("DELETE FROM fence_device WHERE fence_id=?", (fence_id,))
+        for ph in phones:
+            db_exec(
+                "INSERT OR IGNORE INTO fence_device (fence_id, phone) VALUES (?,?)",
+                (fence_id, ph))
+
+
 @app.get('/api/fences')
 def list_fences():
     name   = request.args.get('name', '').strip()
@@ -2584,6 +2637,7 @@ def create_fence():
     EXTRA_COLS = "alarm_enter,alarm_exit,alarm_dwell,speed_limit,valid_start,valid_end,org_id"
     EXTRA_VALS = (ae, ax, adwl, spdl, vs, ve, admin_org)
 
+    devices_str = d.get('devices', '') or ''
     if fence_type == 'circle':
         # 坐标/半径范围校验:非法值会使围栏永远命中不了(静默失效,进出告警不触发),
         # 必须拦在入库前而非存进去。
@@ -2594,34 +2648,39 @@ def create_fence():
             return fail('圆形围栏需要合法的 lat(-90~90)/lng(-180~180)', 400)
         if radius is None:
             return fail('radius 需为正整数', 400)
-        db_exec(
-            f"INSERT INTO geo_fence (name,fence_type,lat,lng,radius,color,devices,{EXTRA_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (name, 'circle', lat, lng,
-             radius, d.get('color', '#409EFF'), d.get('devices', '')) + EXTRA_VALS
-        )
+        ins_sql = f"INSERT INTO geo_fence (name,fence_type,lat,lng,radius,color,devices,{EXTRA_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ins_params = (name, 'circle', lat, lng,
+                      radius, d.get('color', '#409EFF'), devices_str) + EXTRA_VALS
     elif fence_type == 'polygon':
         coords = d.get('coordinates')
         if not coords:
             return fail('多边形围栏需要 coordinates', 400)
         import json as _json
-        db_exec(
-            f"INSERT INTO geo_fence (name,fence_type,lat,lng,coordinates,color,devices,{EXTRA_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (name, 'polygon', 0.0, 0.0, _json.dumps(coords), d.get('color', '#409EFF'), d.get('devices', '')) + EXTRA_VALS
-        )
+        ins_sql = f"INSERT INTO geo_fence (name,fence_type,lat,lng,coordinates,color,devices,{EXTRA_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ins_params = (name, 'polygon', 0.0, 0.0, _json.dumps(coords), d.get('color', '#409EFF'), devices_str) + EXTRA_VALS
     elif fence_type == 'administrative':
         if not d.get('adcode'):
             return fail('行政区围栏需要 adcode', 400)
         import json as _json
-        db_exec(
-            f"INSERT INTO geo_fence (name,fence_type,lat,lng,adcode,coordinates,color,devices,{EXTRA_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (name, 'administrative', 0.0, 0.0, str(d['adcode']),
-             _json.dumps(d.get('coordinates', [])),
-             d.get('color', '#409EFF'), d.get('devices', '')) + EXTRA_VALS
-        )
+        ins_sql = f"INSERT INTO geo_fence (name,fence_type,lat,lng,adcode,coordinates,color,devices,{EXTRA_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ins_params = (name, 'administrative', 0.0, 0.0, str(d['adcode']),
+                      _json.dumps(d.get('coordinates', [])),
+                      d.get('color', '#409EFF'), devices_str) + EXTRA_VALS
     else:
         return fail('未知围栏类型', 400)
+
+    # 单连接内插入围栏并同步 fence_device：拿到 lastrowid 后在同一 conn(同一锁)双写，
+    # 保证 devices 串与关联表原子对齐，不会出现只写其一的中间态。
+    with _db_lock:
+        conn = get_db()
+        try:
+            new_id = conn.execute(ins_sql, ins_params).lastrowid
+            _sync_fence_devices(new_id, devices_str, conn=conn)
+            conn.commit()
+        finally:
+            conn.close()
     add_op_log('围栏新增', f'新建{fence_type}围栏 {name}')
-    return ok()
+    return ok({'id': new_id})
 
 def _admin_fence_or_none(fid):
     """取管理员有权操作的围栏(本组织范围内的全局围栏 customer_id IS NULL),
@@ -2638,6 +2697,7 @@ def delete_fence(fid):
     row = _admin_fence_or_none(fid)
     if not row: return fail('围栏不存在或无权限', 404)
     db_exec("DELETE FROM geo_fence WHERE id=?", (fid,))
+    _sync_fence_devices(fid, '')   # 双写：清理该围栏在加速表中的关联
     add_op_log('围栏删除', f'删除围栏 {row["name"]}')
     return ok()
 
@@ -2650,6 +2710,7 @@ def update_fence_devices(fid):
     phones = d.get('phones', [])            # 传入手机号数组
     devices_str = ','.join(str(p) for p in phones if p)
     db_exec("UPDATE geo_fence SET devices=? WHERE id=?", (devices_str, fid))
+    _sync_fence_devices(fid, devices_str)   # 双写：全量替换该围栏的关联设备
     add_op_log('围栏关联设备', f'围栏 {row["name"]} 关联 {len(phones)} 台设备')
     return ok()
 
@@ -2671,6 +2732,8 @@ def batch_delete_fences():
         return fail('无可删除的围栏', 404)
     del_ph = ','.join('?' * len(allowed_ids))
     db_exec(f"DELETE FROM geo_fence WHERE id IN ({del_ph})", tuple(allowed_ids))
+    # 双写：清理这些围栏在加速表中的关联
+    db_exec(f"DELETE FROM fence_device WHERE fence_id IN ({del_ph})", tuple(allowed_ids))
     add_op_log('围栏批量删除', f'批量删除 {len(allowed_ids)} 条围栏')
     return ok({'deleted': len(allowed_ids)})
 
@@ -3655,6 +3718,7 @@ def portal_create_fence():
     if not name:
         return fail('围栏名称不能为空', 400)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    devices_str = d.get('devices','') or ''
     with _db_lock:
         conn = get_db()
         try:
@@ -3663,10 +3727,12 @@ def portal_create_fence():
                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (name, d.get('fence_type','circle'), d.get('lat'), d.get('lng'),
                  d.get('radius', 2000), d.get('coordinates'), d.get('color','#409EFF'),
-                 d.get('devices',''), cid, now)
+                 devices_str, cid, now)
             )
+            new_id = cur.lastrowid
+            _sync_fence_devices(new_id, devices_str, conn=conn)   # 双写：同 conn 同步关联表
             conn.commit()
-            return ok({'id': cur.lastrowid})
+            return ok({'id': new_id})
         finally:
             conn.close()
 
@@ -3693,6 +3759,7 @@ def portal_delete_fence(fid):
     if not db_query_one("SELECT id FROM geo_fence WHERE id=? AND customer_id=?", (fid, cid)):
         return fail('无权限或不存在', 404)
     db_exec("DELETE FROM geo_fence WHERE id=?", (fid,))
+    _sync_fence_devices(fid, '')   # 双写：清理该围栏在加速表中的关联
     return ok()
 
 
@@ -3708,7 +3775,9 @@ def portal_fence_devices(fid):
     # 只能关联整个子树的设备（含后代客户）
     my_phones = set(_get_subtree_phones(cid))
     phones = [p for p in phones if p in my_phones]
-    db_exec("UPDATE geo_fence SET devices=? WHERE id=?", (','.join(phones), fid))
+    devices_str = ','.join(phones)
+    db_exec("UPDATE geo_fence SET devices=? WHERE id=?", (devices_str, fid))
+    _sync_fence_devices(fid, devices_str)   # 双写：全量替换该围栏的关联设备
     return ok()
 
 

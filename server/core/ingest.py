@@ -21,13 +21,14 @@ import uuid
 import os
 import socket
 import struct
-from datetime import datetime
+import json as _json_mod
+from datetime import datetime, timedelta
 
 import protocol as p
 import protocol_g618g as g618
 import geo_resolve
 
-from core.db import db_query_one, db_query, db_exec, get_db, _db_lock, DB_BACKEND
+from core.db import db_query_one, db_query, db_exec, get_db, _db_lock, DB_BACKEND, DB_PATH
 import core.db as _dbmod
 from core.state import (
     _loc_queue, _dev_latest, _dev_latest_lk,
@@ -71,60 +72,128 @@ def enqueue_location(loc_row, dev_state):
     with _dev_latest_lk:
         _dev_latest[dev_state[0]] = dev_state
 
-def _batch_writer_loop():
-    """后台线程:每 0.5 秒把队列里的位置记录 + 设备最新状态批量写入。"""
-    while True:
-        _time_mod.sleep(0.5)
-        # 取出本轮位置记录,单批上限 2000 行,超出的留到下轮,避免单次事务过大
-        _BATCH_MAX = 2000
+# ── 优雅停机:全局停止标志 + flush 串行化锁 ──────────────────────────────────
+# _stop_event 由信号处理器 / gunicorn 钩子置位,所有后台循环线程据此优雅退出。
+# _flush_lock 串行化「批量写线程的一轮落库」与「停机 flush」,保证两者不会并发
+# 重复写同一批数据(幂等协调)。
+_stop_event  = threading.Event()
+_flush_lock  = threading.Lock()
+
+# 单批位置上限 2000 行,超出的留到下轮,避免单次事务过大
+_BATCH_MAX = 2000
+
+
+def _dump_deadletter(rows):
+    """落库最终失败时,把这批位置数据序列化写到磁盘死信文件,避免永久丢失。
+    路径沿用 db.py 的数据目录约定(DB_PATH 同级目录),文件名 deadletter_位置_时间戳.jsonl。
+    每行一条位置记录(JSON 数组,列顺序同 INSERT),可事后用脚本读回补写。
+    """
+    if not rows:
+        return
+    try:
+        _data_dir = os.path.dirname(DB_PATH) or '.'
+        os.makedirs(_data_dir, exist_ok=True)
+        _ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        _path = os.path.join(_data_dir, f'deadletter_位置_{_ts}.jsonl')
+        with open(_path, 'w', encoding='utf-8') as _f:
+            for _r in rows:
+                _f.write(_json_mod.dumps(list(_r), ensure_ascii=False, default=str))
+                _f.write('\n')
+        log.critical("[批量写] %d 条位置记录落库失败,已写入死信文件: %s", len(rows), _path)
+    except Exception as _e:
+        # 死信落盘本身失败才真正丢数据——此时至少保留 critical 日志留证
+        log.critical("[批量写] 死信落盘失败(%d 条位置记录彻底丢失!): %s", len(rows), _e)
+
+
+def _do_db_write(rows, dev_snapshot):
+    """把一批位置记录 + 设备最新状态写入数据库(含 3 次重试)。
+    成功返回 True;连续 3 次失败则把 rows 写死信文件后返回 False。
+    批量写线程与停机 flush 共用此函数,避免重复造轮子。"""
+    if not rows and not dev_snapshot:
+        return True
+    _write_ok = False
+    for _attempt in range(3):   # 最多重试 3 次,防止瞬时数据库抖动丢弃位置数据
+        try:
+            with _db_lock:
+                conn = get_db()
+                try:
+                    if rows:
+                        if DB_BACKEND == 'postgres':
+                            # PG 下用 execute_values 单条 INSERT 批量写,性能远优于 executemany
+                            # rows 每项列顺序:device_id,phone,lat,lng,altitude,speed,
+                            #                direction,alarm_flag,status_flag,mileage,gps_time
+                            _cur = conn.cursor()
+                            _pg_extras.execute_values(
+                                _cur,
+                                "INSERT INTO location_record (device_id,phone,lat,lng,altitude,"
+                                "speed,direction,alarm_flag,status_flag,mileage,gps_time) "
+                                "VALUES %s", rows)
+                        else:
+                            conn.executemany(
+                                "INSERT INTO location_record (device_id,phone,lat,lng,altitude,"
+                                "speed,direction,alarm_flag,status_flag,mileage,gps_time) "
+                                "VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+                    if dev_snapshot:
+                        conn.executemany(
+                            "UPDATE device SET last_lat=?,last_lng=?,last_speed=?,"
+                            "last_location_time=?,status=?,updated_at=? WHERE phone=?",
+                            [(d[1],d[2],d[3],d[4],d[5],d[6],d[0]) for d in dev_snapshot])
+                    conn.commit()
+                finally:
+                    conn.close()
+            _write_ok = True
+            break
+        except Exception as e:
+            log.error("[批量写] 落库失败(第%d次): %s", _attempt + 1, e)
+    if not _write_ok:
+        # 连续 3 次失败:位置数据落死信文件,而非直接丢弃
+        _dump_deadletter(rows)
+    return _write_ok
+
+
+def _drain_and_write():
+    """从队列取一批(≤_BATCH_MAX)位置 + 设备最新状态快照并落库。
+    用 _flush_lock 串行化,防止批量写线程与停机 flush 并发重复写。
+    返回 (本轮取出的行数, 是否还有剩余待处理数据)。"""
+    with _flush_lock:
         rows = []
         while len(rows) < _BATCH_MAX:
             try:
                 rows.append(_loc_queue.get_nowait())
             except _queue.Empty:
                 break
-        # 取出并清空设备最新状态快照
         with _dev_latest_lk:
             dev_snapshot = list(_dev_latest.values())
             _dev_latest.clear()
-        if not rows and not dev_snapshot:
-            continue
-        _write_ok = False
-        for _attempt in range(3):   # 最多重试 3 次,防止瞬时数据库抖动丢弃位置数据
-            try:
-                with _db_lock:
-                    conn = get_db()
-                    try:
-                        if rows:
-                            if DB_BACKEND == 'postgres':
-                                # PG 下用 execute_values 单条 INSERT 批量写,性能远优于 executemany
-                                # rows 每项列顺序:device_id,phone,lat,lng,altitude,speed,
-                                #                direction,alarm_flag,status_flag,mileage,gps_time
-                                _cur = conn.cursor()
-                                _pg_extras.execute_values(
-                                    _cur,
-                                    "INSERT INTO location_record (device_id,phone,lat,lng,altitude,"
-                                    "speed,direction,alarm_flag,status_flag,mileage,gps_time) "
-                                    "VALUES %s", rows)
-                            else:
-                                conn.executemany(
-                                    "INSERT INTO location_record (device_id,phone,lat,lng,altitude,"
-                                    "speed,direction,alarm_flag,status_flag,mileage,gps_time) "
-                                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
-                        if dev_snapshot:
-                            conn.executemany(
-                                "UPDATE device SET last_lat=?,last_lng=?,last_speed=?,"
-                                "last_location_time=?,status=?,updated_at=? WHERE phone=?",
-                                [(d[1],d[2],d[3],d[4],d[5],d[6],d[0]) for d in dev_snapshot])
-                        conn.commit()
-                    finally:
-                        conn.close()
-                _write_ok = True
-                break
-            except Exception as e:
-                log.error("[批量写] 落库失败(第%d次): %s", _attempt + 1, e)
-        if not _write_ok:
-            log.critical("[批量写] 连续 3 次落库失败,%d 条位置记录已丢弃!请检查数据库连接。", len(rows))
+        _do_db_write(rows, dev_snapshot)
+    # 队列可能仍有超过 _BATCH_MAX 的残余,交由调用方决定是否继续
+    more_pending = not _loc_queue.empty()
+    return len(rows), more_pending
+
+
+def flush_loc_queue():
+    """停机时调用:把 _loc_queue 里剩余的位置全部同步落库(循环直至排空)。
+    幂等:多次调用无害;与批量写线程共用 _flush_lock,不会并发重复写。"""
+    total = 0
+    # 循环排空(单批上限 2000,大队列需多轮)。设安全上限防极端情况死循环。
+    for _ in range(100000):
+        n, more = _drain_and_write()
+        total += n
+        if not more:
+            break
+    if total:
+        log.info("[优雅停机] flush 已同步落库 %d 条剩余位置记录", total)
+    return total
+
+
+def _batch_writer_loop():
+    """后台线程:每 0.5 秒把队列里的位置记录 + 设备最新状态批量写入。
+    响应 _stop_event:置位后退出循环(退出前不落库,由停机 flush 统一排空)。"""
+    while not _stop_event.is_set():
+        # 用 Event.wait 代替 sleep,收到停止信号可立即唤醒退出
+        if _stop_event.wait(0.5):
+            break
+        _drain_and_write()
 
 _batch_writer_started = False
 _batch_writer_start_lock = threading.Lock()
@@ -136,8 +205,66 @@ def start_batch_writer():
         if _batch_writer_started:
             return
         _batch_writer_started = True
-    threading.Thread(target=_batch_writer_loop, daemon=True).start()
+    threading.Thread(target=_batch_writer_loop, daemon=True, name='batch-writer').start()
     log.info("[批量写] 位置异步批量落库线程已启动")
+
+
+# ── 优雅停机:停止标志置位 + flush 排空(信号处理器 / gunicorn 钩子共用)────────
+_graceful_shutdown_done = False
+_graceful_shutdown_lock = threading.Lock()
+
+def graceful_shutdown(reason='signal'):
+    """优雅停机总入口(幂等):
+    1) 置 _stop_event,让批量写线程 / 清理线程退出各自循环;
+    2) flush 把 _loc_queue 排空同步落库,保证重启不丢轨迹。
+    可由信号处理器或 gunicorn worker_int/worker_exit 钩子调用。"""
+    global _graceful_shutdown_done
+    with _graceful_shutdown_lock:
+        if _graceful_shutdown_done:
+            return
+        _graceful_shutdown_done = True
+    log.info("[优雅停机] 收到停机信号(%s),开始排空位置队列...", reason)
+    _stop_event.set()
+    try:
+        flush_loc_queue()
+    except Exception as e:
+        log.error("[优雅停机] flush 异常: %s", e)
+    log.info("[优雅停机] 位置队列已排空,可安全退出")
+
+
+_signal_registered = False
+
+def install_signal_handlers():
+    """注册 SIGTERM/SIGINT 处理器,收到信号 → graceful_shutdown → 退出。
+    直接 `python app.py` 运行时用;gunicorn 部署下由 worker_int/worker_exit 钩子兜底,
+    两条路径都走幂等的 graceful_shutdown,不会重复 flush,也不与 gunicorn 自身停机冲突。
+
+    gevent monkey patch(app.py 顶部 patch_all(thread=True))后,标准 signal 模块的
+    行为已被适配为在主 greenlet 中安全派发;优先用 gevent.signal_handler 以贴合
+    gevent 事件循环,不可用时回退标准 signal。"""
+    global _signal_registered
+    if _signal_registered:
+        return
+    _signal_registered = True
+    import signal as _signal
+
+    def _handler(*_a):
+        graceful_shutdown('signal')
+
+    try:
+        import gevent as _gevent
+        # gevent 环境:用 gevent.signal_handler 在事件循环里安全处理,不打断 greenlet
+        _gevent.signal_handler(_signal.SIGTERM, _handler)
+        _gevent.signal_handler(_signal.SIGINT, _handler)
+        log.info("[优雅停机] 已注册 gevent 信号处理器(SIGTERM/SIGINT)")
+    except Exception:
+        # 非 gevent(纯线程开发模式)或注册失败:回退标准 signal
+        try:
+            _signal.signal(_signal.SIGTERM, _handler)
+            _signal.signal(_signal.SIGINT, _handler)
+            log.info("[优雅停机] 已注册标准信号处理器(SIGTERM/SIGINT)")
+        except Exception as _e:
+            log.warning("[优雅停机] 信号处理器注册失败(可能非主线程): %s", _e)
 
 
 # ── PG 专用:location_record 按月分区 ─────────────────────────────────────────
@@ -264,6 +391,99 @@ def start_partition_maintainer():
     log.info("[PG分区] 分区维护线程已启动")
 
 
+# ── 位置数据保留期清理(防 location_record 无限膨胀)──────────────────────────
+# LOCATION_RETENTION_DAYS: 位置记录保留天数,超期删除。0 表示不清理(默认 90 天)。
+LOCATION_RETENTION_DAYS = int(os.environ.get('LOCATION_RETENTION_DAYS', '90'))
+# 每批删除行数,分批删避免一次删太多长时间锁库
+_CLEANUP_BATCH = 5000
+# 检查间隔(秒):每小时醒一次,判断是否到达下一次清理时刻(可被停止标志提前唤醒)
+_CLEANUP_CHECK_INTERVAL = 3600
+# 两次清理之间的最小间隔(秒):每天清理一次
+_CLEANUP_MIN_PERIOD = 24 * 3600
+
+
+def _cleanup_locations_once():
+    """删除超过保留期的位置记录,分批 DELETE 直到没有更多行。返回删除总数。
+    gps_time 为 'YYYY-MM-DD HH:MM:SS' 字符串,直接用字符串边界比较(SQLite/PG 通用)。"""
+    if LOCATION_RETENTION_DAYS <= 0:
+        return 0
+    cutoff = (datetime.now() - timedelta(days=LOCATION_RETENTION_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
+    total = 0
+    # 分批删除:每批 _CLEANUP_BATCH 行,循环直到本批删不到行或收到停止信号
+    while not _stop_event.is_set():
+        try:
+            with _db_lock if DB_BACKEND == 'sqlite' else _NullCtx():
+                conn = get_db()
+                try:
+                    if DB_BACKEND == 'postgres':
+                        # PG 不支持 DELETE ... LIMIT,用 ctid 子查询限制批量大小
+                        cur = conn.execute(
+                            "DELETE FROM location_record WHERE ctid IN "
+                            "(SELECT ctid FROM location_record WHERE gps_time < ? LIMIT ?)",
+                            (cutoff, _CLEANUP_BATCH))
+                    else:
+                        cur = conn.execute(
+                            "DELETE FROM location_record WHERE rowid IN "
+                            "(SELECT rowid FROM location_record WHERE gps_time < ? LIMIT ?)",
+                            (cutoff, _CLEANUP_BATCH))
+                    deleted = cur.rowcount if cur is not None and cur.rowcount is not None else 0
+                    conn.commit()
+                finally:
+                    conn.close()
+        except Exception as e:
+            log.error("[位置清理] 删除失败: %s", e)
+            break
+        if not deleted or deleted < 0:
+            break
+        total += deleted
+        if deleted < _CLEANUP_BATCH:
+            break   # 本批不足一整批,说明已删完
+    if total:
+        log.info("[位置清理] 已删除 %d 条早于 %s 的位置记录(保留 %d 天)",
+                 total, cutoff, LOCATION_RETENTION_DAYS)
+    return total
+
+
+class _NullCtx:
+    """空上下文管理器:PG 后端各连接独立无需全局写锁,用它统一 with 语法。"""
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+_location_cleaner_started = False
+_location_cleaner_lock    = threading.Lock()
+
+def _location_cleaner_loop():
+    """后台清理线程:定期(每天)删除超保留期的位置记录。响应 _stop_event 优雅退出。"""
+    _last_run = 0.0
+    # 启动后先跑一次(仅在配置了保留期时),之后按天检查
+    while not _stop_event.is_set():
+        now = _time_mod.time()
+        if now - _last_run >= _CLEANUP_MIN_PERIOD:
+            try:
+                _cleanup_locations_once()
+            except Exception as e:
+                log.warning("[位置清理] 清理线程异常: %s", e)
+            _last_run = now
+        # 每小时醒一次检查(Event.wait 收到停止信号立即唤醒退出)
+        if _stop_event.wait(_CLEANUP_CHECK_INTERVAL):
+            break
+
+def start_location_cleaner():
+    """启动位置清理后台线程(幂等)。LOCATION_RETENTION_DAYS<=0 时不启动。"""
+    global _location_cleaner_started
+    with _location_cleaner_lock:
+        if _location_cleaner_started:
+            return
+        _location_cleaner_started = True
+    if LOCATION_RETENTION_DAYS <= 0:
+        log.info("[位置清理] LOCATION_RETENTION_DAYS=%d,不启用位置数据清理", LOCATION_RETENTION_DAYS)
+        return
+    threading.Thread(target=_location_cleaner_loop, daemon=True,
+                     name='location-cleaner').start()
+    log.info("[位置清理] 位置数据清理线程已启动(保留 %d 天)", LOCATION_RETENTION_DAYS)
+
+
 # ── 设备标识解析 ───────────────────────────────────────────────────────────────
 
 def resolve_phone(bcd_phone: str) -> str:
@@ -364,21 +584,22 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
     if (lat == 0 and lng == 0) or not (status_flag & 0x02):
         return
 
-    # 查询该设备关联的所有围栏（devices 字段是逗号分隔的 phone 列表）
+    # 查询该设备关联的所有围栏。
+    # 热路径优化:改走 fence_device 关联表(idx_fence_device_phone 等值索引),
+    # 取代原 "devices LIKE '%phone%'" 前导通配全表扫。fence_device 由 app.py
+    # 各围栏写入点与 devices 字段双写同步,故此处等价且不再全表扫。
     fences = db_query(
-        """SELECT id, name, fence_type, lat, lng, radius, coordinates,
-                  COALESCE(alarm_enter,1)   alarm_enter,
-                  COALESCE(alarm_exit,1)    alarm_exit,
-                  COALESCE(alarm_dwell,0)   alarm_dwell,
-                  COALESCE(speed_limit,0)   speed_limit,
-                  COALESCE(valid_start,'')  valid_start,
-                  COALESCE(valid_end,'')    valid_end
-           FROM geo_fence
-           WHERE devices = ?
-              OR devices LIKE ?
-              OR devices LIKE ?
-              OR devices LIKE ?""",
-        (phone, f'{phone},%', f'%,{phone}', f'%,{phone},%')
+        """SELECT gf.id, gf.name, gf.fence_type, gf.lat, gf.lng, gf.radius, gf.coordinates,
+                  COALESCE(gf.alarm_enter,1)   alarm_enter,
+                  COALESCE(gf.alarm_exit,1)    alarm_exit,
+                  COALESCE(gf.alarm_dwell,0)   alarm_dwell,
+                  COALESCE(gf.speed_limit,0)   speed_limit,
+                  COALESCE(gf.valid_start,'')  valid_start,
+                  COALESCE(gf.valid_end,'')    valid_end
+           FROM geo_fence gf
+           JOIN fence_device fd ON fd.fence_id = gf.id
+           WHERE fd.phone = ?""",
+        (phone,)
     )
     if not fences:
         return
