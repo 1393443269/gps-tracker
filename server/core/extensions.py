@@ -17,13 +17,27 @@ try:
 except ImportError:
     _GEVENT_AVAILABLE = False
 
+import os as _os
 from flask import Flask
 from flask_socketio import SocketIO
 from flask_cors import CORS
 
 # ── 应用初始化 ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app)
+
+# CORS 来源白名单:通过环境变量 CORS_ORIGINS 配置(逗号分隔的域名),生产必须收敛。
+# 未配置时默认 '*'(放开)以不破坏本地开发,但会打 WARNING 提示生产应设白名单。
+# 鉴权用自定义头 X-Admin-Token/X-Customer-Token(非 Cookie),CSRF 面有限;
+# 收敛 CORS 主要防止任意站点脚本跨域读取 API 响应(轨迹/健康等隐私数据)。
+_cors_env = (_os.environ.get('CORS_ORIGINS') or '').strip()
+if _cors_env:
+    _cors_origins = [o.strip() for o in _cors_env.split(',') if o.strip()]
+else:
+    _cors_origins = '*'
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "CORS_ORIGINS 未配置,当前允许所有来源(*)。生产环境请设为具体域名白名单。")
+CORS(app, resources={r"/*": {"origins": _cors_origins}}, supports_credentials=False)
 _SIO_MODE = 'gevent' if _GEVENT_AVAILABLE else 'threading'
-socketio = SocketIO(app, cors_allowed_origins='*', async_mode=_SIO_MODE,
+socketio = SocketIO(app, cors_allowed_origins=_cors_origins, async_mode=_SIO_MODE,
                     logger=False, engineio_logger=False)

@@ -46,6 +46,57 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── 登录失败限流器（进程内、线程安全、内存有界，防撞库）────────────────────────
+# 规则：同一 (来源标识, 来源IP) 在 _LOGIN_WINDOW 秒内失败超过 _LOGIN_MAX_FAILS 次，
+# 则临时锁定 _LOGIN_WINDOW 秒（滑动窗口，随时间自动解除）。登录成功清零该键。
+# 不引入新依赖；用 dict + Lock 保护；每次访问顺带清理过期条目防内存泄漏。
+_LOGIN_WINDOW    = 15 * 60   # 时间窗口/锁定时长（秒）
+_LOGIN_MAX_FAILS = 10        # 窗口内允许的最大失败次数
+_login_fail_map  = {}        # key -> [timestamp, ...]（仅保留窗口内的失败时间戳）
+_login_fail_lock = threading.Lock()
+
+
+def _login_rl_key(scope, ident):
+    """构造限流键：来源标识（用户名/账号）+ 来源IP。"""
+    ip = (request.remote_addr or '-')
+    return f'{scope}|{(ident or "").lower()}|{ip}'
+
+
+def _login_is_locked(key):
+    """检查该键是否已被锁定（窗口内失败次数达到阈值）。顺带清理过期条目。"""
+    now = _time_mod.time()
+    with _login_fail_lock:
+        # 全局清理：移除所有已完全过期的键，保证内存有界
+        expired = [k for k, ts in _login_fail_map.items()
+                   if not ts or ts[-1] <= now - _LOGIN_WINDOW]
+        for k in expired:
+            del _login_fail_map[k]
+        ts = _login_fail_map.get(key)
+        if not ts:
+            return False
+        # 只保留窗口内的失败时间戳
+        ts = [t for t in ts if t > now - _LOGIN_WINDOW]
+        if ts:
+            _login_fail_map[key] = ts
+        else:
+            _login_fail_map.pop(key, None)
+        return len(ts) >= _LOGIN_MAX_FAILS
+
+
+def _login_record_fail(key):
+    """记录一次失败。"""
+    now = _time_mod.time()
+    with _login_fail_lock:
+        ts = [t for t in _login_fail_map.get(key, []) if t > now - _LOGIN_WINDOW]
+        ts.append(now)
+        _login_fail_map[key] = ts
+
+
+def _login_clear(key):
+    """登录成功后清零该键。"""
+    with _login_fail_lock:
+        _login_fail_map.pop(key, None)
+
 # ── 应用初始化 ─────────────────────────────────────────────────────────────────
 # app / socketio / CORS 已下沉至 core/extensions.py(中立单例源头),用于打破
 # 「后台线程用 socketio ↔ socketio 定义在 app.py」的循环 import。此处 import
@@ -226,6 +277,17 @@ def init_db():
         devices     TEXT,
         created_at  TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
     );
+
+    -- 围栏↔设备关联表(查询加速层)：与 geo_fence.devices 逗号串并存双写。
+    -- devices 字段仍是唯一真相源、UI/兼容查询继续依赖；本表仅用于消除
+    -- ingest 每帧热路径 "devices LIKE '%phone%'" 的前导通配全表扫，走
+    -- idx_fence_device_phone 等值索引。任何改 devices 处必须同步此表。
+    CREATE TABLE IF NOT EXISTS fence_device (
+        fence_id INTEGER NOT NULL,
+        phone    TEXT    NOT NULL,
+        PRIMARY KEY (fence_id, phone)
+    );
+    CREATE INDEX IF NOT EXISTS idx_fence_device_phone ON fence_device(phone);
 
     CREATE TABLE IF NOT EXISTS mark_point (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -495,10 +557,16 @@ def init_db():
         except Exception:
             pass
 
-    # 默认管理员 admin / admin123（已存在则跳过）
+    # 默认管理员 admin（已存在则跳过）。初始密码优先取环境变量 INIT_ADMIN_PASSWORD；
+    # 未设置则兜底 admin123 以保证开箱可用，但启动时打 WARNING 强烈提示立即修改。
     try:
+        _init_admin_pw = os.environ.get('INIT_ADMIN_PASSWORD')
+        if not _init_admin_pw:
+            _init_admin_pw = 'admin123'
+            log.warning('未设置 INIT_ADMIN_PASSWORD，管理员 admin 使用默认弱口令 admin123，'
+                        '请立即登录后修改密码或通过环境变量 INIT_ADMIN_PASSWORD 设置强密码！')
         conn.execute("INSERT OR IGNORE INTO admin_user (username, password_hash) VALUES (?,?)",
-                     ('admin', _hash_pw('admin123')))
+                     ('admin', _hash_pw(_init_admin_pw)))
         conn.commit()
     except Exception:
         pass
@@ -580,6 +648,24 @@ def init_db():
         conn.commit()
     except Exception:
         pass
+
+    # ── fence_device 存量回填 ────────────────────────────────────────────────
+    # 把现有 geo_fence.devices 逗号串拆开灌进关联表。INSERT OR IGNORE 幂等：
+    # 主键 (fence_id, phone) 去重，重启多次不会产生重复行，也不覆盖已双写数据。
+    try:
+        _rows = conn.execute("SELECT id, devices FROM geo_fence").fetchall()
+        for _r in _rows:
+            _fid  = _r['id']
+            _devs = _r['devices'] or ''
+            for _ph in _devs.split(','):
+                _ph = _ph.strip()
+                if _ph:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO fence_device (fence_id, phone) VALUES (?,?)",
+                        (_fid, _ph))
+        conn.commit()
+    except Exception:
+        log.exception("fence_device 回填失败(不阻断启动)")
 
     conn.close()
     log.info("数据库初始化完成: %s", DB_PATH)
@@ -1055,12 +1141,25 @@ def bind_device_customer(did):
     cid  = data.get('customer_id')
     if not cid:
         return fail('customer_id 不能为空', 400)
-    dev = db_query_one("SELECT id, phone FROM device WHERE id=?", (did,))
+    # 组织范围校验：非超管的设备与目标客户都必须在权限范围内（防单设备越权）
+    sids = _org_scope_ids(request)
+    if sids is not None and not sids:
+        return fail('无权限', 403)
+    if sids is not None:
+        scope_ph = ','.join('?' * len(sids))
+        dev = db_query_one(
+            f"SELECT id, phone FROM device WHERE id=? AND org_id IN ({scope_ph})",
+            [did] + list(sids))
+        cust = db_query_one(
+            f"SELECT id, name FROM customer WHERE id=? AND org_id IN ({scope_ph})",
+            [cid] + list(sids))
+    else:
+        dev  = db_query_one("SELECT id, phone FROM device WHERE id=?", (did,))
+        cust = db_query_one("SELECT id, name FROM customer WHERE id=?", (cid,))
     if not dev:
-        return fail('设备不存在', 404)
-    cust = db_query_one("SELECT id, name FROM customer WHERE id=?", (cid,))
+        return fail('设备不存在或无权限', 404)
     if not cust:
-        return fail('客户不存在', 404)
+        return fail('客户不存在或无权限', 404)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     db_exec("UPDATE device SET customer_id=?,updated_at=? WHERE id=?", (cid, now, did))
     add_op_log('设备绑定', f'设备 {dev["phone"]} 绑定至客户 {cust["name"]}')
@@ -1070,9 +1169,19 @@ def bind_device_customer(did):
 @app.post('/api/devices/<int:did>/unbind_customer')
 def unbind_device_customer(did):
     """解除设备与客户的绑定"""
-    dev = db_query_one("SELECT id, phone, customer_id FROM device WHERE id=?", (did,))
+    # 组织范围校验：非超管只能解绑权限范围内的设备（防单设备越权）
+    sids = _org_scope_ids(request)
+    if sids is not None and not sids:
+        return fail('无权限', 403)
+    if sids is not None:
+        scope_ph = ','.join('?' * len(sids))
+        dev = db_query_one(
+            f"SELECT id, phone, customer_id FROM device WHERE id=? AND org_id IN ({scope_ph})",
+            [did] + list(sids))
+    else:
+        dev = db_query_one("SELECT id, phone, customer_id FROM device WHERE id=?", (did,))
     if not dev:
-        return fail('设备不存在', 404)
+        return fail('设备不存在或无权限', 404)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     db_exec("UPDATE device SET customer_id=NULL,updated_at=? WHERE id=?", (now, did))
     add_op_log('设备解绑', f'设备 {dev["phone"]} 已解绑')
@@ -1090,13 +1199,28 @@ def batch_bind_devices():
         return fail('ids 不能为空', 400)
     if not cid:
         return fail('customer_id 不能为空', 400)
-    cust = db_query_one("SELECT id, name FROM customer WHERE id=?", (cid,))
+    # 组织范围校验：非超管只能操作自己权限范围内的设备与目标客户（补齐此前遗漏的越权点）
+    sids = _org_scope_ids(request)
+    scope_sql = ''
+    scope_args = []
+    if sids is not None:
+        if not sids:
+            return fail('无权限', 403)
+        scope_ph = ','.join('?' * len(sids))
+        scope_sql = f" AND org_id IN ({scope_ph})"
+        scope_args = list(sids)
+        # 目标客户必须在操作者 scope 内，防止把设备转移到越权客户
+        cust = db_query_one(
+            f"SELECT id, name FROM customer WHERE id=? AND org_id IN ({scope_ph})",
+            [cid] + list(sids))
+    else:
+        cust = db_query_one("SELECT id, name FROM customer WHERE id=?", (cid,))
     if not cust:
-        return fail('客户不存在', 404)
+        return fail('客户不存在或无权限', 404)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     ph  = ','.join('?' * len(ids))
-    db_exec(f"UPDATE device SET customer_id=?,updated_at=? WHERE id IN ({ph})",
-            [cid, now] + list(ids))
+    db_exec(f"UPDATE device SET customer_id=?,updated_at=? WHERE id IN ({ph}){scope_sql}",
+            [cid, now] + list(ids) + scope_args)
     add_op_log('批量绑定', f'{len(ids)} 台设备绑定/转移至客户 {cust["name"]}')
     return ok({'updated': len(ids)})
 
@@ -1106,9 +1230,19 @@ def set_device_role(did):
     """给单台设备设置/清除角色（role_id）。role_id 为空则清除。"""
     data = request.get_json() or {}
     rid  = data.get('role_id')
-    dev  = db_query_one("SELECT id, phone FROM device WHERE id=?", (did,))
+    # 组织范围校验：非超管只能操作权限范围内的设备（防单设备越权）
+    sids = _org_scope_ids(request)
+    if sids is not None and not sids:
+        return fail('无权限', 403)
+    if sids is not None:
+        scope_ph = ','.join('?' * len(sids))
+        dev = db_query_one(
+            f"SELECT id, phone FROM device WHERE id=? AND org_id IN ({scope_ph})",
+            [did] + list(sids))
+    else:
+        dev = db_query_one("SELECT id, phone FROM device WHERE id=?", (did,))
     if not dev:
-        return fail('设备不存在', 404)
+        return fail('设备不存在或无权限', 404)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     if rid:
         role = db_query_one("SELECT id, name FROM device_role WHERE id=?", (rid,))
@@ -1130,18 +1264,28 @@ def batch_set_device_role():
     rid  = data.get('role_id')
     if not ids:
         return fail('ids 不能为空', 400)
+    # 组织范围校验：非超管只能操作自己权限范围内的设备（补齐此前遗漏的越权点）
+    sids = _org_scope_ids(request)
+    scope_sql = ''
+    scope_args = []
+    if sids is not None:
+        if not sids:
+            return fail('无权限', 403)
+        scope_ph = ','.join('?' * len(sids))
+        scope_sql = f" AND org_id IN ({scope_ph})"
+        scope_args = list(sids)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     ph  = ','.join('?' * len(ids))
     if rid:
         role = db_query_one("SELECT id, name FROM device_role WHERE id=?", (rid,))
         if not role:
             return fail('角色不存在', 404)
-        db_exec(f"UPDATE device SET role_id=?,updated_at=? WHERE id IN ({ph})",
-                [rid, now] + list(ids))
+        db_exec(f"UPDATE device SET role_id=?,updated_at=? WHERE id IN ({ph}){scope_sql}",
+                [rid, now] + list(ids) + scope_args)
         add_op_log('批量分配角色', f'{len(ids)} 台设备分配角色 {role["name"]}')
     else:
-        db_exec(f"UPDATE device SET role_id=NULL,updated_at=? WHERE id IN ({ph})",
-                [now] + list(ids))
+        db_exec(f"UPDATE device SET role_id=NULL,updated_at=? WHERE id IN ({ph}){scope_sql}",
+                [now] + list(ids) + scope_args)
         add_op_log('批量清除角色', f'{len(ids)} 台设备清除角色')
     return ok({'updated': len(ids)})
 
@@ -1153,10 +1297,20 @@ def batch_unbind_devices():
     ids  = data.get('ids', [])
     if not ids:
         return fail('ids 不能为空', 400)
+    # 组织范围校验：非超管只能操作自己权限范围内的设备（补齐此前遗漏的越权点）
+    sids = _org_scope_ids(request)
+    scope_sql = ''
+    scope_args = []
+    if sids is not None:
+        if not sids:
+            return fail('无权限', 403)
+        scope_ph = ','.join('?' * len(sids))
+        scope_sql = f" AND org_id IN ({scope_ph})"
+        scope_args = list(sids)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     ph  = ','.join('?' * len(ids))
-    db_exec(f"UPDATE device SET customer_id=NULL,updated_at=? WHERE id IN ({ph})",
-            [now] + list(ids))
+    db_exec(f"UPDATE device SET customer_id=NULL,updated_at=? WHERE id IN ({ph}){scope_sql}",
+            [now] + list(ids) + scope_args)
     add_op_log('批量解绑', f'{len(ids)} 台设备已解绑')
     return ok({'updated': len(ids)})
 
@@ -2422,6 +2576,30 @@ def delete_customer(cid):
 
 # ── 电子围栏接口 ───────────────────────────────────────────────────────────────
 
+def _sync_fence_devices(fence_id, devices_str, conn=None):
+    """把某围栏的关联设备(fence_device 表)与其 devices 逗号串全量对齐：
+    先删该围栏所有关联行，再按新 devices 逐条 INSERT OR IGNORE。
+    devices 字段仍是真相源，本表是查询加速层——凡改 geo_fence.devices 处均须调用此函数。
+
+    conn 为 None 时走 db_exec(自带 _db_lock，用于未持锁的调用点)；
+    传入 conn 时直接用该连接(调用方已持 _db_lock 并自行 commit，避免 SQLite 重入死锁)。
+    删除围栏(devices_str 传空串/None)时只做清理，等价于清空关联。
+    """
+    phones = [p.strip() for p in (devices_str or '').split(',') if p.strip()]
+    if conn is not None:
+        conn.execute("DELETE FROM fence_device WHERE fence_id=?", (fence_id,))
+        for ph in phones:
+            conn.execute(
+                "INSERT OR IGNORE INTO fence_device (fence_id, phone) VALUES (?,?)",
+                (fence_id, ph))
+    else:
+        db_exec("DELETE FROM fence_device WHERE fence_id=?", (fence_id,))
+        for ph in phones:
+            db_exec(
+                "INSERT OR IGNORE INTO fence_device (fence_id, phone) VALUES (?,?)",
+                (fence_id, ph))
+
+
 @app.get('/api/fences')
 def list_fences():
     name   = request.args.get('name', '').strip()
@@ -2459,6 +2637,7 @@ def create_fence():
     EXTRA_COLS = "alarm_enter,alarm_exit,alarm_dwell,speed_limit,valid_start,valid_end,org_id"
     EXTRA_VALS = (ae, ax, adwl, spdl, vs, ve, admin_org)
 
+    devices_str = d.get('devices', '') or ''
     if fence_type == 'circle':
         # 坐标/半径范围校验:非法值会使围栏永远命中不了(静默失效,进出告警不触发),
         # 必须拦在入库前而非存进去。
@@ -2469,34 +2648,39 @@ def create_fence():
             return fail('圆形围栏需要合法的 lat(-90~90)/lng(-180~180)', 400)
         if radius is None:
             return fail('radius 需为正整数', 400)
-        db_exec(
-            f"INSERT INTO geo_fence (name,fence_type,lat,lng,radius,color,devices,{EXTRA_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (name, 'circle', lat, lng,
-             radius, d.get('color', '#409EFF'), d.get('devices', '')) + EXTRA_VALS
-        )
+        ins_sql = f"INSERT INTO geo_fence (name,fence_type,lat,lng,radius,color,devices,{EXTRA_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ins_params = (name, 'circle', lat, lng,
+                      radius, d.get('color', '#409EFF'), devices_str) + EXTRA_VALS
     elif fence_type == 'polygon':
         coords = d.get('coordinates')
         if not coords:
             return fail('多边形围栏需要 coordinates', 400)
         import json as _json
-        db_exec(
-            f"INSERT INTO geo_fence (name,fence_type,lat,lng,coordinates,color,devices,{EXTRA_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (name, 'polygon', 0.0, 0.0, _json.dumps(coords), d.get('color', '#409EFF'), d.get('devices', '')) + EXTRA_VALS
-        )
+        ins_sql = f"INSERT INTO geo_fence (name,fence_type,lat,lng,coordinates,color,devices,{EXTRA_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ins_params = (name, 'polygon', 0.0, 0.0, _json.dumps(coords), d.get('color', '#409EFF'), devices_str) + EXTRA_VALS
     elif fence_type == 'administrative':
         if not d.get('adcode'):
             return fail('行政区围栏需要 adcode', 400)
         import json as _json
-        db_exec(
-            f"INSERT INTO geo_fence (name,fence_type,lat,lng,adcode,coordinates,color,devices,{EXTRA_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (name, 'administrative', 0.0, 0.0, str(d['adcode']),
-             _json.dumps(d.get('coordinates', [])),
-             d.get('color', '#409EFF'), d.get('devices', '')) + EXTRA_VALS
-        )
+        ins_sql = f"INSERT INTO geo_fence (name,fence_type,lat,lng,adcode,coordinates,color,devices,{EXTRA_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ins_params = (name, 'administrative', 0.0, 0.0, str(d['adcode']),
+                      _json.dumps(d.get('coordinates', [])),
+                      d.get('color', '#409EFF'), devices_str) + EXTRA_VALS
     else:
         return fail('未知围栏类型', 400)
+
+    # 单连接内插入围栏并同步 fence_device：拿到 lastrowid 后在同一 conn(同一锁)双写，
+    # 保证 devices 串与关联表原子对齐，不会出现只写其一的中间态。
+    with _db_lock:
+        conn = get_db()
+        try:
+            new_id = conn.execute(ins_sql, ins_params).lastrowid
+            _sync_fence_devices(new_id, devices_str, conn=conn)
+            conn.commit()
+        finally:
+            conn.close()
     add_op_log('围栏新增', f'新建{fence_type}围栏 {name}')
-    return ok()
+    return ok({'id': new_id})
 
 def _admin_fence_or_none(fid):
     """取管理员有权操作的围栏(本组织范围内的全局围栏 customer_id IS NULL),
@@ -2513,6 +2697,7 @@ def delete_fence(fid):
     row = _admin_fence_or_none(fid)
     if not row: return fail('围栏不存在或无权限', 404)
     db_exec("DELETE FROM geo_fence WHERE id=?", (fid,))
+    _sync_fence_devices(fid, '')   # 双写：清理该围栏在加速表中的关联
     add_op_log('围栏删除', f'删除围栏 {row["name"]}')
     return ok()
 
@@ -2525,6 +2710,7 @@ def update_fence_devices(fid):
     phones = d.get('phones', [])            # 传入手机号数组
     devices_str = ','.join(str(p) for p in phones if p)
     db_exec("UPDATE geo_fence SET devices=? WHERE id=?", (devices_str, fid))
+    _sync_fence_devices(fid, devices_str)   # 双写：全量替换该围栏的关联设备
     add_op_log('围栏关联设备', f'围栏 {row["name"]} 关联 {len(phones)} 台设备')
     return ok()
 
@@ -2546,6 +2732,8 @@ def batch_delete_fences():
         return fail('无可删除的围栏', 404)
     del_ph = ','.join('?' * len(allowed_ids))
     db_exec(f"DELETE FROM geo_fence WHERE id IN ({del_ph})", tuple(allowed_ids))
+    # 双写：清理这些围栏在加速表中的关联
+    db_exec(f"DELETE FROM fence_device WHERE fence_id IN ({del_ph})", tuple(allowed_ids))
     add_op_log('围栏批量删除', f'批量删除 {len(allowed_ids)} 条围栏')
     return ok({'deleted': len(allowed_ids)})
 
@@ -2960,13 +3148,18 @@ def admin_login():
     password = d.get('password', '')
     if not username or not password:
         return fail('账号和密码不能为空', 400)
+    _rl_key = _login_rl_key('admin', username)
+    if _login_is_locked(_rl_key):
+        return fail('登录失败次数过多，请稍后再试', 429)
     row = db_query_one(
         "SELECT id, username, real_name, org_id, org_level, user_type, password_hash "
         "FROM admin_user WHERE username=? AND COALESCE(is_active,1)=1",
         (username,)
     )
     if not row or not _verify_pw(password, row.get('password_hash') or ''):
+        _login_record_fail(_rl_key)
         return fail('账号或密码错误', 401)
+    _login_clear(_rl_key)
     # 如果是旧 SHA-256 哈希，自动升级为 bcrypt
     if not (row['password_hash'].startswith('$2b$') or row['password_hash'].startswith('$2a$')):
         db_exec("UPDATE admin_user SET password_hash=? WHERE username=?",
@@ -3022,12 +3215,17 @@ def portal_login():
     password   = d.get('password', '')
     if not login_name or not password:
         return fail('账号和密码不能为空', 400)
+    _rl_key = _login_rl_key('portal', login_name)
+    if _login_is_locked(_rl_key):
+        return fail('登录失败次数过多，请稍后再试', 429)
     row = db_query_one(
         "SELECT id, name, login_name, password_hash FROM customer WHERE login_name=? AND status='活跃'",
         (login_name,)
     )
     if not row or not _verify_pw(password, row.get('password_hash') or ''):
+        _login_record_fail(_rl_key)
         return fail('账号或密码错误', 401)
+    _login_clear(_rl_key)
     # 如果是旧 SHA-256 哈希，自动升级为 bcrypt
     if not (row['password_hash'].startswith('$2b$') or row['password_hash'].startswith('$2a$')):
         db_exec("UPDATE customer SET password_hash=? WHERE id=?",
@@ -3520,6 +3718,7 @@ def portal_create_fence():
     if not name:
         return fail('围栏名称不能为空', 400)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    devices_str = d.get('devices','') or ''
     with _db_lock:
         conn = get_db()
         try:
@@ -3528,10 +3727,12 @@ def portal_create_fence():
                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (name, d.get('fence_type','circle'), d.get('lat'), d.get('lng'),
                  d.get('radius', 2000), d.get('coordinates'), d.get('color','#409EFF'),
-                 d.get('devices',''), cid, now)
+                 devices_str, cid, now)
             )
+            new_id = cur.lastrowid
+            _sync_fence_devices(new_id, devices_str, conn=conn)   # 双写：同 conn 同步关联表
             conn.commit()
-            return ok({'id': cur.lastrowid})
+            return ok({'id': new_id})
         finally:
             conn.close()
 
@@ -3558,6 +3759,7 @@ def portal_delete_fence(fid):
     if not db_query_one("SELECT id FROM geo_fence WHERE id=? AND customer_id=?", (fid, cid)):
         return fail('无权限或不存在', 404)
     db_exec("DELETE FROM geo_fence WHERE id=?", (fid,))
+    _sync_fence_devices(fid, '')   # 双写：清理该围栏在加速表中的关联
     return ok()
 
 
@@ -3573,7 +3775,9 @@ def portal_fence_devices(fid):
     # 只能关联整个子树的设备（含后代客户）
     my_phones = set(_get_subtree_phones(cid))
     phones = [p for p in phones if p in my_phones]
-    db_exec("UPDATE geo_fence SET devices=? WHERE id=?", (','.join(phones), fid))
+    devices_str = ','.join(phones)
+    db_exec("UPDATE geo_fence SET devices=? WHERE id=?", (devices_str, fid))
+    _sync_fence_devices(fid, devices_str)   # 双写：全量替换该围栏的关联设备
     return ok()
 
 
@@ -4332,6 +4536,38 @@ def _serve_spa(path):
             return _send_abs(fp)
     # 其余全部返回 index.html（Vue Router 接管）
     return _send_abs(os.path.join(_DIST, 'index.html'))
+
+
+# ── 全局异常/错误处理 ──────────────────────────────────────────────────────────
+# 统一以 fail() 相同的 {code,msg} JSON 返回，记录日志但不向客户端泄露堆栈。
+# 仅在 _DEBUG_MODE 时附带异常细节，便于本地排障。
+
+@app.errorhandler(Exception)
+def _handle_uncaught(e):
+    # HTTPException（含 404/405/400 等）交给下面专用/默认处理，避免把 4xx 变成 500
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return e
+    log.exception('未处理异常: %s', e)
+    msg = '服务器内部错误'
+    if _DEBUG_MODE:
+        msg = f'服务器内部错误: {e}'
+    return fail(msg, 500)
+
+
+@app.errorhandler(404)
+def _handle_404(e):
+    # 仅对 API 路径返回 JSON；其余路径已被 SPA 兜底路由接管，不会到这里
+    if request.path.startswith('/api/'):
+        return fail('接口不存在', 404)
+    return e
+
+
+@app.errorhandler(405)
+def _handle_405(e):
+    if request.path.startswith('/api/'):
+        return fail('请求方法不被允许', 405)
+    return e
 
 
 # ── 主入口 ─────────────────────────────────────────────────────────────────────

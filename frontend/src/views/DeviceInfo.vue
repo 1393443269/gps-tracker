@@ -421,8 +421,14 @@ async function exportAll() {
       r.phone, r.name || '', r.terminal_model || '', statusMap[r.status] ?? '',
       r.account || '', r.real_name || '', r.contact_phone || '', r.role_name || ''
     ])
+    // 防 CSV 公式注入：以 = + - @ Tab CR 开头的值前置单引号，避免 Excel 当公式执行
+    const csvCell = (c) => {
+      let s = String(c)
+      if (/^[=+\-@\t\r]/.test(s)) s = "'" + s
+      return `"${s.replace(/"/g, '""')}"`
+    }
     const csv = [headers, ...data].map(row =>
-      row.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n')
+      row.map(csvCell).join(',')).join('\n')
     const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' })
     const link = document.createElement('a')
     link.href = URL.createObjectURL(blob)
