@@ -46,6 +46,57 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── 登录失败限流器（进程内、线程安全、内存有界，防撞库）────────────────────────
+# 规则：同一 (来源标识, 来源IP) 在 _LOGIN_WINDOW 秒内失败超过 _LOGIN_MAX_FAILS 次，
+# 则临时锁定 _LOGIN_WINDOW 秒（滑动窗口，随时间自动解除）。登录成功清零该键。
+# 不引入新依赖；用 dict + Lock 保护；每次访问顺带清理过期条目防内存泄漏。
+_LOGIN_WINDOW    = 15 * 60   # 时间窗口/锁定时长（秒）
+_LOGIN_MAX_FAILS = 10        # 窗口内允许的最大失败次数
+_login_fail_map  = {}        # key -> [timestamp, ...]（仅保留窗口内的失败时间戳）
+_login_fail_lock = threading.Lock()
+
+
+def _login_rl_key(scope, ident):
+    """构造限流键：来源标识（用户名/账号）+ 来源IP。"""
+    ip = (request.remote_addr or '-')
+    return f'{scope}|{(ident or "").lower()}|{ip}'
+
+
+def _login_is_locked(key):
+    """检查该键是否已被锁定（窗口内失败次数达到阈值）。顺带清理过期条目。"""
+    now = _time_mod.time()
+    with _login_fail_lock:
+        # 全局清理：移除所有已完全过期的键，保证内存有界
+        expired = [k for k, ts in _login_fail_map.items()
+                   if not ts or ts[-1] <= now - _LOGIN_WINDOW]
+        for k in expired:
+            del _login_fail_map[k]
+        ts = _login_fail_map.get(key)
+        if not ts:
+            return False
+        # 只保留窗口内的失败时间戳
+        ts = [t for t in ts if t > now - _LOGIN_WINDOW]
+        if ts:
+            _login_fail_map[key] = ts
+        else:
+            _login_fail_map.pop(key, None)
+        return len(ts) >= _LOGIN_MAX_FAILS
+
+
+def _login_record_fail(key):
+    """记录一次失败。"""
+    now = _time_mod.time()
+    with _login_fail_lock:
+        ts = [t for t in _login_fail_map.get(key, []) if t > now - _LOGIN_WINDOW]
+        ts.append(now)
+        _login_fail_map[key] = ts
+
+
+def _login_clear(key):
+    """登录成功后清零该键。"""
+    with _login_fail_lock:
+        _login_fail_map.pop(key, None)
+
 # ── 应用初始化 ─────────────────────────────────────────────────────────────────
 # app / socketio / CORS 已下沉至 core/extensions.py(中立单例源头),用于打破
 # 「后台线程用 socketio ↔ socketio 定义在 app.py」的循环 import。此处 import
@@ -495,10 +546,16 @@ def init_db():
         except Exception:
             pass
 
-    # 默认管理员 admin / admin123（已存在则跳过）
+    # 默认管理员 admin（已存在则跳过）。初始密码优先取环境变量 INIT_ADMIN_PASSWORD；
+    # 未设置则兜底 admin123 以保证开箱可用，但启动时打 WARNING 强烈提示立即修改。
     try:
+        _init_admin_pw = os.environ.get('INIT_ADMIN_PASSWORD')
+        if not _init_admin_pw:
+            _init_admin_pw = 'admin123'
+            log.warning('未设置 INIT_ADMIN_PASSWORD，管理员 admin 使用默认弱口令 admin123，'
+                        '请立即登录后修改密码或通过环境变量 INIT_ADMIN_PASSWORD 设置强密码！')
         conn.execute("INSERT OR IGNORE INTO admin_user (username, password_hash) VALUES (?,?)",
-                     ('admin', _hash_pw('admin123')))
+                     ('admin', _hash_pw(_init_admin_pw)))
         conn.commit()
     except Exception:
         pass
@@ -1055,12 +1112,25 @@ def bind_device_customer(did):
     cid  = data.get('customer_id')
     if not cid:
         return fail('customer_id 不能为空', 400)
-    dev = db_query_one("SELECT id, phone FROM device WHERE id=?", (did,))
+    # 组织范围校验：非超管的设备与目标客户都必须在权限范围内（防单设备越权）
+    sids = _org_scope_ids(request)
+    if sids is not None and not sids:
+        return fail('无权限', 403)
+    if sids is not None:
+        scope_ph = ','.join('?' * len(sids))
+        dev = db_query_one(
+            f"SELECT id, phone FROM device WHERE id=? AND org_id IN ({scope_ph})",
+            [did] + list(sids))
+        cust = db_query_one(
+            f"SELECT id, name FROM customer WHERE id=? AND org_id IN ({scope_ph})",
+            [cid] + list(sids))
+    else:
+        dev  = db_query_one("SELECT id, phone FROM device WHERE id=?", (did,))
+        cust = db_query_one("SELECT id, name FROM customer WHERE id=?", (cid,))
     if not dev:
-        return fail('设备不存在', 404)
-    cust = db_query_one("SELECT id, name FROM customer WHERE id=?", (cid,))
+        return fail('设备不存在或无权限', 404)
     if not cust:
-        return fail('客户不存在', 404)
+        return fail('客户不存在或无权限', 404)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     db_exec("UPDATE device SET customer_id=?,updated_at=? WHERE id=?", (cid, now, did))
     add_op_log('设备绑定', f'设备 {dev["phone"]} 绑定至客户 {cust["name"]}')
@@ -1070,9 +1140,19 @@ def bind_device_customer(did):
 @app.post('/api/devices/<int:did>/unbind_customer')
 def unbind_device_customer(did):
     """解除设备与客户的绑定"""
-    dev = db_query_one("SELECT id, phone, customer_id FROM device WHERE id=?", (did,))
+    # 组织范围校验：非超管只能解绑权限范围内的设备（防单设备越权）
+    sids = _org_scope_ids(request)
+    if sids is not None and not sids:
+        return fail('无权限', 403)
+    if sids is not None:
+        scope_ph = ','.join('?' * len(sids))
+        dev = db_query_one(
+            f"SELECT id, phone, customer_id FROM device WHERE id=? AND org_id IN ({scope_ph})",
+            [did] + list(sids))
+    else:
+        dev = db_query_one("SELECT id, phone, customer_id FROM device WHERE id=?", (did,))
     if not dev:
-        return fail('设备不存在', 404)
+        return fail('设备不存在或无权限', 404)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     db_exec("UPDATE device SET customer_id=NULL,updated_at=? WHERE id=?", (now, did))
     add_op_log('设备解绑', f'设备 {dev["phone"]} 已解绑')
@@ -1090,13 +1170,28 @@ def batch_bind_devices():
         return fail('ids 不能为空', 400)
     if not cid:
         return fail('customer_id 不能为空', 400)
-    cust = db_query_one("SELECT id, name FROM customer WHERE id=?", (cid,))
+    # 组织范围校验：非超管只能操作自己权限范围内的设备与目标客户（补齐此前遗漏的越权点）
+    sids = _org_scope_ids(request)
+    scope_sql = ''
+    scope_args = []
+    if sids is not None:
+        if not sids:
+            return fail('无权限', 403)
+        scope_ph = ','.join('?' * len(sids))
+        scope_sql = f" AND org_id IN ({scope_ph})"
+        scope_args = list(sids)
+        # 目标客户必须在操作者 scope 内，防止把设备转移到越权客户
+        cust = db_query_one(
+            f"SELECT id, name FROM customer WHERE id=? AND org_id IN ({scope_ph})",
+            [cid] + list(sids))
+    else:
+        cust = db_query_one("SELECT id, name FROM customer WHERE id=?", (cid,))
     if not cust:
-        return fail('客户不存在', 404)
+        return fail('客户不存在或无权限', 404)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     ph  = ','.join('?' * len(ids))
-    db_exec(f"UPDATE device SET customer_id=?,updated_at=? WHERE id IN ({ph})",
-            [cid, now] + list(ids))
+    db_exec(f"UPDATE device SET customer_id=?,updated_at=? WHERE id IN ({ph}){scope_sql}",
+            [cid, now] + list(ids) + scope_args)
     add_op_log('批量绑定', f'{len(ids)} 台设备绑定/转移至客户 {cust["name"]}')
     return ok({'updated': len(ids)})
 
@@ -1106,9 +1201,19 @@ def set_device_role(did):
     """给单台设备设置/清除角色（role_id）。role_id 为空则清除。"""
     data = request.get_json() or {}
     rid  = data.get('role_id')
-    dev  = db_query_one("SELECT id, phone FROM device WHERE id=?", (did,))
+    # 组织范围校验：非超管只能操作权限范围内的设备（防单设备越权）
+    sids = _org_scope_ids(request)
+    if sids is not None and not sids:
+        return fail('无权限', 403)
+    if sids is not None:
+        scope_ph = ','.join('?' * len(sids))
+        dev = db_query_one(
+            f"SELECT id, phone FROM device WHERE id=? AND org_id IN ({scope_ph})",
+            [did] + list(sids))
+    else:
+        dev = db_query_one("SELECT id, phone FROM device WHERE id=?", (did,))
     if not dev:
-        return fail('设备不存在', 404)
+        return fail('设备不存在或无权限', 404)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     if rid:
         role = db_query_one("SELECT id, name FROM device_role WHERE id=?", (rid,))
@@ -1130,18 +1235,28 @@ def batch_set_device_role():
     rid  = data.get('role_id')
     if not ids:
         return fail('ids 不能为空', 400)
+    # 组织范围校验：非超管只能操作自己权限范围内的设备（补齐此前遗漏的越权点）
+    sids = _org_scope_ids(request)
+    scope_sql = ''
+    scope_args = []
+    if sids is not None:
+        if not sids:
+            return fail('无权限', 403)
+        scope_ph = ','.join('?' * len(sids))
+        scope_sql = f" AND org_id IN ({scope_ph})"
+        scope_args = list(sids)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     ph  = ','.join('?' * len(ids))
     if rid:
         role = db_query_one("SELECT id, name FROM device_role WHERE id=?", (rid,))
         if not role:
             return fail('角色不存在', 404)
-        db_exec(f"UPDATE device SET role_id=?,updated_at=? WHERE id IN ({ph})",
-                [rid, now] + list(ids))
+        db_exec(f"UPDATE device SET role_id=?,updated_at=? WHERE id IN ({ph}){scope_sql}",
+                [rid, now] + list(ids) + scope_args)
         add_op_log('批量分配角色', f'{len(ids)} 台设备分配角色 {role["name"]}')
     else:
-        db_exec(f"UPDATE device SET role_id=NULL,updated_at=? WHERE id IN ({ph})",
-                [now] + list(ids))
+        db_exec(f"UPDATE device SET role_id=NULL,updated_at=? WHERE id IN ({ph}){scope_sql}",
+                [now] + list(ids) + scope_args)
         add_op_log('批量清除角色', f'{len(ids)} 台设备清除角色')
     return ok({'updated': len(ids)})
 
@@ -1153,10 +1268,20 @@ def batch_unbind_devices():
     ids  = data.get('ids', [])
     if not ids:
         return fail('ids 不能为空', 400)
+    # 组织范围校验：非超管只能操作自己权限范围内的设备（补齐此前遗漏的越权点）
+    sids = _org_scope_ids(request)
+    scope_sql = ''
+    scope_args = []
+    if sids is not None:
+        if not sids:
+            return fail('无权限', 403)
+        scope_ph = ','.join('?' * len(sids))
+        scope_sql = f" AND org_id IN ({scope_ph})"
+        scope_args = list(sids)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     ph  = ','.join('?' * len(ids))
-    db_exec(f"UPDATE device SET customer_id=NULL,updated_at=? WHERE id IN ({ph})",
-            [now] + list(ids))
+    db_exec(f"UPDATE device SET customer_id=NULL,updated_at=? WHERE id IN ({ph}){scope_sql}",
+            [now] + list(ids) + scope_args)
     add_op_log('批量解绑', f'{len(ids)} 台设备已解绑')
     return ok({'updated': len(ids)})
 
@@ -2960,13 +3085,18 @@ def admin_login():
     password = d.get('password', '')
     if not username or not password:
         return fail('账号和密码不能为空', 400)
+    _rl_key = _login_rl_key('admin', username)
+    if _login_is_locked(_rl_key):
+        return fail('登录失败次数过多，请稍后再试', 429)
     row = db_query_one(
         "SELECT id, username, real_name, org_id, org_level, user_type, password_hash "
         "FROM admin_user WHERE username=? AND COALESCE(is_active,1)=1",
         (username,)
     )
     if not row or not _verify_pw(password, row.get('password_hash') or ''):
+        _login_record_fail(_rl_key)
         return fail('账号或密码错误', 401)
+    _login_clear(_rl_key)
     # 如果是旧 SHA-256 哈希，自动升级为 bcrypt
     if not (row['password_hash'].startswith('$2b$') or row['password_hash'].startswith('$2a$')):
         db_exec("UPDATE admin_user SET password_hash=? WHERE username=?",
@@ -3022,12 +3152,17 @@ def portal_login():
     password   = d.get('password', '')
     if not login_name or not password:
         return fail('账号和密码不能为空', 400)
+    _rl_key = _login_rl_key('portal', login_name)
+    if _login_is_locked(_rl_key):
+        return fail('登录失败次数过多，请稍后再试', 429)
     row = db_query_one(
         "SELECT id, name, login_name, password_hash FROM customer WHERE login_name=? AND status='活跃'",
         (login_name,)
     )
     if not row or not _verify_pw(password, row.get('password_hash') or ''):
+        _login_record_fail(_rl_key)
         return fail('账号或密码错误', 401)
+    _login_clear(_rl_key)
     # 如果是旧 SHA-256 哈希，自动升级为 bcrypt
     if not (row['password_hash'].startswith('$2b$') or row['password_hash'].startswith('$2a$')):
         db_exec("UPDATE customer SET password_hash=? WHERE id=?",
@@ -4332,6 +4467,38 @@ def _serve_spa(path):
             return _send_abs(fp)
     # 其余全部返回 index.html（Vue Router 接管）
     return _send_abs(os.path.join(_DIST, 'index.html'))
+
+
+# ── 全局异常/错误处理 ──────────────────────────────────────────────────────────
+# 统一以 fail() 相同的 {code,msg} JSON 返回，记录日志但不向客户端泄露堆栈。
+# 仅在 _DEBUG_MODE 时附带异常细节，便于本地排障。
+
+@app.errorhandler(Exception)
+def _handle_uncaught(e):
+    # HTTPException（含 404/405/400 等）交给下面专用/默认处理，避免把 4xx 变成 500
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return e
+    log.exception('未处理异常: %s', e)
+    msg = '服务器内部错误'
+    if _DEBUG_MODE:
+        msg = f'服务器内部错误: {e}'
+    return fail(msg, 500)
+
+
+@app.errorhandler(404)
+def _handle_404(e):
+    # 仅对 API 路径返回 JSON；其余路径已被 SPA 兜底路由接管，不会到这里
+    if request.path.startswith('/api/'):
+        return fail('接口不存在', 404)
+    return e
+
+
+@app.errorhandler(405)
+def _handle_405(e):
+    if request.path.startswith('/api/'):
+        return fail('请求方法不被允许', 405)
+    return e
 
 
 # ── 主入口 ─────────────────────────────────────────────────────────────────────
