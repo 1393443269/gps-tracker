@@ -33,7 +33,7 @@ import * as maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { io } from 'socket.io-client'
 import { deviceApi, portalApi, isAdmin } from '@/api'
-import { ElNotification } from 'element-plus'
+import { ElNotification, ElMessage } from 'element-plus'
 import { TDT_MAP_STYLE } from '@/utils/mapStyle'
 
 // ── 响应式状态 ────────────────────────────────────────────────────────────────
@@ -134,6 +134,17 @@ function updateMarker(info) {
   }
 }
 
+// ── 清理离线设备的标记（对比在线 phone 集合，移除不在集合内的 marker） ──────────
+function pruneMarkers(onlinePhones) {
+  const keep = new Set([...onlinePhones].map(p => String(p)))
+  for (const ph of Object.keys(markerStore)) {
+    if (!keep.has(String(ph))) {
+      markerStore[ph].marker.remove()
+      delete markerStore[ph]
+    }
+  }
+}
+
 function flyTo(phone) {
   const item = markerStore[phone]
   if (item) {
@@ -149,8 +160,10 @@ async function loadInitialPositions() {
     // 更新在线设备列表（含无坐标）
     allOnlineDevices.value = records.filter(d => d.status === 1 || d.status === 2)
     // 有坐标的显示在地图上
+    const locatedPhones = new Set()
     for (const d of records) {
       if (d.last_lat && d.last_lng) {
+        locatedPhones.add(String(d.phone))
         updateMarker({
           phone: d.phone,
           name:  d.name || '',
@@ -165,7 +178,11 @@ async function loadInitialPositions() {
         })
       }
     }
-  } catch {}
+    // 移除已离线（不再返回坐标）设备的标记，避免 markerStore 无限增长
+    pruneMarkers(locatedPhones)
+  } catch (e) {
+    console.warn('[RealtimeMap] 初始位置加载失败:', e)
+  }
 }
 
 // ── 在线设备列表刷新（不更新地图标记，只刷新面板） ───────────────────────────────
@@ -175,7 +192,9 @@ async function loadOnlineDevices() {
       ? await deviceApi.list({ status: 1, size: 500 })
       : await portalApi.deviceList({ status: 1, size: 500 })
     allOnlineDevices.value = res.data?.records || []
-  } catch {}
+  } catch (e) {
+    console.warn('[RealtimeMap] 在线设备列表刷新失败:', e)
+  }
 }
 
 // ── Socket.IO ─────────────────────────────────────────────────────────────────
@@ -189,6 +208,10 @@ function connectSocket() {
 
   socket.on('connect',    () => { wsConnected.value = true  })
   socket.on('disconnect', () => { wsConnected.value = false })
+  socket.on('connect_error', (err) => {
+    wsConnected.value = false
+    console.warn('[RealtimeMap] 实时连接失败，自动重连中:', err?.message || err)
+  })
 
   socket.on('location_update', (data) => {
     updateMarker({
@@ -217,25 +240,35 @@ function connectSocket() {
 
 // ── 生命周期 ──────────────────────────────────────────────────────────────────
 onMounted(async () => {
-  map = new maplibregl.Map({
-    container: 'map-container',
-    style: TDT_MAP_STYLE,
-    center: [114.3, 30.5],
-    zoom: 5,
-  })
-  map.addControl(new maplibregl.NavigationControl(), 'top-left')
+  try {
+    map = new maplibregl.Map({
+      container: 'map-container',
+      style: TDT_MAP_STYLE,
+      center: [114.3, 30.5],
+      zoom: 5,
+    })
+    map.addControl(new maplibregl.NavigationControl(), 'top-left')
 
-  await new Promise(r => map.once('load', r))
+    await new Promise(r => map.once('load', r))
 
-  await loadInitialPositions()
-  connectSocket()
-  // 每 15 秒刷新在线设备列表（面板实时显示无坐标设备）
-  onlineTimer = setInterval(loadOnlineDevices, 15000)
+    await loadInitialPositions()
+    connectSocket()
+    // 每 15 秒刷新在线设备列表（面板实时显示无坐标设备）
+    onlineTimer = setInterval(loadOnlineDevices, 15000)
+  } catch (e) {
+    console.warn('[RealtimeMap] 地图初始化失败:', e)
+    ElMessage.error('地图加载失败，请刷新页面重试')
+  }
 })
 
 onUnmounted(() => {
   if (onlineTimer) clearInterval(onlineTimer)
-  socket?.disconnect()
+  // 先解绑所有 socket 监听再断开，避免监听器/闭包残留导致内存泄漏
+  if (socket) {
+    socket.off()
+    socket.disconnect()
+    socket = null
+  }
   map?.remove()
 })
 </script>

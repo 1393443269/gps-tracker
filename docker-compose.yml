@@ -49,6 +49,12 @@ services:
         limits:
           memory: 512M
           cpus: '1.5'
+    logging:
+      # 限制容器日志大小，防止 json-file 日志无限增长撑爆磁盘
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   frontend:
     build:
@@ -75,6 +81,12 @@ services:
         limits:
           memory: 128M
           cpus: '0.5'
+    logging:
+      # 限制容器日志大小，防止 json-file 日志无限增长撑爆磁盘
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   mqtt:
     container_name: tracker-mqtt
@@ -109,6 +121,12 @@ services:
         limits:
           memory: 128M
           cpus: '0.5'
+    logging:
+      # 限制容器日志大小，防止 json-file 日志无限增长撑爆磁盘
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   postgres:
     container_name: tracker-postgres
@@ -125,7 +143,9 @@ services:
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gps} -d ${POSTGRES_DB:-gps}"]
+      # 用户名/库名强制来自 env，不设 :-gps 默认值——否则改库名后 healthcheck
+      # 仍会对不存在的 gps 库探活，掩盖真实的连接/初始化错误。
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -135,6 +155,12 @@ services:
         limits:
           memory: 512M
           cpus: '1.5'
+    logging:
+      # 限制容器日志大小，防止 json-file 日志无限增长撑爆磁盘
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 networks:
   # 内部网络：backend ↔ mqtt ↔ postgres 通信，不对外暴露

@@ -41,6 +41,19 @@ if DB_BACKEND == 'postgres':
     _PG_DSN = os.environ.get('DATABASE_URL',
                              'postgresql://postgres:postgres@127.0.0.1:5432/gps')
 
+    # 幂等建表/加列时 PG 会抛"已存在"类错误。这些错误有稳定的 SQLSTATE(与 locale 无关),
+    # 用于 executescript 逐条执行时忽略"已存在",而不依赖被本地化的英文错误消息。
+    #   42P07 duplicate_table       表已存在(CREATE TABLE / CREATE INDEX 索引已存在)
+    #   42701 duplicate_column      列已存在(ALTER TABLE ... ADD COLUMN)
+    #   42P06 duplicate_schema      schema 已存在(CREATE SCHEMA)
+    #   42710 duplicate_object      对象已存在(如约束/触发器/序列等)
+    #   42P16 invalid_table_definition 建表定义相关重复(如重复主键定义)
+    #   42723 duplicate_function    函数已存在
+    #   42P05 duplicate_prepared_statement 预备语句已存在
+    _PG_DUPLICATE_SQLSTATES = frozenset({
+        '42P07', '42701', '42P06', '42710', '42P16', '42723', '42P05',
+    })
+
     # ── PG 连接池:防止每请求新建/关闭连接,在高并发下耗尽 max_connections ─────
     from psycopg2.pool import ThreadedConnectionPool as _PgPool
     _pg_pool      = None
@@ -174,8 +187,11 @@ class _ConnWrapper:
                 try:
                     cur.execute(s)
                 except Exception as _e:
-                    # 幂等建表/加列场景下的"已存在"类错误忽略,其余抛出
-                    if 'already exists' not in str(_e).lower():
+                    # 幂等建表/加列场景下的"已存在"类错误忽略,其余抛出。
+                    # 用 SQLSTATE(pgcode)判定而非英文错误消息子串:PG 服务器在
+                    # 非英文 locale(如中文)下错误消息本地化,消息子串判定会误判
+                    # (误抛中断 init_db,或误吞无关错误);SQLSTATE 由标准固定,与 locale 无关。
+                    if getattr(_e, 'pgcode', None) not in _PG_DUPLICATE_SQLSTATES:
                         raise
         return self
     def cursor(self):  return self._raw.cursor()
