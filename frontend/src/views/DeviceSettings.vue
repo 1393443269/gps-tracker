@@ -144,7 +144,7 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { Search, Minus, Link, ArrowDown, Download } from '@element-plus/icons-vue'
-import { deviceApi, customerApi } from '@/api'
+import { deviceApi, customerApi, portalApi, isAdmin } from '@/api'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 const list        = ref([])
@@ -225,7 +225,7 @@ async function loadData(p = page.value) {
       terminal_model: queryModel.value || undefined,
       imei:           queryImei.value.trim() || undefined,
     }
-    const res = await deviceApi.withCustomer(params)
+    const res = isAdmin() ? await deviceApi.withCustomer(params) : await portalApi.deviceList(params)
     let records = res.data?.records || []
     if (bindFilter.value === 'bound')   records = records.filter(r => r.customer_id)
     if (bindFilter.value === 'unbound') records = records.filter(r => !r.customer_id)
@@ -239,7 +239,7 @@ async function loadData(p = page.value) {
 async function loadCustomers() {
   if (customerList.value.length) return
   try {
-    const res = await customerApi.listAll()
+    const res = isAdmin() ? await customerApi.listAll() : await portalApi.subCustomers.list({ size: 500 })
     customerList.value = res.data?.records || []
     customerTree.value = buildCustomerTree(customerList.value)
   } catch {}
@@ -248,7 +248,7 @@ async function loadCustomers() {
 // 从后端导出接口提取全部型号（去重），作为型号下拉选项
 async function loadModelOptions() {
   try {
-    const res = await deviceApi.exportAll()
+    const res = isAdmin() ? await deviceApi.exportAll() : await portalApi.deviceList({ size: 500 })
     const models = (res.data?.records || [])
       .map(r => r.terminal_model)
       .filter(Boolean)
@@ -271,7 +271,16 @@ async function doUnbind(row) {
       '解绑确认', { type: 'warning', confirmButtonText: '解绑', cancelButtonText: '取消' }
     )
   } catch { return }
-  await deviceApi.unbindCustomer(row.id)
+  if (isAdmin()) {
+    await deviceApi.unbindCustomer(row.id)
+  } else {
+    // 客户端:把设备从所属子账号收回自己名下 —— 取该子账号现有设备,剔除本台后全量重提交
+    const sid = row.customer_id
+    const cur = await portalApi.subCustomers.getDevices(sid)
+    const rows = cur.data?.records || cur.data || []
+    const keep = rows.filter(x => x.customer_id === sid && x.phone !== row.phone).map(x => x.phone)
+    await portalApi.subCustomers.assignDevices(sid, keep)
+  }
   ElMessage.success('解绑成功')
   loadData()
 }
@@ -288,11 +297,21 @@ async function doBindConfirm() {
   if (!bindCustomerId.value) return
   bindSaving.value = true
   try {
-    if (bindMode.value === 'single') {
-      await deviceApi.bindCustomer(bindTarget.value.id, bindCustomerId.value)
+    if (isAdmin()) {
+      if (bindMode.value === 'single') {
+        await deviceApi.bindCustomer(bindTarget.value.id, bindCustomerId.value)
+      } else {
+        const ids = selected.value.map(d => d.id)
+        await deviceApi.batchBind(ids, bindCustomerId.value)
+      }
     } else {
-      const ids = selected.value.map(d => d.id)
-      await deviceApi.batchBind(ids, bindCustomerId.value)
+      // 客户端:分配给下级子账号。把选中设备的 phone 追加到该子账号(全量语义由后端处理)
+      const phones = (bindMode.value === 'single' ? [bindTarget.value] : selected.value).map(x => x.phone)
+      // 先取该子账号当前已分配设备,合并后提交(避免覆盖)
+      const cur = await portalApi.subCustomers.getDevices(bindCustomerId.value)
+      const curPhones = (cur.data || cur.data?.records || []).filter(x => x.customer_id === bindCustomerId.value).map(x => x.phone)
+      const merged = [...new Set([...curPhones, ...phones])]
+      await portalApi.subCustomers.assignDevices(bindCustomerId.value, merged)
     }
     ElMessage.success('操作成功')
     bindVisible.value = false
@@ -329,9 +348,22 @@ async function doBatchUnbind() {
       '批量解绑', { type: 'warning', confirmButtonText: '解绑', cancelButtonText: '取消' }
     )
   } catch { return }
-  const ids = selected.value.map(d => d.id)
-  await deviceApi.batchUnbind(ids)
-  ElMessage.success(`已解绑 ${ids.length} 台设备`)
+  if (isAdmin()) {
+    const ids = selected.value.map(d => d.id)
+    await deviceApi.batchUnbind(ids)
+    ElMessage.success(`已解绑 ${ids.length} 台设备`)
+  } else {
+    // 客户端:按所属子账号分组,逐个子账号剔除选中设备后重提交
+    const bySid = {}
+    selected.value.forEach(x => { if (x.customer_id) { (bySid[x.customer_id] ||= new Set()).add(x.phone) } })
+    for (const sid of Object.keys(bySid)) {
+      const cur = await portalApi.subCustomers.getDevices(Number(sid))
+      const rows = cur.data?.records || cur.data || []
+      const keep = rows.filter(x => x.customer_id === Number(sid) && !bySid[sid].has(x.phone)).map(x => x.phone)
+      await portalApi.subCustomers.assignDevices(Number(sid), keep)
+    }
+    ElMessage.success(`已解绑 ${selected.value.length} 台设备`)
+  }
   clearSelection()
   loadData()
 }
@@ -341,7 +373,7 @@ async function doBatchCommand() {
   cmdSaving.value = true
   try {
     const phones = selected.value.map(d => d.phone)
-    const res = await deviceApi.batchCommand(phones, cmdText.value.trim())
+    const res = isAdmin() ? await deviceApi.batchCommand(phones, cmdText.value.trim()) : await portalApi.batchCommand(phones, cmdText.value.trim())
     const { sent = 0, offline = 0 } = res.data || {}
     ElMessage.success(`下发完成：成功 ${sent} 台，离线跳过 ${offline} 台`)
     cmdVisible.value = false
@@ -355,7 +387,7 @@ async function doBatchCommand() {
 async function exportAll() {
   exporting.value = true
   try {
-    const res = await deviceApi.exportAll()
+    const res = isAdmin() ? await deviceApi.exportAll() : await portalApi.deviceList({ size: 1000 })
     const rows = res.data?.records || []
     if (!rows.length) { ElMessage.warning('暂无设备可导出'); return }
     const statusMap = { 0: '离线', 1: '在线', 2: '报警' }

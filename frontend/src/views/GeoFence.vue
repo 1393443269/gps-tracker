@@ -702,16 +702,24 @@ async function finishPolygon() {
     return
   }
   const coords = [...polyPoints.value, polyPoints.value[0]]  // 闭合
+  const _polyPayload = { name: pendingPolyName, fence_type:'polygon', coordinates: coords, color: pendingPolyColor,
+    alarm_enter: pendingPolyAlarmEnter, alarm_exit: pendingPolyAlarmExit,
+    alarm_dwell: pendingPolyAlarmDwell, speed_limit: pendingPolySpeedLimit,
+    valid_start: pendingPolyValidStart, valid_end: pendingPolyValidEnd }
   try {
-    await fenceApi.create({ name: pendingPolyName, fence_type:'polygon', coordinates: coords, color: pendingPolyColor,
-      alarm_enter: pendingPolyAlarmEnter, alarm_exit: pendingPolyAlarmExit,
-      alarm_dwell: pendingPolyAlarmDwell, speed_limit: pendingPolySpeedLimit,
-      valid_start: pendingPolyValidStart, valid_end: pendingPolyValidEnd })
+    // 按身份分流：管理员走管理端接口，客户/子账号走门户接口(否则被 401 拦截、静默失败)
+    if (isAdmin()) {
+      await fenceApi.create(_polyPayload)
+    } else {
+      await portalApi.createFence(_polyPayload)
+    }
     ElMessage.success('多边形围栏创建成功')
     clearPolyDrawing()
     await loadFences()    // 等围栏渲染完再 fit
     _fitAllFences()       // 立即跳视口到所有围栏（duration:0 无动画延迟）
-  } catch {}
+  } catch (e) {
+    ElMessage.error('多边形围栏创建失败：' + (e?.message || '请重试'))
+  }
 }
 
 // ── 数据加载 ─────────────────────────────────────────────────────────────────
@@ -871,13 +879,13 @@ function _fitAllFences() {
 }
 
 async function loadMarks() {
-  const res = await markApi.list({ name: markSearch.value })
+  const res = isAdmin() ? await markApi.list({ name: markSearch.value }) : await portalApi.markPoints.list({ name: markSearch.value })
   marks.value = res.data || []
   renderMarks()
 }
 
 async function loadRisks() {
-  const res = await riskApi.list()
+  const res = isAdmin() ? await riskApi.list() : await portalApi.riskPoints.list()
   risks.value = res.data || []
   renderRisks()
 }
@@ -965,7 +973,7 @@ async function onProvinceChange(code) {
   // 拉取子区域（城市）
   loadingCities.value = true
   try {
-    const r = await fetch(`https://geo.datav.aliyun.com/areas_v3/bound/${code}_full.json`)
+    const r = await fetch(`/mapdata/areas_v3/bound/${code}_full.json`)
     const geo = await r.json()
     const features = geo.features || []
     cities.value = features
@@ -984,7 +992,7 @@ async function onAdcodeChange(adcode) {
     form.value.cityCode = adcode
     districts.value = []
     try {
-      const r = await fetch(`https://geo.datav.aliyun.com/areas_v3/bound/${adcode}_full.json`)
+      const r = await fetch(`/mapdata/areas_v3/bound/${adcode}_full.json`)
       const geo = await r.json()
       const features = geo.features || []
       const subs = features.filter(f => f.properties?.adcode && String(f.properties.adcode) !== adcode)
@@ -999,7 +1007,7 @@ async function onAdcodeChange(adcode) {
 async function previewAdminBoundary(adcode) {
   if (!adcode || !map) return
   try {
-    const r = await fetch(`https://geo.datav.aliyun.com/areas_v3/bound/${adcode}.json`)
+    const r = await fetch(`/mapdata/areas_v3/bound/${adcode}.json`)
     const geo = await r.json()
     const src = 'admin-preview'
     if (map.getLayer(`${src}-fill`)) map.removeLayer(`${src}-fill`)
@@ -1160,14 +1168,14 @@ async function saveDeviceBinding() {
 // ── 标注点 CRUD ───────────────────────────────────────────────────────────────
 async function saveMark() {
   if (!markForm.value.name.trim()) { ElMessage.error('请填写名称'); return }
-  await markApi.create(markForm.value)
+  isAdmin() ? await markApi.create(markForm.value) : await portalApi.markPoints.create(markForm.value)
   ElMessage.success('标注点创建成功')
   markVisible.value = false
   loadMarks()
 }
 
 async function removeMark(id) {
-  await markApi.remove(id)
+  isAdmin() ? await markApi.remove(id) : await portalApi.markPoints.remove(id)
   ElMessage.success('已删除')
   loadMarks()
 }
@@ -1175,14 +1183,14 @@ async function removeMark(id) {
 // ── 风险点 CRUD ───────────────────────────────────────────────────────────────
 async function saveRisk() {
   if (!riskForm.value.name.trim()) { ElMessage.error('请填写名称'); return }
-  await riskApi.create(riskForm.value)
+  isAdmin() ? await riskApi.create(riskForm.value) : await portalApi.riskPoints.create(riskForm.value)
   ElMessage.success('风险点创建成功')
   riskVisible.value = false
   loadRisks()
 }
 
 async function removeRisk(id) {
-  await riskApi.remove(id)
+  isAdmin() ? await riskApi.remove(id) : await portalApi.riskPoints.remove(id)
   ElMessage.success('已删除')
   loadRisks()
 }

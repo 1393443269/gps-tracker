@@ -63,6 +63,12 @@
           <el-tag :type="statusType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
         </template>
       </el-table-column>
+      <el-table-column label="电量" width="80">
+        <template #default="{ row }">
+          <span v-if="row.last_battery != null" :style="{ color: row.last_battery <= 20 ? '#f56c6c' : '#67c23a' }">{{ row.last_battery }}%</span>
+          <span v-else>—</span>
+        </template>
+      </el-table-column>
       <el-table-column label="最新坐标" width="200">
         <template #default="{ row }">
           <span v-if="row.last_lat">{{ Number(row.last_lat).toFixed(5) }}, {{ Number(row.last_lng).toFixed(5) }}</span>

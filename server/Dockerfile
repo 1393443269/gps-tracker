@@ -10,10 +10,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN useradd -r -u 1001 -s /sbin/nologin appuser \
     && mkdir -p /app/data /app/uploads \
     && chown -R appuser:appuser /app
-USER appuser
 
 # 复制业务代码
 COPY app.py protocol.py protocol_g618g.py protocol_zhiling.py geo_resolve.py gunicorn.conf.py ./
+COPY entrypoint.sh ./
+RUN chmod +x /app/entrypoint.sh
 # 拆分出的模块包(common/ core/ 等);后续新增子包目录都要在此补上,否则容器内 import 失败
 COPY common/ ./common/
 COPY core/ ./core/
@@ -28,4 +29,4 @@ EXPOSE 9090
 
 # 生产：Gunicorn + gevent WebSocket worker（替换 Flask dev server）
 # 若需本地调试可覆盖：docker run ... python app.py
-CMD ["gunicorn", "--config", "gunicorn.conf.py", "app:app"]
+ENTRYPOINT ["/app/entrypoint.sh"]

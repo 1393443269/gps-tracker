@@ -72,6 +72,12 @@
                   {{ selected.last_speed != null ? (selected.last_speed/10).toFixed(1)+' km/h' : '—' }}
                 </el-descriptions-item>
                 <el-descriptions-item label="归属客户">{{ selected.customer_name || '—' }}</el-descriptions-item>
+                <el-descriptions-item label="电量">
+                  <span v-if="selected.last_battery != null" :style="{ color: selected.last_battery <= 20 ? '#f56c6c' : '#67c23a' }">
+                    {{ selected.last_battery }}%
+                  </span>
+                  <span v-else>—</span>
+                </el-descriptions-item>
               </el-descriptions>
               <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
                 <el-button size="small" type="primary" @click="locateOnMap(selected)">地图定位</el-button>

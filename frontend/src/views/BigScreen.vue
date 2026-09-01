@@ -119,6 +119,12 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import * as echarts from 'echarts'
 import { deviceApi, alarmApi, reportApi, platformApi, portalApi, isAdmin } from '@/api'
 
+// DataV 的中国 GeoJSON 基于 WGS-84，设备上报也是 WGS-84，直接用原始经纬度即可对齐，
+// 不做坐标转换（此前误加 GCJ 转换反而放大偏移）。
+function _devScatterValue(d) {
+  return [Number(d.last_lng), Number(d.last_lat), d.phone]
+}
+
 // ── refs ──────────────────────────────────────────────────────────────────────
 const bsEl   = ref(null)
 const mapEl  = ref(null)
@@ -340,6 +346,11 @@ async function buildMap(el, provinceData) {
       series: [{
         type: 'map', map: mapName,
         roam: mapName !== 'china',
+        // 必须与上面 geo 组件的 layoutCenter/layoutSize 完全一致：
+        // 散点挂在 geo 坐标系上，若 map series 用默认布局，省份色块与设备散点会错位
+        // （表现为设备点偏离其所在省份几百公里）。
+        layoutCenter: ['50%', '55%'],
+        layoutSize: mapName === 'china' ? '95%' : '90%',
         label: {
           show: true,
           fontSize: mapName === 'china' ? 9 : 10,
@@ -360,7 +371,7 @@ async function buildMap(el, provinceData) {
   }
 
   const scatter = devicePoints.map(d => ({
-    value: [d.last_lng, d.last_lat, d.phone],
+    value: _devScatterValue(d),
     label: d.name || d.phone || '',
     // 报警红优先，否则按角色颜色，无角色回落绿
     itemStyle: { color: d.status === 2 ? '#e04a4a' : (d.role_color || '#1aae5a') },
@@ -408,7 +419,7 @@ async function buildMap(el, provinceData) {
 
     // 散点（保留设备名称标注 + 角色颜色）
     const provinceScatter = inProvince.map(d => ({
-      value: [d.last_lng, d.last_lat, d.phone],
+      value: _devScatterValue(d),
       label: d.name || d.phone || '',
       itemStyle: { color: d.status === 2 ? '#e04a4a' : (d.role_color || '#1aae5a') },
     }))
@@ -427,7 +438,7 @@ async function backToChina() {
   const mapData = Object.entries(provinceData).map(([name, value]) => ({ name, value }))
   const maxVal  = Math.max(...mapData.map(d => d.value), 1)
   const scatter = devicePoints.map(d => ({
-    value: [d.last_lng, d.last_lat, d.phone],
+    value: _devScatterValue(d),
     label: d.name || d.phone || '',
     itemStyle: { color: d.status === 2 ? '#e04a4a' : (d.role_color || '#1aae5a') },
   }))
@@ -445,6 +456,8 @@ async function backToChina() {
       itemStyle: { areaColor: 'transparent', borderColor: 'transparent' }, label: { show: false } }],
     series: [{
       type: 'map', map: 'china', roam: false,
+      // 与 geo 组件布局一致，否则省份色块与设备散点错位
+      layoutCenter: ['50%', '55%'], layoutSize: '95%',
       label: { fontSize: 9, color: '#5a7a9a' },
       itemStyle: { borderColor: '#7ab0e0', borderWidth: 0.8, areaColor: 'rgba(64,158,255,0.08)' },
       data: mapData,

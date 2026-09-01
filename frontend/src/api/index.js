@@ -211,6 +211,7 @@ export const portalApi = {
   handleAlarm:    (id, data)      => portalHttp.put(`/alarms/${id}/handle`, data),
   // 指令
   sendCommand:    (data)          => portalHttp.post('/commands/text', data),
+  batchCommand:   (phones, text)  => portalHttp.post('/commands/batch_text', { phones, text }),
   cmdHistory:     (params)        => portalHttp.get('/commands/history', { params }),
   // 电子围栏
   fences:         (params)        => portalHttp.get('/fences', { params }),
@@ -229,6 +230,24 @@ export const portalApi = {
   },
   // 全量设备池（自己+子账号，供分配界面）
   poolDevices: () => portalHttp.get('/pool_devices'),
+  // 设备角色/分组(每客户独立)
+  roles: {
+    list:          ()           => portalHttp.get('/roles'),
+    create:        (data)       => portalHttp.post('/roles', data),
+    update:        (id, data)   => portalHttp.put(`/roles/${id}`, data),
+    remove:        (id)         => portalHttp.delete(`/roles/${id}`),
+    assignDevices: (id, phones) => portalHttp.put(`/roles/${id}/assign`, { phones }),
+  },
+  markPoints: {
+    list:   (params) => portalHttp.get('/mark_points', { params }),
+    create: (data)   => portalHttp.post('/mark_points', data),
+    remove: (id)     => portalHttp.delete(`/mark_points/${id}`),
+  },
+  riskPoints: {
+    list:   ()     => portalHttp.get('/risk_points'),
+    create: (data) => portalHttp.post('/risk_points', data),
+    remove: (id)   => portalHttp.delete(`/risk_points/${id}`),
+  },
   // SIM 卡（客户只能查/改/充值，不能新增/绑定/删除）
   sims: {
     list:     (params)   => portalHttp.get('/sims', { params }),

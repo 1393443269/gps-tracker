@@ -318,6 +318,20 @@ def init_db():
         created_at  TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
     );
 
+    -- 待发指令队列：G618G 等低功耗设备平时休眠，下发指令时多半离线。
+    -- 点提交时若设备不在线，指令存入本表(status='pending')，设备下次注册上线时自动补发。
+    -- 补发成功后 status 置 'sent'；payload_hex 为已构造好的下行帧(十六进制)，
+    -- 上线补发时直接发送、无需重新构造，避免依赖 app 层的指令构造函数。
+    CREATE TABLE IF NOT EXISTS pending_command (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        phone       TEXT    NOT NULL,
+        cmd         TEXT,
+        payload_hex TEXT,
+        status      TEXT    DEFAULT 'pending',
+        created_at  TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime')),
+        sent_at     TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS op_log (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         action     TEXT,
@@ -382,6 +396,23 @@ def init_db():
         conn.commit()
     except Exception:
         pass
+
+    # device_role 表：加 customer_id 支持客户自建角色/分组（NULL=管理端全局，否则=归属某客户）。
+    # 每客户独立角色：客户只看/管 customer_id=自己的角色，管理端看 customer_id IS NULL 的全局角色。
+    try:
+        conn.execute("ALTER TABLE device_role ADD COLUMN customer_id INTEGER DEFAULT NULL")
+        conn.commit()
+    except Exception:
+        pass
+
+    # mark_point / risk_point 表：加 customer_id 支持客户自建标注点/风险点（每客户独立，
+    # NULL=管理端全局）。客户只看/管 customer_id=自己的点。
+    for _pt in ('mark_point', 'risk_point'):
+        try:
+            conn.execute(f"ALTER TABLE {_pt} ADD COLUMN customer_id INTEGER DEFAULT NULL")
+            conn.commit()
+        except Exception:
+            pass
 
     # ── 组织隔离：给业务表加 org_id（DEFAULT 1 = 根组织，存量数据自动归根） ──────
     for _tbl in ('device', 'customer', 'geo_fence', 'alarm_record', 'op_log', 'alarm_rule'):
@@ -533,6 +564,20 @@ def init_db():
         created_at  TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
     );
     CREATE INDEX IF NOT EXISTS idx_beacon_report ON beacon_report(phone, report_time);
+
+    -- 传感器数据通用表：为以后接入温湿度/气体(环境类)、开关/水位/电量(状态类)等传感器铺路。
+    -- 通用结构：数值类走 value+unit，非数值/状态类走 value_text。sensor_type 区分传感器类别。
+    CREATE TABLE IF NOT EXISTS sensor_data (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_phone TEXT,              -- 关联设备(IMEI/phone)
+        sensor_type  TEXT,              -- 传感器类型: temperature/humidity/gas/switch/water_level/battery ...
+        value        REAL,             -- 数值(温度/湿度/水位/电量等)
+        value_text   TEXT,             -- 非数值类(如开关 on/off、文本状态)
+        unit         TEXT,             -- 单位 ℃/%/cm/...
+        ts           TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime')),  -- 上报时间
+        org_id       INTEGER DEFAULT 1  -- 组织隔离(与平台其它表一致)
+    );
+    CREATE INDEX IF NOT EXISTS idx_sensor_device_ts ON sensor_data(device_phone, ts);
     """)
     conn.commit()
 
@@ -550,7 +595,10 @@ def init_db():
     for _col in ["lifecycle   INTEGER DEFAULT 1",
                  "activated_at  TEXT DEFAULT NULL",
                  "deactivated_at TEXT DEFAULT NULL",
-                 "remark TEXT DEFAULT ''"]:
+                 "remark TEXT DEFAULT ''",
+                 "last_battery INTEGER DEFAULT NULL",       # 最新电量百分比(0-100)，设备心跳带出
+                 "last_battery_time TEXT DEFAULT NULL",     # 电量上报时间
+                 "low_bat_mode INTEGER DEFAULT 0"]:         # 0=正常频率, 1=已切低电量频率（防重复下发标志）
         try:
             conn.execute(f"ALTER TABLE device ADD COLUMN {_col}")
             conn.commit()
@@ -810,20 +858,38 @@ def api_ping():
     return ok({'status': 'ok'})
 
 
+# ── 在线判定：关机报警驱动 ────────────────────────────────────────────────────
+# 设备保持出厂默认(短连接+休眠)最省电。离线判定不再用时间窗口，改为直接读 device.status
+# 字段：设备任何上报(注册/心跳/定位)即被写入侧置 status=1(在线)，收到关机报警(0x21)置 0(离线)，
+# 报警置 2。写入侧(core/ingest.py)已实时维护该字段，读取侧直接信任它即可。
+# 注意：此方案下没电耗尽/失联/死机若无关机报警上报，设备仍显示在线(纯信号驱动的已知取舍)。
+ONLINE_WINDOW_MIN = int(os.environ.get('ONLINE_WINDOW_MIN', '25'))  # 兼容保留，当前判定不使用
+
+def _online_since():
+    """兼容保留：返回 now-窗口 的时间字符串。关机报警驱动方案下已不用于在线判定。"""
+    from datetime import timedelta as _td
+    return (datetime.now() - _td(minutes=ONLINE_WINDOW_MIN)).strftime('%Y-%m-%d %H:%M:%S')
+
+def _is_online_row(row):
+    """在线判定：直接读 status 字段。status==1 为在线(报警2/离线0 均非在线)。"""
+    return bool(row) and row.get('status') == 1
+
+
 @app.get('/api/devices/summary')
 def device_summary():
     sids = _org_scope_ids(request)
     if sids is not None and not sids:
         return ok({'total': 0, 'online': 0, 'offline': 0, 'alarm': 0})
     base_conds, base_params = _org_where(sids)
-    def _count(extra_cond=None):
+    def _count(extra_cond=None, extra_params=None):
         conds  = base_conds + ([extra_cond] if extra_cond else [])
-        params = base_params + []
+        params = base_params + (extra_params or [])
         where  = ("WHERE " + " AND ".join(conds)) if conds else ""
         return db_scalar(f"SELECT COUNT(*) FROM device {where}", params)
     total   = _count()
-    online  = _count("status=1")
+    # 关机报警驱动：直接读 status 字段。在线=status=1，报警=status=2，其余为离线。
     alarm   = _count("status=2")
+    online  = _count("status=1")
     offline = total - online - alarm
     return ok({'total': total, 'online': online, 'offline': offline, 'alarm': alarm})
 
@@ -849,7 +915,14 @@ def list_devices():
             pass
     if st != '':
         try:
-            conds.append("device.status=?"); params.append(int(st))
+            _st = int(st)
+            # 关机报警驱动：直接按 status 字段过滤(1在线/0离线/2报警)
+            if _st == 2:
+                conds.append("device.status=2")
+            elif _st == 1:
+                conds.append("device.status=1")
+            elif _st == 0:
+                conds.append("device.status=0")
         except ValueError:
             pass
     # org 过滤用带表名的列，避免 JOIN 后 org_id 歧义
@@ -857,17 +930,20 @@ def list_devices():
 
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     # JOIN 角色表，带出角色颜色/形状供地图与列表按角色渲染
-    base = "FROM device LEFT JOIN device_role r ON device.role_id = r.id"
+    # JOIN 客户表，带出归属客户名(customer_name)供设备查询详情/列表显示
+    base = ("FROM device LEFT JOIN device_role r ON device.role_id = r.id "
+            "LEFT JOIN customer c ON device.customer_id = c.id")
     total   = db_scalar(f"SELECT COUNT(*) {base} {where}", params)
     records = db_query(
         f"SELECT device.*, r.name AS role_name, r.color AS role_color, "
-        f"r.icon_type AS role_icon {base} "
+        f"r.icon_type AS role_icon, c.name AS customer_name {base} "
         f"{where} ORDER BY device.updated_at DESC LIMIT ? OFFSET ?",
         params + [size, offset])
     # auth_code 是设备 JT808 鉴权码(内部凭据),与单设备详情接口一致,列表也不得外泄,
     # 否则任意管理员可拉全平台鉴权码离线伪造设备身份。
     for _r in records:
         _r.pop('auth_code', None)
+        # 在线状态直接用 status 字段(关机报警驱动)，不再按时间窗口覆盖。
     return ok({'records': records, 'total': total, 'page': page, 'size': size})
 
 @app.post('/api/devices')
@@ -882,10 +958,10 @@ def create_device():
     db_exec(
         "INSERT INTO device (phone,name,plate_no,manufacturer,terminal_model,"
         "terminal_id,plate_color,auth_code,status,org_id,lifecycle,remark,created_at,updated_at)"
-        " VALUES (?,?,?,?,?,?,1,'DEFAULT',0,1,0,?,?,?)",
+        " VALUES (?,?,?,?,?,?,1,'DEFAULT',0,?,0,?,?,?)",
         (phone, data.get('name',''), data.get('plateNo',''),
          data.get('manufacturer',''), data.get('terminalModel',''),
-         data.get('terminalId',''), data.get('remark',''), now, now)
+         data.get('terminalId',''), _admin_org_id(), data.get('remark',''), now, now)
     )
     add_op_log('设备新增', f'手动新增设备 {phone}')
     return ok({'message': '创建成功'})
@@ -1405,15 +1481,27 @@ def create_role():
     return ok()
 
 
+def _role_in_scope(rid):
+    """角色(device_role)按 org_id 隔离:超管无限制;普通管理员仅本组织范围内的角色可读写。
+    返回 True 表示当前管理员有权操作该角色。"""
+    sids = _org_scope_ids(request)
+    if sids is None:
+        return True   # 超管
+    if not sids:
+        return False
+    ph = ','.join('?' * len(sids))
+    return bool(db_query_one(
+        f"SELECT id FROM device_role WHERE id=? AND org_id IN ({ph})", [rid] + sids))
+
+
 @app.put('/api/roles/<int:rid>')
 def update_role(rid):
     d = request.get_json() or {}
     name = (d.get('name') or '').strip()
     if not name:
         return fail('角色名称不能为空', 400)
-    row = db_query_one("SELECT id FROM device_role WHERE id=?", (rid,))
-    if not row:
-        return fail('角色不存在', 404)
+    if not _role_in_scope(rid):
+        return fail('角色不存在或无权限', 403)
     db_exec(
         "UPDATE device_role SET name=?,color=?,icon_type=?,description=? WHERE id=?",
         (name, d.get('color', '#409EFF'), d.get('icon_type', '圆形'),
@@ -1428,6 +1516,8 @@ def delete_role(rid):
     row = db_query_one("SELECT name FROM device_role WHERE id=?", (rid,))
     if not row:
         return fail('角色不存在', 404)
+    if not _role_in_scope(rid):
+        return fail('角色不存在或无权限', 403)
     # 解除该角色下所有设备的角色绑定
     db_exec("UPDATE device SET role_id=NULL WHERE role_id=?", (rid,))
     db_exec("DELETE FROM device_role WHERE id=?", (rid,))
@@ -1443,6 +1533,17 @@ def assign_role_devices(rid):
     row = db_query_one("SELECT id FROM device_role WHERE id=?", (rid,))
     if not row:
         return fail('角色不存在', 404)
+    if not _role_in_scope(rid):
+        return fail('角色不存在或无权限', 403)
+    # 只允许分配当前管理员组织范围内的设备，越权 phone 静默忽略
+    sids = _org_scope_ids(request)
+    if sids is not None:
+        if not sids:
+            return fail('无权限', 403)
+        dev_ph = ','.join('?' * len(sids))
+        allowed = {r['phone'] for r in db_query(
+            f"SELECT phone FROM device WHERE org_id IN ({dev_ph})", sids)}
+        phones = [p for p in phones if p in allowed]
     # 先清除该角色下已分配设备（重新赋值语义）
     db_exec("UPDATE device SET role_id=NULL WHERE role_id=?", (rid,))
     if phones:
@@ -1553,6 +1654,18 @@ def list_alarms():
 def handle_alarm_api(aid):
     data = request.get_json() or {}
     now  = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    # 组织范围校验：报警经 device.org_id 隔离，普通管理员只能处理本组织范围内的报警，
+    # 防止跨组织把他人报警标记为已处理、掩盖真实告警(与 batch_handle_alarms 一致)。
+    sids = _org_scope_ids(request)
+    if sids is not None:
+        if not sids:
+            return fail('报警不存在或无权限', 403)
+        org_ph = ','.join('?' * len(sids))
+        chk = db_query_one(
+            f"SELECT a.id FROM alarm_record a LEFT JOIN device d ON a.phone=d.phone "
+            f"WHERE a.id=? AND d.org_id IN ({org_ph})", [aid] + sids)
+        if not chk:
+            return fail('报警不存在或无权限', 403)
     db_exec("UPDATE alarm_record SET status=1, handler=?, handle_note=?, handle_time=? WHERE id=?",
             (data.get('handler', '管理员'), data.get('note', ''), now, aid))
     return ok()
@@ -1632,12 +1745,26 @@ def create_alarm_rule():
     return ok()
 
 
+def _alarm_rule_in_scope(rid):
+    """报警规则(alarm_rule)按 org_id 隔离:超管无限制;普通管理员仅本组织范围内可读写。"""
+    sids = _org_scope_ids(request)
+    if sids is None:
+        return True
+    if not sids:
+        return False
+    ph = ','.join('?' * len(sids))
+    return bool(db_query_one(
+        f"SELECT id FROM alarm_rule WHERE id=? AND org_id IN ({ph})", [rid] + sids))
+
+
 @app.put('/api/alarm-rules/<int:rid>')
 def update_alarm_rule(rid):
     d = request.get_json() or {}
     row = db_query_one("SELECT alarm_type FROM alarm_rule WHERE id=?", (rid,))
     if not row:
         return fail('规则不存在', 404)
+    if not _alarm_rule_in_scope(rid):
+        return fail('规则不存在或无权限', 403)
     # alarm_type 未传时沿用原值，避免部分更新（如只切开关）时 int(None) 崩溃
     atype = d.get('alarm_type')
     if atype is None:
@@ -1662,6 +1789,8 @@ def delete_alarm_rule(rid):
     row = db_query_one("SELECT id FROM alarm_rule WHERE id=?", (rid,))
     if not row:
         return fail('规则不存在', 404)
+    if not _alarm_rule_in_scope(rid):
+        return fail('规则不存在或无权限', 403)
     db_exec("DELETE FROM alarm_rule WHERE id=?", (rid,))
     add_op_log('报警规则删除', f'删除报警规则 id={rid}')
     return ok()
@@ -2013,12 +2142,25 @@ def g618g_command():
             port = 0
         if not _IPV4_RE.match(ip) or not (1 <= port <= 65535):
             return fail('IP 地址或端口格式错误')
-    with sessions_lock:
-        conn = sessions.get(phone)
-    if not conn:
-        return fail(f'设备不在线: {phone}', 404)
+    # 先构造下行帧（离线入队也要用，故提前构造并校验参数合法性）
     try:
         payload = builder(data)
+    except Exception as e:
+        log.warning("[指令下发] 构造失败 phone=%s cmd=%s err=%s", phone, cmd, e)
+        return fail(f'指令参数错误: {e}')
+
+    with sessions_lock:
+        conn = sessions.get(phone)
+    # 设备离线：存入待发队列，下次上线自动补发（G618G 低功耗设备平时休眠，这是常态）
+    if not conn:
+        db_exec("INSERT INTO pending_command (phone,cmd,payload_hex,status) VALUES (?,?,?,?)",
+                (phone, cmd, payload.hex(), 'pending'))
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, 'G618G-'+phone[-6:], cmd, 'queued', '设备离线，已加入待发队列，上线后自动下发'))
+        add_op_log('G618G指令入队', f'phone={phone} cmd={cmd}（设备离线，待上线补发）')
+        return ok({'cmd': cmd, 'phone': phone, 'queued': True,
+                   'message': '设备当前离线，指令已排队，设备下次上线时自动下发'})
+    try:
         # G618G 短连接设备需在下行窗口连续发两次（间隔 <20ms）
         conn.sendall(payload)
         import time as _t; _t.sleep(0.01)
@@ -2027,12 +2169,16 @@ def g618g_command():
         db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
                 (phone, 'G618G-'+phone[-6:], cmd, 'success', ''))
         add_op_log('G618G指令下发', f'phone={phone} cmd={cmd}')
-        return ok({'cmd': cmd, 'phone': phone})
+        return ok({'cmd': cmd, 'phone': phone, 'queued': False})
     except Exception as e:
+        # 在线发送失败（连接刚断等）：转入待发队列，避免指令丢失
+        db_exec("INSERT INTO pending_command (phone,cmd,payload_hex,status) VALUES (?,?,?,?)",
+                (phone, cmd, payload.hex(), 'pending'))
         db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
-                (phone, 'G618G-'+phone[-6:], cmd, 'fail', str(e)))
-        log.warning("[指令下发] 失败 phone=%s err=%s", phone, e)
-        return fail('指令下发失败，请稍后重试')
+                (phone, 'G618G-'+phone[-6:], cmd, 'queued', f'实时下发失败已转待发队列: {e}'))
+        log.warning("[指令下发] 实时失败转入队 phone=%s err=%s", phone, e)
+        return ok({'cmd': cmd, 'phone': phone, 'queued': True,
+                   'message': '实时下发失败，已转入待发队列，设备下次上线时自动下发'})
 
 
 # ── 天禧(智令 *XXX#)下行指令接口 ───────────────────────────────────────────────
@@ -2101,7 +2247,10 @@ def zhiling_command():
 @app.get('/api/beacons')
 def list_beacons():
     """信标对照表列表。"""
-    rows = db_query("SELECT * FROM beacon_location ORDER BY major, minor")
+    conds, params = [], []
+    conds, params = _org_scope_conds(conds, params)
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    rows = db_query(f"SELECT * FROM beacon_location {where} ORDER BY major, minor", params)
     return ok({'records': rows, 'total': len(rows)})
 
 @app.post('/api/beacons')
@@ -2117,20 +2266,23 @@ def create_beacon():
         return fail('major/minor 必须为整数')
     name = data.get('name')
     lat  = data.get('lat'); lng = data.get('lng')
-    exist = db_query_one("SELECT id FROM beacon_location WHERE major=? AND minor=?", (major, minor))
+    _org = _admin_org_id()
+    exist = db_query_one("SELECT id FROM beacon_location WHERE major=? AND minor=? AND org_id=?", (major, minor, _org))
     if exist:
         db_exec("UPDATE beacon_location SET name=?, lat=?, lng=?, "
-                "updated_at=strftime('%Y-%m-%d %H:%M:%S','now','localtime') WHERE major=? AND minor=?",
-                (name, lat, lng, major, minor))
+                "updated_at=strftime('%Y-%m-%d %H:%M:%S','now','localtime') WHERE major=? AND minor=? AND org_id=?",
+                (name, lat, lng, major, minor, _org))
         add_op_log('信标更新', f'major={major} minor={minor} lat={lat} lng={lng}')
     else:
-        db_exec("INSERT INTO beacon_location (major, minor, name, lat, lng) VALUES (?,?,?,?,?)",
-                (major, minor, name, lat, lng))
+        db_exec("INSERT INTO beacon_location (major, minor, name, lat, lng, org_id) VALUES (?,?,?,?,?,?)",
+                (major, minor, name, lat, lng, _org))
         add_op_log('信标新增', f'major={major} minor={minor}')
     return ok()
 
 @app.delete('/api/beacons/<int:bid>')
 def delete_beacon(bid):
+    if not _row_org_ok('beacon_location', bid):
+        return fail('无权操作该信标')
     db_exec("DELETE FROM beacon_location WHERE id=?", (bid,))
     add_op_log('信标删除', f'id={bid}')
     return ok()
@@ -2184,6 +2336,37 @@ def _sim_days_left(expire_date):
         return None
 
 
+def _admin_org_id():
+    """当前管理员所属组织 id(用于新建资源的 org 归属)。取不到默认 1。"""
+    admin = _current_admin(request)
+    return (admin.get('org_id') or 1) if admin else 1
+
+
+def _org_scope_conds(conds, params, col='org_id'):
+    """给已有 conds/params 追加组织范围过滤(通用资源表用)。
+    超管(sids=None)不加;空范围加 1=0;否则 col IN (...)。返回 (conds, params)。"""
+    sids = _org_scope_ids(request)
+    if sids is None:
+        return conds, params
+    if not sids:
+        conds.append("1=0"); return conds, params
+    ph = ','.join('?' * len(sids))
+    conds.append(f"{col} IN ({ph})"); params.extend(sids)
+    return conds, params
+
+
+def _row_org_ok(table, rid):
+    """校验某表某行是否在当前管理员组织范围内(update/delete 前调用)。"""
+    sids = _org_scope_ids(request)
+    if sids is None:
+        return True
+    if not sids:
+        return False
+    ph = ','.join('?' * len(sids))
+    return bool(db_query_one(
+        f"SELECT 1 FROM {table} WHERE id=? AND org_id IN ({ph})", [rid] + sids))
+
+
 @app.get('/api/sims')
 def list_sims():
     page, size = _page_params(20)
@@ -2192,6 +2375,7 @@ def list_sims():
     expiring = request.args.get('expiring', '').strip()   # '7' / '30' = 近N天到期
     offset  = (page - 1) * size
     conds, params = [], []
+    conds, params = _org_scope_conds(conds, params)   # 组织隔离
     if kw:
         conds.append("(iccid LIKE ? OR imsi LIKE ? OR operator LIKE ? OR device_phone LIKE ?)")
         like = f'%{kw}%'
@@ -2241,12 +2425,12 @@ def create_sim():
         return fail('ICCID 不能为空', 400)
     try:
         db_exec(
-            "INSERT INTO sim_card (iccid,imsi,operator,plan,balance,status,device_phone,remark,expire_date,monthly_fee) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO sim_card (iccid,imsi,operator,plan,balance,status,device_phone,remark,expire_date,monthly_fee,org_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (iccid, d.get('imsi',''), d.get('operator','中国移动'), d.get('plan',''),
              float(d.get('balance', 0)), d.get('status','正常'),
              d.get('device_phone',''), d.get('remark',''),
-             d.get('expire_date') or None, float(d.get('monthly_fee', 0)))
+             d.get('expire_date') or None, float(d.get('monthly_fee', 0)), _admin_org_id())
         )
         add_op_log('SIM新增', f'新增SIM卡 {iccid}')
     except Exception as e:
@@ -2256,6 +2440,8 @@ def create_sim():
 
 @app.put('/api/sims/<int:sid>')
 def update_sim(sid):
+    if not _row_org_ok('sim_card', sid):
+        return fail('SIM卡不存在或无权限', 403)
     d = request.get_json() or {}
     db_exec(
         "UPDATE sim_card SET imsi=?,operator=?,plan=?,balance=?,status=?,device_phone=?,remark=?,expire_date=?,monthly_fee=? WHERE id=?",
@@ -2270,6 +2456,8 @@ def update_sim(sid):
 
 @app.delete('/api/sims/<int:sid>')
 def delete_sim(sid):
+    if not _row_org_ok('sim_card', sid):
+        return fail('SIM卡不存在或无权限', 403)
     row = db_query_one("SELECT iccid FROM sim_card WHERE id=?", (sid,))
     if not row: return fail('SIM卡不存在', 404)
     db_exec("DELETE FROM sim_card WHERE id=?", (sid,))
@@ -2278,6 +2466,8 @@ def delete_sim(sid):
 
 @app.post('/api/sims/<int:sid>/bind')
 def bind_sim(sid):
+    if not _row_org_ok('sim_card', sid):
+        return fail('SIM卡不存在或无权限', 403)
     d = request.get_json() or {}
     phone = d.get('phone', '')
     db_exec("UPDATE sim_card SET device_phone=? WHERE id=?", (phone, sid))
@@ -2292,14 +2482,14 @@ def list_recharges():
     page, size = _page_params(20)
     sim_id = request.args.get('sim_id')
     offset = (page - 1) * size
+    conds, params = [], []
     if sim_id:
-        total   = db_scalar("SELECT COUNT(*) FROM recharge WHERE sim_id=?", (sim_id,))
-        records = db_query("SELECT * FROM recharge WHERE sim_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                           (sim_id, size, offset))
-    else:
-        total   = db_scalar("SELECT COUNT(*) FROM recharge")
-        records = db_query("SELECT * FROM recharge ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                           (size, offset))
+        conds.append("sim_id=?"); params.append(sim_id)
+    conds, params = _org_scope_conds(conds, params)
+    where = "WHERE " + " AND ".join(conds) if conds else ""
+    total   = db_scalar(f"SELECT COUNT(*) FROM recharge {where}", params)
+    records = db_query(f"SELECT * FROM recharge {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                       params + [size, offset])
     return ok({'records': records, 'total': total, 'page': page})
 
 @app.post('/api/recharges')
@@ -2325,9 +2515,9 @@ def create_recharge():
                 (amount, amount, sim_id)
             )
             conn.execute(
-                "INSERT INTO recharge (sim_id,iccid,amount,method,plan,remark,operator) VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO recharge (sim_id,iccid,amount,method,plan,remark,operator,org_id) VALUES (?,?,?,?,?,?,?,?)",
                 (sim_id, row['iccid'], amount, d.get('method','支付宝'),
-                 d.get('plan',''), d.get('remark',''), d.get('operator','管理员')))
+                 d.get('plan',''), d.get('remark',''), d.get('operator','管理员'), _admin_org_id()))
             new_balance_row = conn.execute("SELECT balance FROM sim_card WHERE id=?", (sim_id,)).fetchone()
             conn.commit()
         finally:
@@ -2515,7 +2705,12 @@ def serve_upload(filename):
         return fail('非法路径', 400)
     if not os.path.isfile(full_path):
         return fail('文件不存在', 404)
-    return _send_abs(full_path)
+    # 危险类型(svg/html/xml 等可被浏览器执行脚本)强制以附件下载，防 XSS；
+    # 图片(png/jpg/gif/webp/ico)保持 inline 以便页面/Logo 直接显示。
+    # 注意：只由后端设 Content-Disposition，nginx 不再重复加，避免响应头重复致浏览器拒绝加载。
+    _danger_exts = {'.svg', '.html', '.htm', '.xml', '.xhtml', '.js'}
+    as_attach = ext in _danger_exts
+    return _send_abs(full_path, as_attachment=as_attach)
 
 
 @app.delete('/api/customers/<int:cid>')
@@ -2741,11 +2936,11 @@ def batch_delete_fences():
 @app.get('/api/mark_points')
 def list_mark_points():
     name = request.args.get('name', '').strip()
-    sql  = "SELECT * FROM mark_point WHERE 1=1"
-    args = []
+    conds, args = ["1=1"], []
     if name:
-        sql += " AND name LIKE ?"; args.append(f'%{name}%')
-    sql += " ORDER BY created_at DESC"
+        conds.append("name LIKE ?"); args.append(f'%{name}%')
+    conds, args = _org_scope_conds(conds, args)
+    sql = "SELECT * FROM mark_point WHERE " + " AND ".join(conds) + " ORDER BY created_at DESC"
     return ok(db_query(sql, tuple(args)))
 
 @app.post('/api/mark_points')
@@ -2759,20 +2954,24 @@ def create_mark_point():
     if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
         return fail('坐标超出有效范围', 400)
     db_exec(
-        "INSERT INTO mark_point (name,lat,lng,remark) VALUES (?,?,?,?)",
-        (name, lat, lng, d.get('remark', ''))
+        "INSERT INTO mark_point (name,lat,lng,remark,org_id) VALUES (?,?,?,?,?)",
+        (name, lat, lng, d.get('remark', ''), _admin_org_id())
     )
     return ok()
 
 @app.delete('/api/mark_points/<int:mid>')
 def delete_mark_point(mid):
+    if not _row_org_ok('mark_point', mid):
+        return fail('无权限', 403)
     db_exec("DELETE FROM mark_point WHERE id=?", (mid,))
     return ok()
 
 # ── 共享风险点 ────────────────────────────────────────────────────────────────
 @app.get('/api/risk_points')
 def list_risk_points():
-    return ok(db_query("SELECT * FROM risk_point ORDER BY created_at DESC"))
+    conds, params = _org_scope_conds(["1=1"], [])
+    sql = "SELECT * FROM risk_point WHERE " + " AND ".join(conds) + " ORDER BY created_at DESC"
+    return ok(db_query(sql, tuple(params)))
 
 @app.post('/api/risk_points')
 def create_risk_point():
@@ -2785,13 +2984,15 @@ def create_risk_point():
     if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
         return fail('坐标超出有效范围', 400)
     db_exec(
-        "INSERT INTO risk_point (name,lat,lng,level,remark) VALUES (?,?,?,?,?)",
-        (name, lat, lng, d.get('level', 'medium'), d.get('remark', ''))
+        "INSERT INTO risk_point (name,lat,lng,level,remark,org_id) VALUES (?,?,?,?,?,?)",
+        (name, lat, lng, d.get('level', 'medium'), d.get('remark', ''), _admin_org_id())
     )
     return ok()
 
 @app.delete('/api/risk_points/<int:rid>')
 def delete_risk_point(rid):
+    if not _row_org_ok('risk_point', rid):
+        return fail('无权限', 403)
     db_exec("DELETE FROM risk_point WHERE id=?", (rid,))
     return ok()
 
@@ -2803,23 +3004,77 @@ def list_command_history():
     page, size = _page_params(20)
     phone  = request.args.get('phone', '').strip()
     offset = (page - 1) * size
+    conds, params = [], []
     if phone:
-        total   = db_scalar("SELECT COUNT(*) FROM command_history WHERE phone=?", (phone,))
-        records = db_query("SELECT * FROM command_history WHERE phone=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                           (phone, size, offset))
-    else:
-        total   = db_scalar("SELECT COUNT(*) FROM command_history")
-        records = db_query("SELECT * FROM command_history ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                           (size, offset))
+        conds.append("phone=?"); params.append(phone)
+    # 按当前管理员组织范围过滤
+    conds, params = _org_scope_conds(conds, params, col='org_id')
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    total   = db_scalar(f"SELECT COUNT(*) FROM command_history {where}", params)
+    records = db_query(f"SELECT * FROM command_history {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                       params + [size, offset])
     return ok({'records': records, 'total': total, 'page': page})
 
 @app.post('/api/command-history')
 def create_command_history():
     d = request.get_json() or {}
-    db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+    db_exec("INSERT INTO command_history (phone,device_name,command,result,response,org_id) VALUES (?,?,?,?,?,?)",
             (d.get('phone',''), d.get('device_name',''), d.get('command',''),
-             d.get('result',''), d.get('response','')))
+             d.get('result',''), d.get('response',''), _admin_org_id()))
     return ok()
+
+
+# ── 传感器数据接口(通用框架)────────────────────────────────────────────────────
+# 为以后接入环境类(温湿度/气体)、状态类(开关/水位/电量)传感器铺路，现只搭骨架。
+# 控制类(执行器下发指令)复用现有 pending_command + /api/commands/g618g + _flush_pending_commands。
+
+@app.post('/api/sensor-data')
+def create_sensor_data():
+    """上报一条传感器数据(程序/设备上报)。org_id 用当前管理员组织。"""
+    d = request.get_json() or {}
+    db_exec("INSERT INTO sensor_data (device_phone,sensor_type,value,value_text,unit,org_id) "
+            "VALUES (?,?,?,?,?,?)",
+            (d.get('device_phone',''), d.get('sensor_type',''), d.get('value'),
+             d.get('value_text',''), d.get('unit',''), _admin_org_id()))
+    return ok()
+
+@app.get('/api/sensor-data')
+def list_sensor_data():
+    """传感器数据列表查询，支持 device_phone/sensor_type 过滤 + 分页，按 ts DESC。"""
+    page, size  = _page_params(20)
+    device_phone = request.args.get('device_phone', '').strip()
+    sensor_type  = request.args.get('sensor_type', '').strip()
+    offset = (page - 1) * size
+    conds, params = [], []
+    if device_phone:
+        conds.append("device_phone=?"); params.append(device_phone)
+    if sensor_type:
+        conds.append("sensor_type=?"); params.append(sensor_type)
+    # 按当前管理员组织范围过滤(组织隔离)
+    conds, params = _org_scope_conds(conds, params, col='org_id')
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    total   = db_scalar(f"SELECT COUNT(*) FROM sensor_data {where}", params)
+    records = db_query(f"SELECT * FROM sensor_data {where} ORDER BY ts DESC LIMIT ? OFFSET ?",
+                       params + [size, offset])
+    return ok({'records': records, 'total': total, 'page': page})
+
+@app.get('/api/sensor-data/latest')
+def latest_sensor_data():
+    """查某设备各类传感器的最新值：返回该设备每种 sensor_type 的最新一条。"""
+    device_phone = request.args.get('device_phone', '').strip()
+    if not device_phone:
+        return fail('device_phone 不能为空', 400)
+    conds, params = ["device_phone=?"], [device_phone]
+    # 组织隔离
+    conds, params = _org_scope_conds(conds, params, col='org_id')
+    where = "WHERE " + " AND ".join(conds)
+    # 子查询取每种 sensor_type 的最大 id(id 自增，等价于最新一条，避免 ts 相同时歧义)
+    records = db_query(
+        f"SELECT * FROM sensor_data {where} AND id IN ("
+        f"  SELECT MAX(id) FROM sensor_data {where} GROUP BY sensor_type"
+        f") ORDER BY sensor_type ASC",
+        params + params)
+    return ok({'records': records})
 
 
 # ── 操作日志接口 ───────────────────────────────────────────────────────────────
@@ -3318,9 +3573,20 @@ def portal_alarms():
     page, size = _page_params(20)
     offset = (page - 1) * size
     ph     = ','.join('?' * len(phones))
-    total   = db_scalar(f"SELECT COUNT(*) FROM alarm_record WHERE phone IN ({ph})", phones)
-    records = db_query(f"SELECT * FROM alarm_record WHERE phone IN ({ph}) ORDER BY alarm_time DESC LIMIT ? OFFSET ?",
-                       phones + [size, offset])
+    # status 过滤：与管理端 list_alarms 一致(0未处理/1已处理)。之前漏过滤导致客户端红点
+    # 恒等于该客户全部报警数——管理员处理后 status 已置 1，客户端仍把已处理的计入"未处理"。
+    conds  = [f"phone IN ({ph})"]
+    params = list(phones)
+    status = request.args.get('status')
+    if status is not None and status != '':
+        _st = _num_or_none(status, int)
+        if _st is None:
+            return fail('status 参数无效', 400)
+        conds.append("status=?"); params.append(_st)
+    where  = "WHERE " + " AND ".join(conds)
+    total   = db_scalar(f"SELECT COUNT(*) FROM alarm_record {where}", params)
+    records = db_query(f"SELECT * FROM alarm_record {where} ORDER BY alarm_time DESC LIMIT ? OFFSET ?",
+                       params + [size, offset])
     return ok({'records': records, 'total': total, 'page': page})
 
 
@@ -3444,6 +3710,44 @@ def portal_send_text():
         return fail('指令下发失败，请稍后重试')
 
 
+@app.post('/api/customer/commands/batch_text')
+def portal_batch_send_text():
+    """客户批量向自己子树内的设备下发文本指令。越权设备静默跳过,仅对在线设备下发。"""
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    data   = request.get_json() or {}
+    phones = data.get('phones', [])
+    text   = (data.get('text') or '').strip()
+    if not phones:
+        return fail('phones 不能为空', 400)
+    if len(phones) > 500:
+        return fail('单次批量下发不超过 500 台设备', 400)
+    if not text:
+        return fail('指令内容不能为空', 400)
+    # 限定在客户子树内的设备,越权 phone 静默跳过
+    my_phones = set(_get_subtree_phones(cid))
+    sent, offline, denied = 0, 0, 0
+    for phone in phones:
+        if phone not in my_phones:
+            denied += 1
+            continue
+        with sessions_lock:
+            conn = sessions.get(phone)
+        if not conn:
+            offline += 1
+            continue
+        try:
+            body = bytes([0x01]) + text.encode('gbk', errors='replace')
+            conn.sendall(p.encode_message(0x8300, phone, next_serial(), body))
+            db_exec("INSERT INTO command_history (phone,device_name,command,result) VALUES (?,?,?,?)",
+                    (phone, phone, text, '已发送'))
+            sent += 1
+        except Exception:
+            offline += 1
+    return ok({'sent': sent, 'offline': offline, 'denied': denied})
+
+
 @app.get('/api/customer/commands/history')
 def portal_command_history():
     """客户查看自己名下设备的指令历史"""
@@ -3480,9 +3784,10 @@ def portal_summary():
     if not phones:
         return ok({'total': 0, 'online': 0, 'offline': 0, 'alarm': 0})
     ph     = ','.join('?' * len(phones))
-    online  = db_scalar(f"SELECT COUNT(*) FROM device WHERE phone IN ({ph}) AND status=1", phones)
-    offline = db_scalar(f"SELECT COUNT(*) FROM device WHERE phone IN ({ph}) AND status=0", phones)
+    # 关机报警驱动：直接读 status 字段，与管理端一致
     alarm   = db_scalar(f"SELECT COUNT(*) FROM device WHERE phone IN ({ph}) AND status=2", phones)
+    online  = db_scalar(f"SELECT COUNT(*) FROM device WHERE phone IN ({ph}) AND status=1", phones)
+    offline = total - online - alarm
     return ok({'total': total, 'online': online, 'offline': offline, 'alarm': alarm})
 
 
@@ -3499,7 +3804,7 @@ def portal_device_list():
     offset  = (page - 1) * size
     base_cols = ("SELECT device.id, device.phone, device.name, device.plate_no, "
                  "device.manufacturer, device.terminal_model, device.last_lat, device.last_lng, "
-                 "device.last_speed, device.last_location_time, device.status, device.customer_id, "
+                 "device.last_speed, device.last_location_time, device.online_time, device.status, device.customer_id, "
                  "r.name AS role_name, r.color AS role_color, r.icon_type AS role_icon "
                  "FROM device LEFT JOIN device_role r ON device.role_id = r.id")
     all_cids = _get_all_descendant_cids(cid)
@@ -3515,6 +3820,7 @@ def portal_device_list():
         total   = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph})", all_cids)
         records = db_query(f"{base_cols} WHERE device.customer_id IN ({cid_ph}) ORDER BY device.id LIMIT ? OFFSET ?",
                            all_cids + [size, offset])
+    # 在线状态直接用 status 字段(关机报警驱动)，不再按时间窗口覆盖。
     return ok({'records': records, 'total': total, 'page': page})
 
 
@@ -3684,14 +3990,22 @@ def portal_assign_sub_customer_devices(sid):
         return fail('无权限或不存在', 404)
     d      = request.get_json() or {}
     phones = d.get('phones', [])
-    # 只能分配归属自己或该子客户的设备
+    # 只能操作「父客户直属」或「该子客户直属」的设备（allowed 集合）。
+    # allowed 之外的设备（如该子客户自己的下级持有的设备）绝不动，避免误伤更深层级。
     allowed = {r['phone'] for r in db_query(
         "SELECT phone FROM device WHERE customer_id=? OR customer_id=?", (cid, sid)
     )}
-    phones = [p for p in phones if p in allowed]
-    # 先把该子客户的设备归还给父客户，再重新分配
-    db_exec("UPDATE device SET customer_id=? WHERE customer_id=?", (cid, sid))
-    for phone in phones:
+    target = [p for p in phones if p in allowed]           # 本次要归属到 sid 的设备
+    target_set = set(target)
+    # 全量设置语义，但严格限制在 allowed 内：
+    # 1) 回收：仅把「当前属于 sid 且本次未勾选」的设备收回父客户（不碰 sid 下级的设备）
+    reclaim = [p for p in allowed
+               if p not in target_set
+               and db_query_one("SELECT 1 FROM device WHERE phone=? AND customer_id=?", (p, sid))]
+    for phone in reclaim:
+        db_exec("UPDATE device SET customer_id=? WHERE phone=?", (cid, phone))
+    # 2) 分配：把本次勾选的设备归属到 sid
+    for phone in target:
         db_exec("UPDATE device SET customer_id=? WHERE phone=?", (sid, phone))
     return ok()
 
@@ -3719,17 +4033,42 @@ def portal_create_fence():
         return fail('围栏名称不能为空', 400)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     devices_str = d.get('devices','') or ''
+    fence_type  = d.get('fence_type', 'circle')
+    color       = d.get('color', '#409EFF')
+    # 按围栏类型分别落库(与管理端 create_fence 一致)：之前不分类型、直接塞 coordinates 原始
+    # 数组且不存 adcode，导致客户建多边形(coordinates 未 JSON 化插入报错)、行政区(缺 adcode)失败。
+    import json as _json
+    if fence_type == 'circle':
+        lat = _num_or_none(d.get('lat'), float, lo=-90,  hi=90)
+        lng = _num_or_none(d.get('lng'), float, lo=-180, hi=180)
+        radius = _num_or_none(d.get('radius', 2000), int, lo=1)
+        if lat is None or lng is None:
+            return fail('圆形围栏需要合法的 lat(-90~90)/lng(-180~180)', 400)
+        if radius is None:
+            return fail('radius 需为正整数', 400)
+        ins_sql = ("INSERT INTO geo_fence (name,fence_type,lat,lng,radius,color,devices,customer_id,created_at) "
+                   "VALUES (?,?,?,?,?,?,?,?,?)")
+        ins_params = (name, 'circle', lat, lng, radius, color, devices_str, cid, now)
+    elif fence_type == 'polygon':
+        coords = d.get('coordinates')
+        if not coords:
+            return fail('多边形围栏需要 coordinates', 400)
+        ins_sql = ("INSERT INTO geo_fence (name,fence_type,lat,lng,coordinates,color,devices,customer_id,created_at) "
+                   "VALUES (?,?,?,?,?,?,?,?,?)")
+        ins_params = (name, 'polygon', 0.0, 0.0, _json.dumps(coords), color, devices_str, cid, now)
+    elif fence_type == 'administrative':
+        if not d.get('adcode'):
+            return fail('行政区围栏需要 adcode', 400)
+        ins_sql = ("INSERT INTO geo_fence (name,fence_type,lat,lng,adcode,coordinates,color,devices,customer_id,created_at) "
+                   "VALUES (?,?,?,?,?,?,?,?,?,?)")
+        ins_params = (name, 'administrative', 0.0, 0.0, str(d['adcode']),
+                      _json.dumps(d.get('coordinates', [])), color, devices_str, cid, now)
+    else:
+        return fail('未知围栏类型', 400)
     with _db_lock:
         conn = get_db()
         try:
-            cur = conn.execute(
-                "INSERT INTO geo_fence (name,fence_type,lat,lng,radius,coordinates,color,devices,customer_id,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (name, d.get('fence_type','circle'), d.get('lat'), d.get('lng'),
-                 d.get('radius', 2000), d.get('coordinates'), d.get('color','#409EFF'),
-                 devices_str, cid, now)
-            )
-            new_id = cur.lastrowid
+            new_id = conn.execute(ins_sql, ins_params).lastrowid
             _sync_fence_devices(new_id, devices_str, conn=conn)   # 双写：同 conn 同步关联表
             conn.commit()
             return ok({'id': new_id})
@@ -3745,9 +4084,21 @@ def portal_update_fence(fid):
     if not db_query_one("SELECT id FROM geo_fence WHERE id=? AND customer_id=?", (fid, cid)):
         return fail('无权限或不存在', 404)
     d = request.get_json() or {}
-    db_exec("UPDATE geo_fence SET name=?,fence_type=?,lat=?,lng=?,radius=?,coordinates=?,color=? WHERE id=?",
-            (d.get('name'), d.get('fence_type'), d.get('lat'), d.get('lng'),
-             d.get('radius',2000), d.get('coordinates'), d.get('color','#409EFF'), fid))
+    fence_type = d.get('fence_type', 'circle')
+    color      = d.get('color', '#409EFF')
+    # 按类型更新：多边形/行政区的 coordinates 需 JSON 化，行政区还要写 adcode(与创建一致)
+    import json as _json
+    if fence_type == 'polygon':
+        db_exec("UPDATE geo_fence SET name=?,fence_type=?,lat=0,lng=0,coordinates=?,color=? WHERE id=?",
+                (d.get('name'), 'polygon', _json.dumps(d.get('coordinates') or []), color, fid))
+    elif fence_type == 'administrative':
+        db_exec("UPDATE geo_fence SET name=?,fence_type=?,lat=0,lng=0,adcode=?,coordinates=?,color=? WHERE id=?",
+                (d.get('name'), 'administrative', str(d.get('adcode') or ''),
+                 _json.dumps(d.get('coordinates') or []), color, fid))
+    else:
+        db_exec("UPDATE geo_fence SET name=?,fence_type=?,lat=?,lng=?,radius=?,color=? WHERE id=?",
+                (d.get('name'), 'circle', d.get('lat'), d.get('lng'),
+                 d.get('radius', 2000), color, fid))
     return ok()
 
 
@@ -3802,6 +4153,172 @@ def portal_pool_devices():
         all_ids
     )
     return ok(records)
+
+
+# ── 客户门户：设备角色/分组（每客户独立，按 customer_id 隔离） ──────────────────
+# 客户只看/管 device_role.customer_id = 自己的角色；分配设备限定在客户子树内。
+
+@app.get('/api/customer/roles')
+def portal_list_roles():
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    records = db_query(
+        "SELECT r.*, "
+        "(SELECT COUNT(*) FROM device d WHERE d.role_id = r.id) as device_count "
+        "FROM device_role r WHERE r.customer_id=? ORDER BY r.created_at ASC", (cid,))
+    return ok({'records': records, 'total': len(records)})
+
+
+@app.post('/api/customer/roles')
+def portal_create_role():
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    d = request.get_json() or {}
+    name = (d.get('name') or '').strip()
+    if not name:
+        return fail('角色名称不能为空', 400)
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    db_exec(
+        "INSERT INTO device_role (name,color,icon_type,description,customer_id,created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (name, d.get('color', '#409EFF'), d.get('icon_type', '圆形'),
+         d.get('description', ''), cid, now))
+    return ok()
+
+
+def _portal_role_or_none(rid, cid):
+    """取该客户拥有的角色(customer_id=cid)，无权/不存在返回 None，防跨客户改他人角色。"""
+    return db_query_one("SELECT id FROM device_role WHERE id=? AND customer_id=?", (rid, cid))
+
+
+@app.put('/api/customer/roles/<int:rid>')
+def portal_update_role(rid):
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    if not _portal_role_or_none(rid, cid):
+        return fail('角色不存在或无权限', 404)
+    d = request.get_json() or {}
+    name = (d.get('name') or '').strip()
+    if not name:
+        return fail('角色名称不能为空', 400)
+    db_exec("UPDATE device_role SET name=?,color=?,icon_type=?,description=? WHERE id=?",
+            (name, d.get('color', '#409EFF'), d.get('icon_type', '圆形'),
+             d.get('description', ''), rid))
+    return ok()
+
+
+@app.delete('/api/customer/roles/<int:rid>')
+def portal_delete_role(rid):
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    if not _portal_role_or_none(rid, cid):
+        return fail('角色不存在或无权限', 404)
+    db_exec("UPDATE device SET role_id=NULL WHERE role_id=?", (rid,))
+    db_exec("DELETE FROM device_role WHERE id=?", (rid,))
+    return ok()
+
+
+@app.put('/api/customer/roles/<int:rid>/assign')
+def portal_assign_role_devices(rid):
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    if not _portal_role_or_none(rid, cid):
+        return fail('角色不存在或无权限', 404)
+    d = request.get_json() or {}
+    phones = d.get('phones', [])
+    # 只允许分配客户子树内的设备，越权 phone 静默忽略
+    my_phones = set(_get_subtree_phones(cid))
+    phones = [p for p in phones if p in my_phones]
+    db_exec("UPDATE device SET role_id=NULL WHERE role_id=?", (rid,))
+    if phones:
+        ph = ','.join('?' * len(phones))
+        db_exec(f"UPDATE device SET role_id=? WHERE phone IN ({ph})", [rid] + list(phones))
+    return ok()
+
+
+# ── 客户门户：标注点 / 风险点（每客户独立，按 customer_id 隔离） ──────────────────
+
+@app.get('/api/customer/mark_points')
+def portal_list_mark_points():
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    name = request.args.get('name', '').strip()
+    conds, args = ["customer_id=?"], [cid]
+    if name:
+        conds.append("name LIKE ?"); args.append(f'%{name}%')
+    sql = "SELECT * FROM mark_point WHERE " + " AND ".join(conds) + " ORDER BY created_at DESC"
+    return ok(db_query(sql, tuple(args)))
+
+
+@app.post('/api/customer/mark_points')
+def portal_create_mark_point():
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    d = request.get_json() or {}
+    name = (d.get('name') or '').strip()
+    if not name or d.get('lat') is None or d.get('lng') is None:
+        return fail('name/lat/lng 不能为空', 400)
+    lat = float(d['lat']); lng = float(d['lng'])
+    if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+        return fail('坐标超出有效范围', 400)
+    db_exec("INSERT INTO mark_point (name,lat,lng,remark,customer_id) VALUES (?,?,?,?,?)",
+            (name, lat, lng, d.get('remark', ''), cid))
+    return ok()
+
+
+@app.delete('/api/customer/mark_points/<int:mid>')
+def portal_delete_mark_point(mid):
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    if not db_query_one("SELECT id FROM mark_point WHERE id=? AND customer_id=?", (mid, cid)):
+        return fail('无权限或不存在', 404)
+    db_exec("DELETE FROM mark_point WHERE id=?", (mid,))
+    return ok()
+
+
+@app.get('/api/customer/risk_points')
+def portal_list_risk_points():
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    sql = "SELECT * FROM risk_point WHERE customer_id=? ORDER BY created_at DESC"
+    return ok(db_query(sql, (cid,)))
+
+
+@app.post('/api/customer/risk_points')
+def portal_create_risk_point():
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    d = request.get_json() or {}
+    name = (d.get('name') or '').strip()
+    if not name or d.get('lat') is None or d.get('lng') is None:
+        return fail('name/lat/lng 不能为空', 400)
+    lat = float(d['lat']); lng = float(d['lng'])
+    if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+        return fail('坐标超出有效范围', 400)
+    db_exec("INSERT INTO risk_point (name,lat,lng,level,remark,customer_id) VALUES (?,?,?,?,?,?)",
+            (name, lat, lng, d.get('level', 'medium'), d.get('remark', ''), cid))
+    return ok()
+
+
+@app.delete('/api/customer/risk_points/<int:rid>')
+def portal_delete_risk_point(rid):
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    if not db_query_one("SELECT id FROM risk_point WHERE id=? AND customer_id=?", (rid, cid)):
+        return fail('无权限或不存在', 404)
+    db_exec("DELETE FROM risk_point WHERE id=?", (rid,))
+    return ok()
 
 
 # ── 客户门户：SIM 卡（只读自己名下设备的SIM，可改信息/充值，不能新增/绑定/删除） ──

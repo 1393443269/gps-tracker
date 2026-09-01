@@ -174,7 +174,7 @@
 <script setup>
 import { ref, reactive, onMounted } from 'vue'
 import { Search, Edit as EditIcon, Download, Plus } from '@element-plus/icons-vue'
-import { deviceApi, customerApi, roleApi, UPLOAD_AVATAR_URL, uploadHeaders } from '@/api'
+import { deviceApi, portalApi, isAdmin, customerApi, roleApi, UPLOAD_AVATAR_URL, uploadHeaders } from '@/api'
 import { ElMessage } from 'element-plus'
 
 // 头像相对路径 → 完整可访问地址（后端返回 /uploads/xxx）
@@ -284,13 +284,19 @@ async function loadData(p = page.value) {
   loading.value = true
   page.value = p
   try {
-    const res = await deviceApi.withCustomer({
-      page: p, size: pageSize.value,
-      customer_id:    queryCustomerId.value ?? undefined,
-      terminal_model: queryModel.value || undefined,
-      imei:           queryImei.value.trim() || undefined,
-      role_id:        queryRoleId.value || undefined,
-    })
+    // 按身份分流：管理员走管理端(可按客户筛选)，客户走门户接口(只返回自己名下设备)
+    const res = isAdmin()
+      ? await deviceApi.withCustomer({
+          page: p, size: pageSize.value,
+          customer_id:    queryCustomerId.value ?? undefined,
+          terminal_model: queryModel.value || undefined,
+          imei:           queryImei.value.trim() || undefined,
+          role_id:        queryRoleId.value || undefined,
+        })
+      : await portalApi.deviceList({
+          page: p, size: pageSize.value,
+          keyword: queryImei.value.trim() || undefined,
+        })
     list.value  = res.data?.records || []
     total.value = res.data?.total   || 0
   } finally {

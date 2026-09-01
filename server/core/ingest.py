@@ -47,6 +47,16 @@ log = logging.getLogger(__name__)
 # PG 专用(批量写用 execute_values);sqlite 后端为 None,与原 getattr 兜底一致
 _pg_extras = getattr(_dbmod, '_pg_extras', None)
 
+# 低电量自动缩短上报间隔：电量≤阈值时下发缩短间隔，恢复后切回正常间隔（阈值/间隔在此改）
+LOW_BAT_THRESHOLD = 10      # 电量阈值 %
+LOW_BAT_INTERVAL  = 5       # 低电量上报间隔(分钟)
+NORMAL_INTERVAL   = 20      # 正常上报间隔(分钟)。20 分钟是"保持在线且最省电"的平衡点：
+                            # 配 45 分钟在线窗口，能容忍偶尔丢报不误判离线。
+# 保持在线的根因不是间隔而是"休眠"：G618G 默认静止 20~40 分钟进入休眠、彻底停报(协议 2.1/2.3)。
+# 故上线时必须下发"关休眠"(0xCE18/02)，否则设备静止即离线。保持短连接(报完即断)最省电，
+# 不切长连接(长连接每 4 分钟强制心跳、射频常开，最费电)。
+DISABLE_SLEEP_ON_LOGIN = True   # 设备上线自动关闭休眠(保持在线的关键开关)
+
 
 def _get_device_id(phone):
     import time as _t
@@ -532,6 +542,22 @@ def _record_attendance(fence_id, fence_name, phone, action, event_time):
         log.error("[考勤] 记录失败: %s", e)
 
 
+def insert_sensor_data(phone, sensor_type, value=None, value_text='', unit='', org_id=None):
+    """程序内落库一条传感器数据(供以后协议解析调用)。
+    与 app.py 的 sensor_data 表对应。org_id 不传则按设备归属自动带出(取不到默认 1)。"""
+    try:
+        if org_id is None:
+            dev = db_query_one("SELECT org_id FROM device WHERE phone=?", (phone,))
+            org_id = (dev.get('org_id') if dev else 1) or 1
+        db_exec(
+            "INSERT INTO sensor_data (device_phone,sensor_type,value,value_text,unit,org_id) "
+            "VALUES (?,?,?,?,?,?)",
+            (phone, sensor_type, value, value_text or '', unit or '', org_id)
+        )
+    except Exception as e:
+        log.error("[传感器] 落库失败: %s", e)
+
+
 # ── 客户链解析 / Socket.IO 推送 ───────────────────────────────────────────────
 
 def _customer_ancestors(cid):
@@ -557,6 +583,18 @@ def _sio_emit(event: str, data: dict, phone: str):
     row = db_query_one("SELECT org_id, customer_id FROM device WHERE phone=?", (phone,))
     org_id = int(row.get('org_id') or 1) if row else 1
     cid    = row.get('customer_id') if row else None
+    # 临时诊断：打印各房间当前在线客户端数，定位"推了但没人收"的问题
+    try:
+        _mgr = socketio.server.manager
+        def _rc(rm):
+            try:
+                return len(set(_mgr.get_participants('/', rm)))
+            except Exception:
+                return -1
+        log.info("[WS诊断] event=%s phone=%s 房间在线: org_%s=%d broadcast=%d",
+                 event, phone, org_id, _rc(f'org_{org_id}'), _rc('broadcast'))
+    except Exception as _e:
+        log.info("[WS诊断] 统计失败: %s", _e)
     socketio.emit(event, data, room=f'org_{org_id}')   # 该组织管理员
     socketio.emit(event, data, room='broadcast')        # 超级管理员
     # 归属客户及其上级客户
@@ -952,6 +990,38 @@ def handle_location(sock, phone, serial, body):
         log.error("[围栏检测] 异常: %s", e)
 
 
+def _flush_pending_commands(conn, imei):
+    """设备上线时补发待发队列里的指令。
+    payload 已在入队时构造好(payload_hex)，此处直接发送，不依赖 app 层指令构造函数，
+    避免 ingest 反向 import app 造成循环依赖。G618G 短连接需连发两次(间隔<20ms)。
+    单条失败不影响其余；发送异常整体跳过（连接可能刚断），指令留在队列等下次上线。"""
+    try:
+        rows = db_query(
+            "SELECT id, payload_hex FROM pending_command WHERE phone=? AND status='pending' ORDER BY id",
+            (imei,))
+    except Exception as e:
+        log.warning("[G618G] 待发队列查询失败 imei=%s err=%s", imei, e)
+        return
+    if not rows:
+        return
+    import time as _t
+    sent = 0
+    for row in rows:
+        try:
+            payload = bytes.fromhex(row['payload_hex'])
+            conn.sendall(payload)
+            _t.sleep(0.01)
+            conn.sendall(payload)
+            db_exec("UPDATE pending_command SET status='sent', sent_at=? WHERE id=?",
+                    (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), row['id']))
+            sent += 1
+        except Exception as e:
+            log.warning("[G618G] 待发指令补发失败 imei=%s id=%s err=%s", imei, row['id'], e)
+            break   # 发送通道异常，剩余留到下次上线
+    if sent:
+        log.info("[G618G] 补发待发指令 imei=%s 成功 %d 条", imei, sent)
+
+
 def handle_g618g_frame(conn, frame, phone_holder):
     """处理一个 G618G 上报帧：解析并落库。phone_holder 是 [phone] 单元素列表（可变引用）。"""
     r = g618.parse(frame)
@@ -983,12 +1053,54 @@ def handle_g618g_frame(conn, frame, phone_holder):
         import time as _t
         conn.sendall(g618.build_login_reply(int(_t.time())))
         log.info("[G618G] 设备上线 IMEI=%s", imei)
+        # 补发待发指令：设备离线时排队的指令，趁这次上线窗口发出去
+        _flush_pending_commands(conn, imei)
+        # 离线判定改为"关机报警驱动"：设备保持出厂默认(短连接+休眠)最省电，平台不再下发
+        # 关休眠/调频去干预设备。设备一旦有任何上报(注册/心跳/定位)即视为开机在线，
+        # 收到关机报警(0x21)才判离线。注册分支上面已置 status=1，此处无需再下发保活指令。
 
     elif typ == 'heartbeat':       # 0xF9 心跳：回复保持连接 + 更新电量
         conn.sendall(g618.build_heartbeat_reply())
         imei = phone_holder[0]
         if imei:
-            db_exec("UPDATE device SET updated_at=? WHERE phone=?", (now, imei))
+            # 电量存两处：device.last_battery 存实时值(供列表/详情直接读)，
+            # sensor_data 存历史(供以后画电量曲线)。battery_pct 可能为 None(短心跳payload)，判空再存。
+            battery_pct = r.get('battery_pct')
+            if battery_pct is not None:
+                db_exec("UPDATE device SET last_battery=?, last_battery_time=?, updated_at=? WHERE phone=?",
+                        (battery_pct, now, now, imei))
+                insert_sensor_data(imei, 'battery', value=battery_pct, unit='%')
+                # 低电量自动缩短上报间隔：电量刚更新、conn 正连着，可直接下发。
+                # 只在状态变化时下发一次，靠 device.low_bat_mode 标志防重复（幂等）。
+                _bat_row = db_query_one("SELECT low_bat_mode FROM device WHERE phone=?", (imei,))
+                _low_mode = (_bat_row['low_bat_mode'] if _bat_row else 0) or 0
+                if battery_pct <= LOW_BAT_THRESHOLD and _low_mode != 1:
+                    # 正常→低电量：下发缩短间隔
+                    try:
+                        _freq_payload = g618.build_set_freq(LOW_BAT_INTERVAL)
+                        conn.sendall(_freq_payload)
+                        _time_mod.sleep(0.01)   # G618G 短连接连发两次(间隔<20ms)
+                        conn.sendall(_freq_payload)
+                        db_exec("UPDATE device SET low_bat_mode=1 WHERE phone=?", (imei,))
+                        log.info("[G618G] 低电量%d%%,切换上报间隔为%d分钟 imei=%s",
+                                 battery_pct, LOW_BAT_INTERVAL, imei)
+                    except Exception as e:
+                        # 连接刚断等导致下发失败：只告警不中断心跳（标志未置位，下次心跳会重试）
+                        log.warning("[G618G] 低电量切换间隔下发失败 imei=%s err=%s", imei, e)
+                elif battery_pct > LOW_BAT_THRESHOLD and _low_mode == 1:
+                    # 低电量→恢复:切回正常间隔
+                    try:
+                        _freq_payload = g618.build_set_freq(NORMAL_INTERVAL)
+                        conn.sendall(_freq_payload)
+                        _time_mod.sleep(0.01)   # G618G 短连接连发两次(间隔<20ms)
+                        conn.sendall(_freq_payload)
+                        db_exec("UPDATE device SET low_bat_mode=0 WHERE phone=?", (imei,))
+                        log.info("[G618G] 电量恢复%d%%,切回正常上报间隔为%d分钟 imei=%s",
+                                 battery_pct, NORMAL_INTERVAL, imei)
+                    except Exception as e:
+                        log.warning("[G618G] 恢复正常间隔下发失败 imei=%s err=%s", imei, e)
+            else:
+                db_exec("UPDATE device SET updated_at=? WHERE phone=?", (now, imei))
 
     elif typ == 'location':        # 0x03 位置：更新设备最新位置 + 写轨迹（走异步批量）
         imei = phone_holder[0]
@@ -1007,22 +1119,67 @@ def handle_g618g_frame(conn, frame, phone_holder):
                 (did, imei, r['lat'], r['lng'], 0, 0, 0, 0, 2, None, gps_time),
                 (imei, r['lat'], r['lng'], 0, gps_time, 1, now)
             )
+            # WebSocket 实时推送位置到前端地图（与 808/MQTT 路径一致，缺此步则设备有坐标却不上图）
+            role_row = db_query_one(
+                "SELECT r.name AS role_name, r.color AS role_color, r.icon_type AS role_icon "
+                "FROM device LEFT JOIN device_role r ON device.role_id = r.id WHERE device.phone=?",
+                (imei,))
+            _sio_emit('location_update', {
+                'phone':     imei,
+                'lat':       r['lat'],
+                'lng':       r['lng'],
+                'speed':     0,
+                'direction': 0,
+                'altitude':  0,
+                'alarm':     False,
+                'alarmFlag': 0,
+                'time':      gps_time,
+                'roleName':  role_row.get('role_name')  if role_row else None,
+                'roleColor': role_row.get('role_color') if role_row else None,
+                'roleIcon':  role_row.get('role_icon')  if role_row else None,
+            }, imei)
+            log.info("[G618G] 位置上报并推送 phone=%s lat=%.6f lng=%.6f", imei, r['lat'], r['lng'])
 
     elif typ in ('alarm', 'alarm2'):   # 0x02/0x21 报警
         imei = phone_holder[0]
         if imei:
             did = _get_device_id(imei)
-            desc = '、'.join(r.get('alarms') or ['报警'])
+            _alarm_list = r.get('alarms') or ['报警']
+            desc = '、'.join(_alarm_list)
             db_exec("INSERT INTO alarm_record (device_id,phone,alarm_type,alarm_desc,alarm_time,status) "
                     "VALUES (?,?,?,?,?,0)", (did, imei, r.get('warn_bits', 0), desc, now))
-            has_sos = any('SOS' in a for a in (r.get('alarms') or []))
+            has_sos = any('SOS' in a for a in _alarm_list)
             _emit_alarm('alarm', {'phone': imei, 'alarmDesc': desc, 'time': now},
                         imei, 0 if has_sos else 99)
+            # 关机报警驱动离线：收到关机类报警(主动/低电/充电关机，0x21)即判设备离线。
+            # 这是"设备保持出厂默认最省电、平台按信号判离线"方案的核心：平时有上报即在线，
+            # 唯有收到明确的关机信号才置离线。注意此方案下没电耗尽/失联/死机可能无关机报警上报，
+            # 那几种情况平台仍显示在线(已与用户确认，属纯信号驱动的已知取舍)。
+            _is_shutdown = any(('关机' in a) for a in _alarm_list)
+            if _is_shutdown:
+                db_exec("UPDATE device SET status=0, offline_time=?, updated_at=? WHERE phone=?",
+                        (now, now, imei))
+                log.info("[G618G] 收到关机报警(%s)判离线 imei=%s", desc, imei)
+                # 实时推送离线状态到前端，使地图/列表即时反映
+                _sio_emit('device_offline', {'phone': imei, 'time': now, 'reason': desc}, imei)
 
     elif typ == 'iccid':           # 0xF3 SIM ICCID
         imei = phone_holder[0]
         if imei:
-            db_exec("UPDATE device SET remark=? WHERE phone=?", ('ICCID:'+r['iccid'], imei))
+            iccid = r['iccid']
+            db_exec("UPDATE device SET remark=? WHERE phone=?", ('ICCID:'+iccid, imei))
+            # 打通 SIM 卡管理：设备上报的 ICCID 自动登记/关联到 sim_card 表，
+            # 使 SIM 卡管理页能看到该卡及其绑定设备。iccid 唯一，存在则仅更新绑定设备，
+            # 不覆盖运营商/套餐/到期等人工维护字段。跨库(SQLite/PG)用先查后写，避免 UPSERT 方言差异。
+            try:
+                exist = db_query_one("SELECT id FROM sim_card WHERE iccid=?", (iccid,))
+                if exist:
+                    db_exec("UPDATE sim_card SET device_phone=? WHERE iccid=?", (imei, iccid))
+                else:
+                    db_exec("INSERT INTO sim_card (iccid, device_phone, remark) VALUES (?,?,?)",
+                            (iccid, imei, '设备自动上报'))
+            except Exception as e:
+                log.warning("[G618G] SIM卡登记失败 imei=%s iccid=%s err=%s", imei, iccid, e)
 
     elif typ == 'charge':          # 0xC3 充电状态
         pass   # 可扩展：记录充电事件
@@ -1182,11 +1339,9 @@ def handle_client(conn, addr):
                 for _k in [k for k, v in sessions.items() if v is conn]:
                     sessions.pop(_k, None)
             _fence_cleanup(phone)   # 清理围栏状态，防内存泄漏和 phone 复用时状态污染
-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            try:
-                db_exec("UPDATE device SET status=0, offline_time=? WHERE phone=?", (now, resolve_phone(phone)))
-            except Exception:
-                pass
+            # 关机报警驱动离线方案：短连接设备(G618G等)上报完即断开 TCP，这是正常低功耗行为，
+            # 【不能】据此判离线，否则设备每次上报完就被置离线、离线状态形同虚设。
+            # 设备离线只由「收到关机报警(0x21)」置位(见 alarm2 分支)，TCP 断开只记日志、不改 status。
         log.info("[808] 连接断开: %s phone=%s", addr, phone)
 
 

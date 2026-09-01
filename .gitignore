@@ -64,3 +64,7 @@ mqtt_credentials.txt
 *.pfx
 certs/
 ssl/
+
+# 开发临时备份(改代码时 cp 的快照,不入库)
+*.bak_*
+*.bak.*

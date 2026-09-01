@@ -127,7 +127,7 @@
 <script setup>
 import { ref, reactive, computed, onMounted, nextTick } from 'vue'
 import { Plus, Grid, Edit as EditIcon, Delete } from '@element-plus/icons-vue'
-import { roleApi, deviceApi } from '@/api'
+import { roleApi, deviceApi, portalApi, isAdmin } from '@/api'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 // ── 角色图标形状 ──────────────────────────────────────────────────────────────
@@ -161,7 +161,7 @@ const loading = ref(false)
 async function loadList() {
   loading.value = true
   try {
-    const res = await roleApi.list()
+    const res = isAdmin() ? await roleApi.list() : await portalApi.roles.list()
     list.value = res.data?.records || []
   } finally {
     loading.value = false
@@ -200,9 +200,9 @@ async function submitForm() {
   try {
     const payload = { name: form.name, color: form.color, icon_type: form.icon_type, description: form.description }
     if (isEdit.value) {
-      await roleApi.update(form.id, payload)
+      isAdmin() ? await roleApi.update(form.id, payload) : await portalApi.roles.update(form.id, payload)
     } else {
-      await roleApi.create(payload)
+      isAdmin() ? await roleApi.create(payload) : await portalApi.roles.create(payload)
     }
     ElMessage.success(isEdit.value ? '保存成功' : '角色创建成功')
     formVisible.value = false
@@ -219,7 +219,7 @@ async function doDelete(row) {
       '删除确认', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
     )
   } catch { return }
-  await roleApi.remove(row.id)
+  isAdmin() ? await roleApi.remove(row.id) : await portalApi.roles.remove(row.id)
   ElMessage.success('已删除')
   loadList()
 }
@@ -250,7 +250,7 @@ async function openAssign() {
 
 async function onAssignOpen() {
   try {
-    const res = await deviceApi.withCustomer({ size: 500 })
+    const res = isAdmin() ? await deviceApi.withCustomer({ size: 500 }) : await portalApi.deviceList({ size: 500 })
     assignDevices.value = res.data?.records || []
   } catch {}
 }
@@ -277,7 +277,7 @@ async function submitAssign() {
   assignSaving.value = true
   try {
     const phones = assignSelected.value.map(r => r.phone)
-    await roleApi.assignDevices(assignRoleId.value, phones)
+    isAdmin() ? await roleApi.assignDevices(assignRoleId.value, phones) : await portalApi.roles.assignDevices(assignRoleId.value, phones)
     ElMessage.success(`已将 ${phones.length} 台设备分配到该角色`)
     assignVisible.value = false
     loadList()

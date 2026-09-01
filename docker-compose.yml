@@ -25,6 +25,7 @@ services:
       - MQTT_PASS=${MQTT_PASS}
       # 腾讯位置服务 Key（WiFi/基站/蓝牙坐标换算，可选；不配则这类定位不出点）
       - TENCENT_LBS_KEY=${TENCENT_LBS_KEY:-}
+      - ONLINE_WINDOW_MIN=${ONLINE_WINDOW_MIN:-25}
       # 生产必须为 0；本地调试才设为 1
       - DEBUG_MODE=0
     ports:
