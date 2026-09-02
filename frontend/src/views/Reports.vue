@@ -134,7 +134,7 @@
 <script setup>
 import { ref, computed, onMounted, nextTick } from 'vue'
 import { Refresh } from '@element-plus/icons-vue'
-import { reportApi } from '@/api'
+import { reportApi, portalApi, isAdmin } from '@/api'
 
 const loading         = ref(false)
 const dateRange       = ref(null)
@@ -240,7 +240,7 @@ async function load() {
     } else {
       params.days = quickDays.value
     }
-    const res = await reportApi.summary(params)
+    const res = isAdmin() ? await reportApi.summary(params) : await portalApi.reportSummary(params)
     data.value = res.data || {}
     await nextTick()
     drawCharts()

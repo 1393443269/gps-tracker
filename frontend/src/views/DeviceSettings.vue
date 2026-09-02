@@ -67,7 +67,7 @@
         <template #default="{ row }"><span>{{ row.terminal_id || row.phone }}</span></template>
       </el-table-column>
       <el-table-column label="IMEI" width="160">
-        <template #default="{ row }"><span v-if="row.imei">{{ row.imei }}</span><span v-else style="color:#ccc;font-size:12px;">—</span></template>
+        <template #default="{ row }">{{ row.imei || row.phone }}</template>
       </el-table-column>
       <el-table-column prop="account"        label="归属账号"   width="130">
         <template #default="{ row }">

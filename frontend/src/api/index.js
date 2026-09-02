@@ -141,6 +141,7 @@ export const commandApi = {
                                http.post('/commands/track',   { phone, interval, duration }),
   history:  (params)        => http.get('/command-history', { params }),
   addHistory: (data)        => http.post('/command-history', data),
+  zhiling:  (data)          => http.post('/commands/zhiling', data),
 }
 
 // ── SIM 卡 ────────────────────────────────────────────────────────────────────
@@ -203,6 +204,7 @@ export const portalApi = {
   devices:        ()              => portalHttp.get('/devices'),
   updateDevice:   (phone, data)   => portalHttp.put(`/devices/${phone}/update`, data),
   summary:        ()              => portalHttp.get('/summary'),
+  reportSummary:  (params)        => portalHttp.get('/report/summary', { params }),
   // 位置
   latest:         (phone)         => portalHttp.get(`/locations/${phone}/latest`),
   history:        (phone, params) => portalHttp.get(`/locations/${phone}/history`, { params }),

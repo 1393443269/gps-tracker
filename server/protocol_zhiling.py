@@ -165,11 +165,11 @@ def encode_cmd(cmd_str: str) -> bytes:
 # ── 可用指令清单（供 API 校验）─────────────────────────────────────────────────
 
 AVAILABLE_COMMANDS = {
-    'set_ip':           {'func': build_set_ip,           'params': ['ip', 'port'], 'desc': '设置服务器IP'},
+    'set_ip':           {'func': build_set_ip,           'params': ['ip', 'port', 'proto'], 'desc': '设置服务器IP'},
     'close_ip':         {'func': build_close_ip,         'params': [],             'desc': '关闭IP通道'},
     'query_status':     {'func': build_query_status,     'params': [],             'desc': '查询设备状态'},
     'set_interval':     {'func': build_set_interval,     'params': ['move_sec', 'static_sec', 'heartbeat_sec'], 'desc': '设置上传频率'},
-    'reset':            {'func': build_reset,            'params': [],             'desc': '远程复位'},
+    'reset':            {'func': build_reset,            'params': ['delay_sec'], 'desc': '远程复位'},
     'upload':           {'func': build_upload_now,       'params': [],             'desc': '立即上传定位'},
     'set_volume':       {'func': build_set_volume,       'params': ['level'],      'desc': '设置音量'},
     'set_card_info':    {'func': build_set_card_info,    'params': ['company', 'name', 'emp_id', 'title'], 'desc': '设置工卡信息'},
@@ -186,5 +186,5 @@ AVAILABLE_COMMANDS = {
     'set_sos_msg':      {'func': build_set_sos_msg,      'params': ['msg'],        'desc': 'SOS短信'},
     'set_ntrip':        {'func': build_set_ntrip,        'params': ['ip', 'port', 'mountpoint', 'user', 'pwd', 'freq'], 'desc': 'NTRIP RTK'},
     'close_rtk':        {'func': build_close_rtk,        'params': [],             'desc': '关闭RTK'},
-    'set_apn':          {'func': build_set_apn,          'params': ['apn_type', 'name'], 'desc': '设置APN'},
+    'set_apn':          {'func': build_set_apn,          'params': ['apn_type', 'name', 'user', 'pwd'], 'desc': '设置APN'},
 }

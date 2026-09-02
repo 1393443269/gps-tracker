@@ -3823,6 +3823,160 @@ def portal_summary():
     return ok({'total': total, 'online': online, 'offline': offline, 'alarm': alarm})
 
 
+# ── 客户门户：报表统计（照搬管理端 report_summary，过滤范围换成客户子树） ──────
+@app.get('/api/customer/report/summary')
+def portal_report_summary():
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+
+    # 时间范围参数（默认近30天，最多365天）
+    try:
+        days = min(365, max(1, int(request.args.get('days', 30))))
+    except (ValueError, TypeError):
+        days = 30
+    start_raw = request.args.get('start', '').strip()
+    end_raw   = request.args.get('end', '').strip()
+
+    # 日期格式校验，防止 SQL 注入
+    if start_raw and (not _DATE_RE.match(start_raw) or not _DATE_RE.match(end_raw)):
+        return fail('日期格式错误，应为 YYYY-MM-DD', 400)
+
+    # 客户子树：cid 及所有后代客户
+    all_cids = _get_all_descendant_cids(cid)
+    phones   = _get_subtree_phones(cid)
+    cid_ph   = ','.join('?' * len(all_cids)) if all_cids else '0'
+    ph       = ','.join('?' * len(phones)) if phones else '0'
+
+    # 设备统计：按 customer_id 过滤到客户子树
+    device_total    = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph})", all_cids)
+    device_online   = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND status=1", all_cids)
+    device_alarm    = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND status=2", all_cids)
+    device_active   = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND lifecycle=1", all_cids)
+    device_inactive = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND lifecycle=0", all_cids)
+    device_disabled = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND lifecycle IN (2,3)", all_cids)
+
+    # 报警统计：alarm_record 按 phone 关联子树设备
+    if phones:
+        alarm_total     = db_scalar(f"SELECT COUNT(*) FROM alarm_record WHERE phone IN ({ph})", phones)
+        alarm_unhandled = db_scalar(f"SELECT COUNT(*) FROM alarm_record WHERE phone IN ({ph}) AND status=0", phones)
+    else:
+        alarm_total = alarm_unhandled = 0
+    # 使用参数化查询，防止日期字段 SQL 注入
+    if not phones:
+        alarm_period = 0
+    elif start_raw:
+        alarm_period = db_scalar(
+            f"SELECT COUNT(*) FROM alarm_record WHERE phone IN ({ph}) AND date(alarm_time) BETWEEN ? AND ?",
+            list(phones) + [start_raw, end_raw]
+        )
+    else:
+        from datetime import timedelta
+        _start_date = (datetime.now() - timedelta(days=days - 1)).strftime('%Y-%m-%d')
+        alarm_period = db_scalar(
+            f"SELECT COUNT(*) FROM alarm_record WHERE phone IN ({ph}) AND date(alarm_time) >= ?",
+            list(phones) + [_start_date]
+        )
+
+    # SIM 卡：sim_card 按 device_phone 关联子树设备（列名是 device_phone，非 phone）
+    if phones:
+        sim_total   = db_scalar(f"SELECT COUNT(*) FROM sim_card WHERE device_phone IN ({ph})", phones)
+        sim_normal  = db_scalar(f"SELECT COUNT(*) FROM sim_card WHERE device_phone IN ({ph}) AND status='正常'", phones)
+        sim_exp7    = db_scalar(f"SELECT COUNT(*) FROM sim_card WHERE device_phone IN ({ph}) AND expire_date IS NOT NULL "
+                                f"AND expire_date <= date('now','+7 days') AND expire_date >= date('now')", phones)
+        sim_exp30   = db_scalar(f"SELECT COUNT(*) FROM sim_card WHERE device_phone IN ({ph}) AND expire_date IS NOT NULL "
+                                f"AND expire_date <= date('now','+30 days') AND expire_date >= date('now')", phones)
+        sim_expired = db_scalar(f"SELECT COUNT(*) FROM sim_card WHERE device_phone IN ({ph}) AND expire_date IS NOT NULL "
+                                f"AND expire_date < date('now')", phones)
+    else:
+        sim_total = sim_normal = sim_exp7 = sim_exp30 = sim_expired = 0
+
+    # 客户统计：子树内的客户
+    customer_total = db_scalar(f"SELECT COUNT(*) FROM customer WHERE id IN ({cid_ph})", all_cids)
+    if phones:
+        loc_total = db_scalar(f"SELECT COUNT(*) FROM location_record WHERE phone IN ({ph})", phones)
+    else:
+        loc_total = 0
+    # 充值：recharge 通过 sim_id 关联，先取子树设备名下 SIM 的 id 列表
+    sim_ids = [r['id'] for r in db_query(f"SELECT id FROM sim_card WHERE device_phone IN ({ph})", phones)] if phones else []
+    if sim_ids:
+        sp = ','.join('?' * len(sim_ids))
+        recharge_total = db_scalar(f"SELECT COALESCE(SUM(amount),0) FROM recharge WHERE sim_id IN ({sp})", sim_ids)
+        if start_raw:
+            recharge_period = db_scalar(
+                f"SELECT COALESCE(SUM(amount),0) FROM recharge WHERE sim_id IN ({sp}) AND date(created_at) BETWEEN ? AND ?",
+                sim_ids + [start_raw, end_raw]
+            )
+        else:
+            from datetime import timedelta as _td
+            _rstart_date = (datetime.now() - _td(days=days - 1)).strftime('%Y-%m-%d')
+            recharge_period = db_scalar(
+                f"SELECT COALESCE(SUM(amount),0) FROM recharge WHERE sim_id IN ({sp}) AND date(created_at) >= ?",
+                sim_ids + [_rstart_date]
+            )
+    else:
+        recharge_total = recharge_period = 0
+
+    # 趋势：按实际天数
+    trend_days = min(days, 30)
+    from datetime import timedelta as _trd
+    _trend_date = (datetime.now() - _trd(days=trend_days - 1)).strftime('%Y-%m-%d')
+    if phones:
+        alarm_trend = db_query(
+            f"SELECT date(alarm_time) as day, COUNT(*) as cnt FROM alarm_record "
+            f"WHERE phone IN ({ph}) AND date(alarm_time) >= ? GROUP BY day ORDER BY day",
+            list(phones) + [_trend_date]
+        )
+        alarm_types = db_query(
+            f"SELECT alarm_desc, COUNT(*) as cnt FROM alarm_record WHERE phone IN ({ph}) "
+            f"GROUP BY alarm_desc ORDER BY cnt DESC LIMIT 6",
+            phones
+        )
+        loc_trend = db_query(
+            f"SELECT date(gps_time) as day, COUNT(*) as cnt FROM location_record "
+            f"WHERE phone IN ({ph}) AND date(gps_time) >= ? GROUP BY day ORDER BY day",
+            list(phones) + [_trend_date]
+        )
+    else:
+        alarm_trend = alarm_types = loc_trend = []
+
+    # 客户排名（按名下设备数）：限定子树内客户
+    customer_rank = db_query(
+        f"SELECT c.name, COUNT(d.id) as device_count "
+        f"FROM customer c LEFT JOIN device d ON d.customer_id=c.id "
+        f"WHERE c.id IN ({cid_ph}) "
+        f"GROUP BY c.id ORDER BY device_count DESC LIMIT 10",
+        all_cids
+    )
+
+    # 本月新增设备 / 新增客户（限定子树）
+    new_devices   = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) "
+                              f"AND date(created_at) >= date('now','start of month')", all_cids)
+    new_customers = db_scalar(f"SELECT COUNT(*) FROM customer WHERE id IN ({cid_ph}) "
+                              f"AND date(created_at) >= date('now','start of month')", all_cids)
+
+    return ok({
+        'device': {
+            'total': device_total, 'online': device_online, 'alarm': device_alarm,
+            'active': device_active, 'inactive': device_inactive, 'disabled': device_disabled,
+            'new_this_month': new_devices,
+        },
+        'alarm':  {'total': alarm_total, 'unhandled': alarm_unhandled, 'period': alarm_period},
+        'sim':    {
+            'total': sim_total, 'normal': sim_normal,
+            'expiring7': sim_exp7, 'expiring30': sim_exp30, 'expired': sim_expired,
+        },
+        'customer': {'total': customer_total, 'new_this_month': new_customers, 'rank': customer_rank},
+        'location': {'total': loc_total},
+        'recharge_total':  float(recharge_total),
+        'recharge_period': float(recharge_period),
+        'alarm_trend': alarm_trend,
+        'alarm_types': alarm_types,
+        'loc_trend':   loc_trend,
+        'trend_days':  trend_days,
+    })
+
+
 # ── 客户门户：设备列表（带分页 / 搜索） ──────────────────────────────────────
 
 @app.get('/api/customer/device_list')

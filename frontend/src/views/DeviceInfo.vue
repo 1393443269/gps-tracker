@@ -32,8 +32,8 @@
         <el-option v-for="r in roleList" :key="r.id" :label="r.name" :value="r.id" />
       </el-select>
 
-      <el-button type="primary" @click="openBatchRole" style="margin-left:6px;">批量修改角色</el-button>
-      <el-button :icon="Download" @click="exportAll" :loading="exporting">导出</el-button>
+      <el-button v-if="isAdmin()" type="primary" @click="openBatchRole" style="margin-left:6px;">批量修改角色</el-button>
+      <el-button v-if="isAdmin()" :icon="Download" @click="exportAll" :loading="exporting">导出</el-button>
     </div>
 
     <!-- 已选提示 -->
@@ -52,7 +52,7 @@
         <template #default="{ row }"><span>{{ row.terminal_id || row.phone }}</span></template>
       </el-table-column>
       <el-table-column label="IMEI" width="160">
-        <template #default="{ row }"><span v-if="row.imei">{{ row.imei }}</span><span v-else style="color:#ccc;font-size:12px;">—</span></template>
+        <template #default="{ row }">{{ row.imei || row.phone }}</template>
       </el-table-column>
       <el-table-column prop="terminal_model" label="设备型号"   width="110" />
       <el-table-column label="设备围栏数" width="95" align="center">
@@ -63,13 +63,20 @@
       <!-- 角色名称：带颜色色块，点击可分配 -->
       <el-table-column label="角色名称" width="150">
         <template #default="{ row }">
-          <el-button link type="primary" style="padding:0;height:auto;" @click="openRole(row)">
+          <el-button v-if="isAdmin()" link type="primary" style="padding:0;height:auto;" @click="openRole(row)">
             <div v-if="row.role_name" style="display:flex;align-items:center;gap:6px;">
               <span :style="roleIconStyle(row.role_color, row.icon_type)" />
               <span>{{ row.role_name }}</span>
             </div>
             <span v-else style="color:#909399;">未分配</span>
           </el-button>
+          <div v-else>
+            <div v-if="row.role_name" style="display:flex;align-items:center;gap:6px;">
+              <span :style="roleIconStyle(row.role_color, row.icon_type)" />
+              <span>{{ row.role_name }}</span>
+            </div>
+            <span v-else style="color:#909399;">未分配</span>
+          </div>
         </template>
       </el-table-column>
       <el-table-column label="头像" width="70" align="center">
@@ -92,7 +99,7 @@
       </el-table-column>
       <el-table-column label="操作" fixed="right" width="70" align="center">
         <template #default="{ row }">
-          <el-button size="small" :icon="EditIcon" circle title="编辑人员信息"
+          <el-button v-if="isAdmin()" size="small" :icon="EditIcon" circle title="编辑人员信息"
             @click="openEdit(row)" :disabled="!row.customer_id" />
         </template>
       </el-table-column>

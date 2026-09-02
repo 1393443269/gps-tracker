@@ -79,10 +79,10 @@
                   <span v-else>—</span>
                 </el-descriptions-item>
               </el-descriptions>
-              <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
-                <el-button size="small" type="primary" @click="locateOnMap(selected)">地图定位</el-button>
-                <el-button size="small" @click="goTrack(selected.phone)">查看轨迹</el-button>
-                <el-button size="small" @click="goCmd(selected.phone)">发送指令</el-button>
+              <div style="margin-top:14px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;">
+                <el-button type="primary" style="width:100%;margin:0;" @click="locateOnMap(selected)">地图定位</el-button>
+                <el-button type="success" plain style="width:100%;margin:0;" @click="goTrack(selected.phone)">查看轨迹</el-button>
+                <el-button type="warning" style="width:100%;margin:0;" @click="openZhiling(selected)">指令</el-button>
               </div>
             </div>
           </div>
@@ -222,6 +222,150 @@
           style="justify-content:flex-end;flex-shrink:0;" />
       </div>
     </div>
+
+    <!-- 天禧设备指令面板 -->
+    <el-dialog v-model="zhilingVisible" title="设备参数" width="720px" top="6vh" destroy-on-close>
+      <div style="margin-bottom:10px;color:#606266;font-size:13px;">
+        目标设备：<b>{{ zlDev?.name || zlDev?.terminal_id || zlDev?.phone }}</b>
+        （设备号 {{ zlDev?.phone }}）
+        <el-tag v-if="zlDev?.status===1" size="small" type="success" style="margin-left:6px;">在线</el-tag>
+        <el-tag v-else size="small" type="info" style="margin-left:6px;">离线</el-tag>
+      </div>
+      <el-alert type="info" :closable="false" show-icon style="margin-bottom:10px;"
+        title="设备需在线才能接收指令；离线设备将返回“设备不在线”。" />
+      <el-tabs v-model="zlTab">
+        <!-- 网络配置 -->
+        <el-tab-pane label="网络配置" name="net">
+          <div class="zl-card">
+            <div class="zl-title">设置IP地址 <span class="zl-cmd">set_ip</span></div>
+            <el-form :inline="true" size="small">
+              <el-form-item label="IP"><el-input v-model="zf.set_ip.ip" placeholder="服务器IP/域名" style="width:180px" /></el-form-item>
+              <el-form-item label="端口"><el-input v-model="zf.set_ip.port" placeholder="端口" style="width:100px" /></el-form-item>
+              <el-form-item label="协议">
+                <el-select v-model="zf.set_ip.proto" style="width:110px">
+                  <el-option label="TCP(0)" :value="0" />
+                  <el-option label="UDP(1)" :value="1" />
+                </el-select>
+              </el-form-item>
+              <el-form-item><el-button type="primary" :loading="zlBusy==='set_ip'" @click="sendZhiling('set_ip', zf.set_ip, ['ip','port','proto'])">下发</el-button></el-form-item>
+            </el-form>
+          </div>
+          <div class="zl-card">
+            <div class="zl-title">设置APN <span class="zl-cmd">set_apn</span></div>
+            <el-form :inline="true" size="small">
+              <el-form-item label="鉴权">
+                <el-select v-model="zf.set_apn.apn_type" style="width:110px">
+                  <el-option label="none(0)" :value="0" />
+                  <el-option label="pap(1)" :value="1" />
+                  <el-option label="chap(2)" :value="2" />
+                </el-select>
+              </el-form-item>
+              <el-form-item label="APN名"><el-input v-model="zf.set_apn.name" placeholder="APN名称" style="width:160px" /></el-form-item>
+              <el-form-item label="用户"><el-input v-model="zf.set_apn.user" placeholder="选填" style="width:130px" /></el-form-item>
+              <el-form-item label="密码"><el-input v-model="zf.set_apn.pwd" placeholder="选填" style="width:130px" /></el-form-item>
+              <el-form-item><el-button type="primary" :loading="zlBusy==='set_apn'" @click="sendZhiling('set_apn', zf.set_apn, ['apn_type','name'])">下发</el-button></el-form-item>
+            </el-form>
+          </div>
+        </el-tab-pane>
+
+        <!-- 上报控制 -->
+        <el-tab-pane label="上报控制" name="report">
+          <div class="zl-card">
+            <div class="zl-title">修改上传频率 <span class="zl-cmd">set_interval</span></div>
+            <el-form :inline="true" size="small">
+              <el-form-item label="运动(s)"><el-input v-model="zf.set_interval.move_sec" placeholder="≥3" style="width:90px" /></el-form-item>
+              <el-form-item label="静止(s)"><el-input v-model="zf.set_interval.static_sec" placeholder="≥3" style="width:90px" /></el-form-item>
+              <el-form-item label="心跳(s)"><el-input v-model="zf.set_interval.heartbeat_sec" placeholder="≥3" style="width:90px" /></el-form-item>
+              <el-form-item><el-button type="primary" :loading="zlBusy==='set_interval'" @click="sendZhiling('set_interval', zf.set_interval, ['move_sec','static_sec','heartbeat_sec'])">下发</el-button></el-form-item>
+            </el-form>
+          </div>
+          <div class="zl-card">
+            <div class="zl-title">立即上传数据 <span class="zl-cmd">upload</span></div>
+            <el-button type="primary" size="small" :loading="zlBusy==='upload'" @click="sendZhiling('upload', {}, [])">下发</el-button>
+          </div>
+        </el-tab-pane>
+
+        <!-- 语音留言 -->
+        <el-tab-pane label="语音留言" name="voice">
+          <div class="zl-card">
+            <div class="zl-title">设置音量 / 喇叭声音等级 <span class="zl-cmd">set_volume</span></div>
+            <el-form :inline="true" size="small">
+              <el-form-item label="音量(0-100)"><el-input v-model="zf.set_volume.level" placeholder="0-100" style="width:110px" /></el-form-item>
+              <el-form-item><el-button type="primary" :loading="zlBusy==='set_volume'" @click="sendZhiling('set_volume', zf.set_volume, ['level'])">下发</el-button></el-form-item>
+            </el-form>
+          </div>
+          <div class="zl-card">
+            <div class="zl-title">发送留言 <span class="zl-cmd">send_message</span></div>
+            <el-form :inline="true" size="small">
+              <el-form-item label="留言"><el-input v-model="zf.send_message.message" placeholder="文本(不支持标点)" style="width:280px" /></el-form-item>
+              <el-form-item><el-button type="primary" :loading="zlBusy==='send_message'" @click="sendZhiling('send_message', zf.send_message, ['message'])">下发</el-button></el-form-item>
+            </el-form>
+          </div>
+        </el-tab-pane>
+
+        <!-- SOS设置 -->
+        <el-tab-pane label="SOS设置" name="sos">
+          <div class="zl-card">
+            <div class="zl-title">设置亲情号码 <span class="zl-cmd">set_family</span></div>
+            <el-form :inline="true" size="small">
+              <el-form-item label="号码1"><el-input v-model="zf.set_family.num1" placeholder="可空" style="width:150px" /></el-form-item>
+              <el-form-item label="号码2"><el-input v-model="zf.set_family.num2" placeholder="可空" style="width:150px" /></el-form-item>
+              <el-form-item label="号码3"><el-input v-model="zf.set_family.num3" placeholder="可空" style="width:150px" /></el-form-item>
+              <el-form-item><el-button type="primary" :loading="zlBusy==='set_family'" @click="sendZhiling('set_family', zf.set_family, [])">下发</el-button></el-form-item>
+            </el-form>
+          </div>
+          <div class="zl-card">
+            <div class="zl-title">设置SOS求救电话 <span class="zl-cmd">set_sos_numbers</span></div>
+            <el-form :inline="true" size="small">
+              <el-form-item label="号码"><el-input v-model="zf.set_sos_numbers.numbers" placeholder="逗号分隔,最多5个" style="width:280px" /></el-form-item>
+              <el-form-item><el-button type="primary" :loading="zlBusy==='set_sos_numbers'" @click="sendSosNumbers()">下发</el-button></el-form-item>
+            </el-form>
+          </div>
+          <div class="zl-card">
+            <div class="zl-title">设置SOS求救短信内容 <span class="zl-cmd">set_sos_msg</span></div>
+            <el-form :inline="true" size="small">
+              <el-form-item label="短信"><el-input v-model="zf.set_sos_msg.msg" placeholder="不能有逗号" style="width:280px" /></el-form-item>
+              <el-form-item><el-button type="primary" :loading="zlBusy==='set_sos_msg'" @click="sendZhiling('set_sos_msg', zf.set_sos_msg, ['msg'])">下发</el-button></el-form-item>
+            </el-form>
+          </div>
+        </el-tab-pane>
+
+        <!-- 系统 -->
+        <el-tab-pane label="系统" name="sys">
+          <div class="zl-card">
+            <div class="zl-title">远程复位 <span class="zl-cmd">reset</span></div>
+            <el-form :inline="true" size="small">
+              <el-form-item label="延迟(s)"><el-input v-model="zf.reset.delay_sec" placeholder="默认3" style="width:100px" /></el-form-item>
+              <el-form-item><el-button type="danger" :loading="zlBusy==='reset'" @click="sendZhiling('reset', {delay_sec: (zf.reset.delay_sec===''||zf.reset.delay_sec==null) ? 3 : zf.reset.delay_sec}, [])">下发</el-button></el-form-item>
+            </el-form>
+          </div>
+          <div class="zl-card">
+            <div class="zl-title">OTA升级 <span class="zl-cmd">ota_http</span></div>
+            <el-form :inline="true" size="small">
+              <el-form-item label="URL"><el-input v-model="zf.ota_http.url" placeholder="固件URL" style="width:260px" /></el-form-item>
+              <el-form-item label="大小"><el-input v-model="zf.ota_http.file_size" placeholder="字节" style="width:110px" /></el-form-item>
+              <el-form-item label="MD5"><el-input v-model="zf.ota_http.md5" placeholder="MD5" style="width:260px" /></el-form-item>
+              <el-form-item><el-button type="primary" :loading="zlBusy==='ota_http'" @click="sendZhiling('ota_http', zf.ota_http, ['url','file_size','md5'])">下发</el-button></el-form-item>
+            </el-form>
+          </div>
+        </el-tab-pane>
+
+        <!-- 自定义指令 -->
+        <el-tab-pane label="自定义" name="custom">
+          <div class="zl-card">
+            <div class="zl-title">手动输入指令文本 <span class="zl-cmd">text</span></div>
+            <el-input v-model="zlCustomText" placeholder="输入指令内容" type="textarea" :rows="3" style="margin-bottom:8px;" />
+            <div style="margin-bottom:10px;">
+              <span style="color:#909399;font-size:12px;margin-right:6px;">快捷指令：</span>
+              <el-tag v-for="q in quickCmds" :key="q.label" style="cursor:pointer;margin-right:6px;"
+                @click="zlCustomText=q.cmd">{{ q.label }}</el-tag>
+            </div>
+            <el-button type="primary" size="small" :loading="zlBusy==='text'"
+              :disabled="!zlCustomText" @click="sendCustomZhiling()">发送</el-button>
+          </div>
+        </el-tab-pane>
+      </el-tabs>
+    </el-dialog>
   </div>
 </template>
 
@@ -547,6 +691,93 @@ async function loadCmdHistory(reset=true) {
     cmdHisFetched.value = true
   } catch {} finally { cmdHisLoading.value = false }
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 天禧设备指令面板（管理端 /api/commands/zhiling）
+// ══════════════════════════════════════════════════════════════════════════════
+const zhilingVisible = ref(false)
+const zlDev  = ref(null)
+const zlTab  = ref('net')
+const zlBusy = ref('')
+const zlCustomText = ref('')
+const zf = ref({
+  set_ip:          { ip:'', port:'', proto:0 },
+  set_apn:         { apn_type:0, name:'', user:'', pwd:'' },
+  set_interval:    { move_sec:'', static_sec:'', heartbeat_sec:'' },
+  set_volume:      { level:'' },
+  send_message:    { message:'' },
+  set_family:      { num1:'', num2:'', num3:'' },
+  set_sos_numbers: { numbers:'' },
+  set_sos_msg:     { msg:'' },
+  reset:           { delay_sec:'' },
+  ota_http:        { url:'', file_size:'', md5:'' },
+})
+
+function openZhiling(dev) {
+  zlDev.value = dev
+  zlTab.value = 'net'
+  zlCustomText.value = ''
+  zhilingVisible.value = true
+}
+
+// 自定义指令：向天禧设备下发手动输入的指令文本，复用 /commands/text 接口
+async function sendCustomZhiling() {
+  if (!zlDev.value?.phone) { ElMessage.warning('未选择设备'); return }
+  if (!zlCustomText.value) { ElMessage.warning('请输入指令内容'); return }
+  zlBusy.value = 'text'
+  try {
+    const text = zlCustomText.value
+    await api.sendCmd(zlDev.value.phone, text)
+    await api.addHistory({
+      phone: zlDev.value.phone,
+      device_name: zlDev.value.name || zlDev.value.terminal_id || zlDev.value.phone,
+      command: text, result: '已发送'
+    })
+    ElMessage.success('指令已发送')
+    zlCustomText.value = ''
+  } catch (e) {
+    ElMessage.error(e.response?.data?.msg || '发送失败')
+  } finally {
+    zlBusy.value = ''
+  }
+}
+
+// 通用下发：cmd=命令名, form=参数对象, required=必填参数名数组
+async function sendZhiling(cmd, form, required) {
+  if (!zlDev.value?.phone) { ElMessage.warning('未选择设备'); return }
+  for (const k of required) {
+    if (form[k] === '' || form[k] === null || form[k] === undefined) {
+      ElMessage.warning(`请填写参数：${k}`); return
+    }
+  }
+  zlBusy.value = cmd
+  try {
+    await commandApi.zhiling({ phone: zlDev.value.phone, cmd, ...form })
+    ElMessage.success('指令已下发')
+  } catch (e) {
+    ElMessage.error(e.response?.data?.msg || '指令下发失败')
+  } finally {
+    zlBusy.value = ''
+  }
+}
+
+// SOS号码：逗号分隔转数组（最多5个），后端 numbers 支持数组
+async function sendSosNumbers() {
+  const raw = (zf.value.set_sos_numbers.numbers || '').trim()
+  if (!raw) { ElMessage.warning('请填写SOS号码'); return }
+  const arr = raw.split(/[,，]/).map(x => x.trim()).filter(Boolean)
+  if (!arr.length) { ElMessage.warning('请填写SOS号码'); return }
+  if (arr.length > 5) { ElMessage.warning('SOS号码最多5个'); return }
+  zlBusy.value = 'set_sos_numbers'
+  try {
+    await commandApi.zhiling({ phone: zlDev.value.phone, cmd:'set_sos_numbers', numbers: arr })
+    ElMessage.success('指令已下发')
+  } catch (e) {
+    ElMessage.error(e.response?.data?.msg || '指令下发失败')
+  } finally {
+    zlBusy.value = ''
+  }
+}
 </script>
 
 <style scoped>
@@ -574,4 +805,8 @@ async function loadCmdHistory(reset=true) {
 
 .slide-detail-enter-active, .slide-detail-leave-active { transition: width .2s ease, opacity .2s; }
 .slide-detail-enter-from, .slide-detail-leave-to      { width:0; opacity:0; overflow:hidden; }
+
+.zl-card { border:1px solid #ebeef5; border-radius:6px; padding:10px 12px; margin-bottom:10px; background:#fafafa; }
+.zl-title { font-weight:600; font-size:13px; color:#303133; margin-bottom:8px; }
+.zl-cmd { font-weight:400; font-size:12px; color:#909399; margin-left:6px; font-family:monospace; }
 </style>

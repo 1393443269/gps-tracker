@@ -55,7 +55,7 @@
         <template #default="{ row }"><span v-if="row.msisdn">{{ row.msisdn }}</span><span v-else style="color:#ccc;font-size:12px;">—</span></template>
       </el-table-column>
       <el-table-column label="IMEI" min-width="150">
-        <template #default="{ row }"><span v-if="row.imei || row.dev_imei">{{ row.imei || row.dev_imei }}</span><span v-else style="color:#ccc;font-size:12px;">—</span></template>
+        <template #default="{ row }">{{ row.imei || row.dev_imei || row.device_phone || "—" }}</template>
       </el-table-column>
       <el-table-column label="设备号" min-width="150">
         <template #default="{ row }">
