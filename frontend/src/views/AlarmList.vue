@@ -9,7 +9,7 @@
         </el-select>
       </el-form-item>
       <el-form-item label="设备号">
-        <el-input v-model="filterPhone" placeholder="终端手机号" clearable style="width:160px;" />
+        <el-input v-model="filterPhone" placeholder="设备号" clearable style="width:160px;" />
       </el-form-item>
       <el-form-item>
         <el-button type="primary" @click="loadData(1)">查询</el-button>
@@ -31,9 +31,14 @@
     <el-table ref="tableRef" :data="list" v-loading="loading" stripe border
       @selection-change="onSelectionChange">
       <el-table-column type="selection" width="45" :selectable="row => row.status === 0" />
-      <el-table-column prop="phone" label="设备号" width="170">
+      <el-table-column label="设备号" width="170">
         <template #default="{ row }">
-          <span style="white-space:nowrap;">{{ row.phone }}</span>
+          <span style="white-space:nowrap;">{{ row.terminal_id || row.phone }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="IMEI" width="170">
+        <template #default="{ row }">
+          <span style="white-space:nowrap;">{{ row.imei || row.phone }}</span>
         </template>
       </el-table-column>
       <el-table-column prop="alarm_desc" label="报警类型" width="160">

@@ -33,7 +33,12 @@
         <el-table-column prop="device_name" label="设备名称" width="130">
           <template #default="{ row }">{{ row.device_name || '—' }}</template>
         </el-table-column>
-        <el-table-column prop="phone" label="设备IMEI" width="160" />
+        <el-table-column label="设备号" width="160">
+          <template #default="{ row }">{{ row.terminal_id || row.phone }}</template>
+        </el-table-column>
+        <el-table-column label="IMEI" width="160">
+          <template #default="{ row }">{{ row.imei || row.phone }}</template>
+        </el-table-column>
         <el-table-column label="动作" width="90" align="center">
           <template #default="{ row }">
             <el-tag size="small" :type="row.action === 'enter' ? 'success' : 'info'">

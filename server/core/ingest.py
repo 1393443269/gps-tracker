@@ -802,6 +802,15 @@ def handle_register(sock, phone, serial, body):
     info      = p.parse_register_body(body)
     now       = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+    # 清洗定长字段的 NUL 补齐字节：标准 808 注册报文里终端制造商/型号/ID 是定长字段，
+    # 位数不足时后补 0x00（协议规定）。天禧 LT115 等设备的这些字段就带 NUL 尾巴，
+    # 直接入库会触发 PG "string literal cannot contain NUL" 报错、注册失败、设备死循环重连。
+    # 故此处统一去掉 NUL 及首尾空白，再落库。
+    for _k in ('manufacturer', 'terminal_model', 'terminal_id', 'plate_no'):
+        _v = info.get(_k)
+        if isinstance(_v, str):
+            info[_k] = _v.replace('\x00', '').strip()
+
     # 若 plate_no 字段携带了完整 IMEI（15 位纯数字），以 IMEI 作为设备标识
     plate_no_raw = info.get('plate_no', '') or ''
     if len(plate_no_raw) == 15 and plate_no_raw.isdigit():
@@ -845,13 +854,27 @@ def handle_register(sock, phone, serial, body):
 
 
 def handle_auth(sock, phone, serial, body):
-    code_len  = body[0] if body else 0
-    auth_code = body[1:1 + code_len].decode('ascii', errors='replace') if len(body) > 1 else ''
+    # 鉴权体格式存在方言差异，兼容两种：
+    #   ① 标准 JT808：body[0]=长度字节，其后为鉴权码；
+    #   ② 天禧 LT115 等：无长度字节，整个 body 就是鉴权码(协议文档 2.7 定义为 String 无长度)。
+    # 若只按①解析，天禧设备的鉴权码首字符会被误当长度吃掉(如 DD5FAFBC→D5FAFBC)导致鉴权永久失败。
+    # 故生成两个候选：带长度前缀解读 + 整体解读，任一匹配库中鉴权码即通过。
+    _cand = set()
+    if body:
+        _whole = body.decode('ascii', errors='replace').strip('\x00').strip()
+        if _whole:
+            _cand.add(_whole)                       # ② 整体即鉴权码
+        code_len = body[0]
+        if 0 < code_len <= len(body) - 1:
+            _pref = body[1:1 + code_len].decode('ascii', errors='replace').strip('\x00').strip()
+            if _pref:
+                _cand.add(_pref)                    # ① 带长度前缀
+    auth_code = _whole if body else ''              # 日志展示用整体解读
 
     canonical = resolve_phone(phone)
     row = db_query_one("SELECT id, auth_code, status FROM device WHERE phone=?", (canonical,))
-    # 严格比对鉴权码，不允许万能 DEFAULT 绕过
-    auth_ok = row and row.get('auth_code') == auth_code
+    # 严格比对鉴权码(两种解读任一命中即可)，不允许万能 DEFAULT 绕过
+    auth_ok = bool(row) and row.get('auth_code') in _cand
     if auth_ok:
         # 先应答设备（不被数据库写锁阻塞，避免高并发下设备超时断连），再异步更新状态
         sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0102, 0))
@@ -909,6 +932,36 @@ def handle_location(sock, phone, serial, body):
     direction = int(direction) % 360   # 方向截断到 0-359
 
     device_id = _get_device_id(canonical)   # 缓存查询，免每次上报查库
+
+    # 从位置报文附加字段拿到设备真实 IMEI(0xF6)/ICCID(0xF1)：设备注册头里的 phone 可能只是
+    # 终端ID(非IMEI)，真实身份走位置附加字段上报。只在值有效且与库中不同时更新(避免每帧写库)，
+    # 并自动登记/更新 SIM 卡表(iccid 唯一，存在则仅关联设备，不覆盖人工维护的运营商/套餐等)。
+    _iccid = loc.get('iccid')
+    _imei  = loc.get('imei')
+    if _iccid or _imei:
+        try:
+            _drow = db_query_one("SELECT imei, iccid FROM device WHERE phone=?", (canonical,))
+            _cur_imei  = (_drow.get('imei')  if _drow else '') or ''
+            _cur_iccid = (_drow.get('iccid') if _drow else '') or ''
+            if _imei and _imei != _cur_imei:
+                db_exec("UPDATE device SET imei=? WHERE phone=?", (_imei, canonical))
+            if _iccid and _iccid != _cur_iccid:
+                db_exec("UPDATE device SET iccid=? WHERE phone=?", (_iccid, canonical))
+                # 同步登记/更新 sim_card：iccid 已存在则更新绑定设备+IMEI，否则新增。
+                # IMEI 一并写入 sim_card，使 SIM 卡管理页 IMEI 列能显示设备真实 IMEI。
+                _sim = db_query_one("SELECT id FROM sim_card WHERE iccid=?", (_iccid,))
+                if _sim:
+                    db_exec("UPDATE sim_card SET device_phone=?, imei=? WHERE iccid=?",
+                            (canonical, _imei or '', _iccid))
+                else:
+                    db_exec("INSERT INTO sim_card (iccid, device_phone, imei, remark) VALUES (?,?,?,?)",
+                            (_iccid, canonical, _imei or '', '设备自动上报'))
+            elif _imei and _iccid:
+                # ICCID 未变但 IMEI 刚解析到：补写 sim_card.imei(覆盖之前漏同步的空值)
+                db_exec("UPDATE sim_card SET imei=? WHERE iccid=? AND (imei IS NULL OR imei='')",
+                        (_imei, _iccid))
+        except Exception as e:
+            log.warning("[808] ICCID/IMEI 落库失败 phone=%s err=%s", canonical, e)
 
     # 位置记录 + 设备最新状态：异步批量落库（削减写锁争用，大幅降低上报延迟）
     status = 2 if alarm_flag else 1

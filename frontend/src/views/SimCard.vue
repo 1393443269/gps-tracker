@@ -51,9 +51,15 @@
       <el-table-column label="ICCID" min-width="195">
         <template #default="{ row }"><span v-html="highlight(row.iccid)" /></template>
       </el-table-column>
-      <el-table-column label="绑定设备" min-width="150">
+      <el-table-column prop="msisdn" label="MSISDN(号码)" min-width="130">
+        <template #default="{ row }"><span v-if="row.msisdn">{{ row.msisdn }}</span><span v-else style="color:#ccc;font-size:12px;">—</span></template>
+      </el-table-column>
+      <el-table-column label="IMEI" min-width="150">
+        <template #default="{ row }"><span v-if="row.imei || row.dev_imei">{{ row.imei || row.dev_imei }}</span><span v-else style="color:#ccc;font-size:12px;">—</span></template>
+      </el-table-column>
+      <el-table-column label="设备号" min-width="150">
         <template #default="{ row }">
-          <span v-if="row.device_phone" v-html="highlight(row.device_phone)" />
+          <span v-if="row.dev_terminal_id || row.device_phone" v-html="highlight(row.dev_terminal_id || row.device_phone)" />
           <span v-else style="color:#ccc;font-size:12px;">未绑定</span>
         </template>
       </el-table-column>
@@ -111,6 +117,12 @@
         </el-form-item>
         <el-form-item v-if="admin" label="IMSI">
           <el-input v-model="form.imsi" placeholder="15位IMSI" />
+        </el-form-item>
+        <el-form-item label="MSISDN(号码)">
+          <el-input v-model="form.msisdn" placeholder="SIM卡手机号码" />
+        </el-form-item>
+        <el-form-item label="IMEI">
+          <el-input v-model="form.imei" placeholder="设备IMEI(设备上报自动填充)" />
         </el-form-item>
         <el-form-item label="运营商">
           <el-select v-model="form.operator" style="width:100%">
@@ -216,7 +228,7 @@ const expiring30 = ref(0)
 // modal
 const modalVisible = ref(false)
 const form = ref({
-  id: null, iccid: '', imsi: '', operator: '中国移动',
+  id: null, iccid: '', imsi: '', msisdn: '', imei: '', operator: '中国移动',
   plan: '', balance: 0, status: '正常', remark: '',
   expire_date: null, monthly_fee: 0
 })
@@ -315,7 +327,7 @@ async function load() {
 function openModal(row) {
   form.value = row
     ? { ...row, expire_date: row.expire_date || null, monthly_fee: row.monthly_fee || 0 }
-    : { id: null, iccid: '', imsi: '', operator: '中国移动', plan: '', balance: 0,
+    : { id: null, iccid: '', imsi: '', msisdn: '', imei: '', operator: '中国移动', plan: '', balance: 0,
         status: '正常', remark: '', expire_date: null, monthly_fee: 0 }
   modalVisible.value = true
 }

@@ -3,7 +3,7 @@
     <!-- 搜索栏 -->
     <el-row :gutter="12" style="margin-bottom:14px;" align="middle">
       <el-col :span="8">
-        <el-input v-model="keyword" placeholder="归属账号 / 姓名 / 设备IMEI" clearable @change="loadData(1)">
+        <el-input v-model="keyword" placeholder="归属账号 / 姓名 / 设备号" clearable @change="loadData(1)">
           <template #prefix><el-icon><Search /></el-icon></template>
         </el-input>
       </el-col>
@@ -25,7 +25,12 @@
       <el-table-column prop="device_name"  label="姓名"      width="130">
         <template #default="{ row }">{{ row.device_name || '—' }}</template>
       </el-table-column>
-      <el-table-column prop="phone"        label="设备IMEI"  width="160" />
+      <el-table-column label="设备号" width="160">
+        <template #default="{ row }">{{ row.terminal_id || row.phone }}</template>
+      </el-table-column>
+      <el-table-column label="IMEI" width="160">
+        <template #default="{ row }">{{ row.imei || row.phone }}</template>
+      </el-table-column>
       <el-table-column label="体温℃" width="80" align="center">
         <template #default="{ row }">
           <span :style="tempStyle(row.temperature)">{{ fmt(row.temperature) }}</span>
@@ -98,9 +103,9 @@ async function loadData(p = page.value) {
 
 function exportCsv() {
   if (!list.value.length) return ElMessage.warning('当前无数据可导出')
-  const headers = ['归属账号', '姓名', '设备IMEI', '体温', '腕温', '心率', '血氧', '收缩压', '舒张压', '计步', '采集时间']
+  const headers = ['归属账号', '姓名', '设备号', 'IMEI', '体温', '腕温', '心率', '血氧', '收缩压', '舒张压', '计步', '采集时间']
   const rows = list.value.map(r => [
-    r.account || '', r.device_name || '', r.phone, r.temperature ?? '', r.wrist_temp ?? '',
+    r.account || '', r.device_name || '', r.terminal_id || r.phone, r.imei || r.phone, r.temperature ?? '', r.wrist_temp ?? '',
     r.heart_rate ?? '', r.blood_oxygen ?? '', r.systolic ?? '', r.diastolic ?? '',
     r.steps ?? '', r.record_time || ''
   ])

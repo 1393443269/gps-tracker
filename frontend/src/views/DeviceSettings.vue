@@ -63,7 +63,12 @@
       <el-table-column type="selection" width="45" />
       <el-table-column type="index" label="#" width="50" />
       <el-table-column prop="name"           label="姓名"       width="120" />
-      <el-table-column prop="phone"          label="设备IMEI"   width="160" />
+      <el-table-column label="设备号" width="160">
+        <template #default="{ row }"><span>{{ row.terminal_id || row.phone }}</span></template>
+      </el-table-column>
+      <el-table-column label="IMEI" width="160">
+        <template #default="{ row }"><span v-if="row.imei">{{ row.imei }}</span><span v-else style="color:#ccc;font-size:12px;">—</span></template>
+      </el-table-column>
       <el-table-column prop="account"        label="归属账号"   width="130">
         <template #default="{ row }">
           <el-tag v-if="row.account" size="small" type="success">{{ row.account }}</el-tag>

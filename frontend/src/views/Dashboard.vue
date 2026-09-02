@@ -17,7 +17,9 @@
         <el-button style="float:right;" type="primary" link @click="$router.push('/alarms')">查看全部</el-button>
       </template>
       <el-table :data="recentAlarms" size="small" stripe>
-        <el-table-column prop="phone"     label="设备号"   width="140" />
+        <el-table-column label="设备号" width="140">
+          <template #default="{ row }">{{ row.terminal_id || row.phone }}</template>
+        </el-table-column>
         <el-table-column prop="alarmDesc" label="报警类型" width="140" />
         <el-table-column label="位置" width="220">
           <template #default="{ row }">

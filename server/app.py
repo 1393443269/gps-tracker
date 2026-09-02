@@ -414,6 +414,19 @@ def init_db():
         except Exception:
             pass
 
+    # sim_card 表：加 msisdn(SIM卡手机号)、imei(所插设备的IMEI)。
+    # device 表：加 imei(设备真实IMEI，从808位置报文0xF6解析)、iccid(从0xF1解析)。
+    # 说明：设备注册头里的 phone 可能只是终端ID(非IMEI)，真实IMEI/ICCID 走位置附加字段上报。
+    for _col in ("ALTER TABLE sim_card ADD COLUMN msisdn TEXT DEFAULT ''",
+                 "ALTER TABLE sim_card ADD COLUMN imei TEXT DEFAULT ''",
+                 "ALTER TABLE device ADD COLUMN imei TEXT DEFAULT ''",
+                 "ALTER TABLE device ADD COLUMN iccid TEXT DEFAULT ''"):
+        try:
+            conn.execute(_col)
+            conn.commit()
+        except Exception:
+            pass
+
     # ── 组织隔离：给业务表加 org_id（DEFAULT 1 = 根组织，存量数据自动归根） ──────
     for _tbl in ('device', 'customer', 'geo_fence', 'alarm_record', 'op_log', 'alarm_rule'):
         try:
@@ -950,17 +963,20 @@ def list_devices():
 def create_device():
     data  = request.get_json() or {}
     phone = (data.get('phone') or '').strip()
+    imei  = (data.get('imei') or '').strip()
     if not phone:
         return fail('设备号不能为空')
+    if not imei:
+        return fail('IMEI 为必填项')   # 手动新增设备时 IMEI 必填
     if db_query_one("SELECT id FROM device WHERE phone=?", (phone,)):
         return fail('设备号已存在')
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     db_exec(
-        "INSERT INTO device (phone,name,plate_no,manufacturer,terminal_model,"
+        "INSERT INTO device (phone,name,plate_no,manufacturer,terminal_model,imei,"
         "terminal_id,plate_color,auth_code,status,org_id,lifecycle,remark,created_at,updated_at)"
-        " VALUES (?,?,?,?,?,?,1,'DEFAULT',0,?,0,?,?,?)",
+        " VALUES (?,?,?,?,?,?,?,1,'DEFAULT',0,?,0,?,?,?)",
         (phone, data.get('name',''), data.get('plateNo',''),
-         data.get('manufacturer',''), data.get('terminalModel',''),
+         data.get('manufacturer',''), data.get('terminalModel',''), imei,
          data.get('terminalId',''), _admin_org_id(), data.get('remark',''), now, now)
     )
     add_op_log('设备新增', f'手动新增设备 {phone}')
@@ -1192,6 +1208,7 @@ def devices_with_customer():
     data_sql = (
         "SELECT d.id, d.phone, d.name, d.terminal_model, d.last_location_time, "
         "       d.status, d.lifecycle, d.activated_at, d.customer_id, d.role_id, "
+        "       d.terminal_id, d.imei, "
         "       r.name as role_name, r.color as role_color, r.icon_type, "
         "       c.contact as real_name, c.gender, c.age, c.avatar, "
         "       c.phone as contact_phone, c.address, c.remark as customer_remark, "
@@ -1639,10 +1656,10 @@ def list_alarms():
     # 需要 JOIN device 才能按 org_id 过滤
     if sids is not None:
         base  = "FROM alarm_record a LEFT JOIN device d ON a.phone=d.phone"
-        sel   = "a.*"
+        sel   = "a.*, d.terminal_id, d.imei"
     else:
-        base  = "FROM alarm_record a"
-        sel   = "a.*"
+        base  = "FROM alarm_record a LEFT JOIN device d ON a.phone=d.phone"
+        sel   = "a.*, d.terminal_id, d.imei"
 
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     total   = db_scalar(f"SELECT COUNT(*) {base} {where}", params)
@@ -1836,8 +1853,12 @@ def attendance_detail():
     conds, params = _org_where(sids, conds, params)   # 组织隔离
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     total   = db_scalar(f"SELECT COUNT(*) FROM attendance_record {where}", params)
+    # JOIN device 带出终端ID/IMEI(供前端"设备号"列显示 terminal_id||phone)。
+    # where 里的列(fence_id/event_time/org_id)无表歧义,直接沿用。
     records = db_query(
-        f"SELECT * FROM attendance_record {where} ORDER BY event_time DESC LIMIT ? OFFSET ?",
+        f"SELECT attendance_record.*, d.terminal_id, d.imei FROM attendance_record "
+        f"LEFT JOIN device d ON attendance_record.phone = d.phone {where} "
+        f"ORDER BY attendance_record.event_time DESC LIMIT ? OFFSET ?",
         params + [size, offset]
     )
     return ok({'records': records, 'total': total, 'page': page})
@@ -1869,7 +1890,7 @@ def list_health():
             "LEFT JOIN customer c ON d.customer_id = c.id ")
     total   = db_scalar(f"SELECT COUNT(*) {base} {where}", params)
     records = db_query(
-        "SELECT h.*, d.name as device_name, c.name as account "
+        "SELECT h.*, d.name as device_name, d.terminal_id, d.imei, c.name as account "
         + base + where +
         " ORDER BY h.record_time DESC LIMIT ? OFFSET ?",
         params + [size, offset]
@@ -2397,8 +2418,12 @@ def list_sims():
             pass
     where = "WHERE " + " AND ".join(conds) if conds else ""
     total   = db_scalar(f"SELECT COUNT(*) FROM sim_card {where}", params)
-    records = db_query(f"SELECT * FROM sim_card {where} ORDER BY expire_date ASC, created_at DESC LIMIT ? OFFSET ?",
-                       params + [size, offset])
+    # JOIN device 带出绑定设备的终端ID(设备号显示优先用它)和真实IMEI(兜底 sim_card.imei 为空)
+    records = db_query(
+        f"SELECT sim_card.*, d.terminal_id AS dev_terminal_id, d.imei AS dev_imei, d.name AS dev_name "
+        f"FROM sim_card LEFT JOIN device d ON sim_card.device_phone = d.phone "
+        f"{where} ORDER BY expire_date ASC, created_at DESC LIMIT ? OFFSET ?",
+        params + [size, offset])
     # 补充剩余天数
     for r in records:
         r['days_left'] = _sim_days_left(r.get('expire_date'))
@@ -2425,9 +2450,10 @@ def create_sim():
         return fail('ICCID 不能为空', 400)
     try:
         db_exec(
-            "INSERT INTO sim_card (iccid,imsi,operator,plan,balance,status,device_phone,remark,expire_date,monthly_fee,org_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (iccid, d.get('imsi',''), d.get('operator','中国移动'), d.get('plan',''),
+            "INSERT INTO sim_card (iccid,imsi,msisdn,imei,operator,plan,balance,status,device_phone,remark,expire_date,monthly_fee,org_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (iccid, d.get('imsi',''), d.get('msisdn',''), d.get('imei',''),
+             d.get('operator','中国移动'), d.get('plan',''),
              float(d.get('balance', 0)), d.get('status','正常'),
              d.get('device_phone',''), d.get('remark',''),
              d.get('expire_date') or None, float(d.get('monthly_fee', 0)), _admin_org_id())
@@ -2444,8 +2470,9 @@ def update_sim(sid):
         return fail('SIM卡不存在或无权限', 403)
     d = request.get_json() or {}
     db_exec(
-        "UPDATE sim_card SET imsi=?,operator=?,plan=?,balance=?,status=?,device_phone=?,remark=?,expire_date=?,monthly_fee=? WHERE id=?",
-        (d.get('imsi',''), d.get('operator','中国移动'), d.get('plan',''),
+        "UPDATE sim_card SET imsi=?,msisdn=?,imei=?,operator=?,plan=?,balance=?,status=?,device_phone=?,remark=?,expire_date=?,monthly_fee=? WHERE id=?",
+        (d.get('imsi',''), d.get('msisdn',''), d.get('imei',''),
+         d.get('operator','中国移动'), d.get('plan',''),
          float(d.get('balance', 0)), d.get('status','正常'),
          d.get('device_phone',''), d.get('remark',''),
          d.get('expire_date') or None, float(d.get('monthly_fee', 0)), sid)
@@ -3575,18 +3602,23 @@ def portal_alarms():
     ph     = ','.join('?' * len(phones))
     # status 过滤：与管理端 list_alarms 一致(0未处理/1已处理)。之前漏过滤导致客户端红点
     # 恒等于该客户全部报警数——管理员处理后 status 已置 1，客户端仍把已处理的计入"未处理"。
-    conds  = [f"phone IN ({ph})"]
+    # 列名统一带 alarm_record. 前缀：records 查询 JOIN device 后 phone/status 两列都会歧义
+    conds  = [f"alarm_record.phone IN ({ph})"]
     params = list(phones)
     status = request.args.get('status')
     if status is not None and status != '':
         _st = _num_or_none(status, int)
         if _st is None:
             return fail('status 参数无效', 400)
-        conds.append("status=?"); params.append(_st)
+        conds.append("alarm_record.status=?"); params.append(_st)
     where  = "WHERE " + " AND ".join(conds)
     total   = db_scalar(f"SELECT COUNT(*) FROM alarm_record {where}", params)
-    records = db_query(f"SELECT * FROM alarm_record {where} ORDER BY alarm_time DESC LIMIT ? OFFSET ?",
-                       params + [size, offset])
+    # JOIN device 带出终端ID/IMEI(供前端"设备号"列显示 terminal_id||phone、IMEI列显示真实imei)
+    records = db_query(
+        f"SELECT alarm_record.*, d.terminal_id, d.imei FROM alarm_record "
+        f"LEFT JOIN device d ON alarm_record.phone = d.phone {where} "
+        f"ORDER BY alarm_record.alarm_time DESC LIMIT ? OFFSET ?",
+        params + [size, offset])
     return ok({'records': records, 'total': total, 'page': page})
 
 
@@ -3671,7 +3703,7 @@ def portal_health():
             "LEFT JOIN customer c ON d.customer_id = c.id ")
     total   = db_scalar(f"SELECT COUNT(*) {base} {where}", params)
     records = db_query(
-        "SELECT h.*, d.name as device_name, c.name as account "
+        "SELECT h.*, d.name as device_name, d.terminal_id, d.imei, c.name as account "
         + base + where +
         " ORDER BY h.record_time DESC LIMIT ? OFFSET ?",
         params + [size, offset])
@@ -3803,7 +3835,8 @@ def portal_device_list():
     keyword = request.args.get('keyword', '').strip()
     offset  = (page - 1) * size
     base_cols = ("SELECT device.id, device.phone, device.name, device.plate_no, "
-                 "device.manufacturer, device.terminal_model, device.last_lat, device.last_lng, "
+                 "device.manufacturer, device.terminal_model, device.terminal_id, device.imei, "
+                 "device.last_lat, device.last_lng, "
                  "device.last_speed, device.last_location_time, device.online_time, device.status, device.customer_id, "
                  "r.name AS role_name, r.color AS role_color, r.icon_type AS role_icon "
                  "FROM device LEFT JOIN device_role r ON device.role_id = r.id")

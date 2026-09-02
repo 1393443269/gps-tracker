@@ -58,8 +58,8 @@
             <div style="padding:12px;">
               <el-descriptions :column="1" size="small" border>
                 <el-descriptions-item label="设备名称">{{ selected.name || '—' }}</el-descriptions-item>
-                <el-descriptions-item label="设备号">{{ selected.phone }}</el-descriptions-item>
-                <el-descriptions-item label="IMEI">{{ selected.imei || '—' }}</el-descriptions-item>
+                <el-descriptions-item label="设备号">{{ selected.terminal_id || selected.phone }}</el-descriptions-item>
+                <el-descriptions-item label="IMEI">{{ selected.imei || selected.phone }}</el-descriptions-item>
                 <el-descriptions-item label="状态">
                   <el-tag size="small" :type="selected.status===1?'success':selected.status===2?'danger':'info'">
                     {{ selected.status===1?'在线':selected.status===2?'报警':'离线' }}
@@ -142,7 +142,9 @@
         <span style="font-size:13px;color:#909399;">共 {{ alarmTotal }} 条</span>
       </div>
       <el-table :data="alarms" size="small" style="flex:1;" height="100%" stripe border>
-        <el-table-column label="设备号"   prop="phone"           width="140" />
+        <el-table-column label="设备号" width="140">
+          <template #default="{ row }">{{ row.terminal_id || row.phone }}</template>
+        </el-table-column>
         <el-table-column label="报警类型" prop="alarm_type_name" width="130" />
         <el-table-column label="报警时间" prop="alarm_time"      width="160" />
         <el-table-column label="位置" min-width="180">

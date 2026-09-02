@@ -47,7 +47,7 @@
           v-model="keyword"
           size="small"
           clearable
-          placeholder="按设备IMEI号或姓名搜索"
+          placeholder="按设备号或姓名搜索"
         >
           <template #prefix><el-icon><Search /></el-icon></template>
         </el-input>
@@ -584,7 +584,7 @@ function popupHtml(info) {
   const roleLine = info.roleName
     ? `角色: <span style="color:${_esc(info.roleColor || '#409eff')}">${_esc(info.roleName)}</span><br>`
     : ''
-  return `<b>${_esc(info.phone)}</b><br>
+  return `<b>${_esc(info.terminal_id || info.phone)}</b><br>
     ${roleLine}纬度: ${Number(info.lat).toFixed(6)}<br>
     经度: ${Number(info.lng).toFixed(6)}<br>
     速度: ${_esc(info.speed)} km/h<br>

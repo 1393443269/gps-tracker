@@ -93,7 +93,7 @@
           </el-select>
         </el-col>
         <el-col :span="12">
-          <el-input v-model="assignSearch" placeholder="搜索设备 IMEI/名称" clearable />
+          <el-input v-model="assignSearch" placeholder="搜索设备号/名称" clearable />
         </el-col>
       </el-row>
       <div style="font-size:12px;color:#909399;margin-bottom:6px;">
@@ -103,7 +103,9 @@
         <el-table :data="filteredAssignDevices" size="small" height="340"
           @selection-change="handleAssignSelect" ref="assignTableRef">
           <el-table-column type="selection" width="45" />
-          <el-table-column prop="phone" label="IMEI" min-width="150" />
+          <el-table-column label="设备号" min-width="150">
+            <template #default="{ row }">{{ row.terminal_id || row.phone }}</template>
+          </el-table-column>
           <el-table-column prop="name"  label="名称" width="120">
             <template #default="{ row }">{{ row.name || '—' }}</template>
           </el-table-column>

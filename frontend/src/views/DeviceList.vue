@@ -3,7 +3,7 @@
     <!-- 搜索栏 -->
     <el-row :gutter="12" style="margin-bottom:14px;" align="middle">
       <el-col :span="7">
-        <el-input v-model="keyword" placeholder="IMEI / 名称 / 位置" clearable @change="loadData(1)">
+        <el-input v-model="keyword" placeholder="设备号 / 名称 / 位置" clearable @change="loadData(1)">
           <template #prefix><el-icon><Search /></el-icon></template>
         </el-input>
       </el-col>
@@ -50,7 +50,12 @@
     <el-table ref="tableRef" :data="list" v-loading="loading" stripe border size="small"
       @selection-change="handleSelectionChange">
       <el-table-column type="selection" width="45" />
-      <el-table-column prop="phone"         label="IMEI"     width="150" />
+      <el-table-column label="设备号" width="150">
+        <template #default="{ row }">{{ row.terminal_id || row.phone }}</template>
+      </el-table-column>
+      <el-table-column label="IMEI" width="150">
+        <template #default="{ row }">{{ row.imei || row.phone }}</template>
+      </el-table-column>
       <el-table-column prop="name"          label="名称"     width="120" />
       <el-table-column prop="plate_no"      label="位置"     width="120" />
       <el-table-column label="生命周期" width="95">
@@ -149,8 +154,11 @@
     <!-- 新增设备弹窗 -->
     <el-dialog v-model="createVisible" title="新增设备" width="460px">
       <el-form :model="createForm" label-width="90px">
-        <el-form-item label="IMEI/设备号" required>
-          <el-input v-model="createForm.phone" placeholder="请输入15位IMEI或设备号" />
+        <el-form-item label="设备号" required>
+          <el-input v-model="createForm.phone" placeholder="设备号/终端ID(作设备唯一标识)" />
+        </el-form-item>
+        <el-form-item label="IMEI" required>
+          <el-input v-model="createForm.imei" placeholder="请输入15位设备IMEI(必填)" maxlength="20" />
         </el-form-item>
         <el-form-item label="名称">
           <el-input v-model="createForm.name" placeholder="选填" />
@@ -286,15 +294,16 @@ const textForm    = reactive({ phone:'', text:'' })
 // ── 新增设备 ─────────────────────────────────────────────────────────────────
 const createVisible = ref(false)
 const createSaving  = ref(false)
-const createForm    = reactive({ phone: '', name: '', plateNo: '', terminalModel: '', remark: '' })
+const createForm    = reactive({ phone: '', imei: '', name: '', plateNo: '', terminalModel: '', remark: '' })
 
 function openCreate() {
-  Object.assign(createForm, { phone: '', name: '', plateNo: '', terminalModel: '', remark: '' })
+  Object.assign(createForm, { phone: '', imei: '', name: '', plateNo: '', terminalModel: '', remark: '' })
   createVisible.value = true
 }
 
 async function submitCreate() {
   if (!createForm.phone.trim()) return ElMessage.warning('请输入设备号')
+  if (!createForm.imei.trim()) return ElMessage.warning('IMEI 为必填项,请输入设备 IMEI')
   createSaving.value = true
   try {
     await deviceApi.create({ ...createForm })

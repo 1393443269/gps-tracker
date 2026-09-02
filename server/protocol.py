@@ -275,6 +275,8 @@ def parse_location_body(body: bytes):
         beacon_data = None     # 0x67 蓝牙信标
         rtk_data = None        # 0xE3 RTK
         battery_data = None    # 0xFB 电池
+        iccid_data = None      # 0xF1 ICCID(SIM卡)
+        imei_data = None       # 0xF6 IMEI(设备身份)
         extra_raw = {}         # 所有附加项原始数据
         offset = 28
         while offset + 2 <= len(body):
@@ -296,6 +298,14 @@ def parse_location_body(body: bytes):
                 rtk_data = _parse_extra_rtk(item_data)
             elif item_id == 0xFB and item_len >= 2:  # 电池信息
                 battery_data = _parse_extra_battery(item_data)
+            elif item_id == 0xF1 and item_len >= 1:  # ICCID(SIM卡号)
+                # 协议: 0xF1 后为 ICCID 的 ASCII 串(如 f1143839...),去掉补位后即数字串
+                iccid_data = item_data.decode('ascii', errors='replace').replace('\x00', '').strip()
+                iccid_data = ''.join(c for c in iccid_data if c.isalnum())
+            elif item_id == 0xF6 and item_len >= 8:  # IMEI(设备身份)
+                # 协议: 8字节,第1位nibble为0,后面15位为IMEI的16进制(BCD)数据
+                imei_data = ''.join(f'{b:02x}' for b in item_data)
+                imei_data = imei_data.lstrip('0')[:15] if imei_data else None
             offset += item_len
 
         return {
@@ -313,6 +323,8 @@ def parse_location_body(body: bytes):
             'beacon_data':  beacon_data,
             'rtk_data':     rtk_data,
             'battery_data': battery_data,
+            'iccid':        iccid_data,
+            'imei':         imei_data,
             'extra_raw':    extra_raw,
         }
     except Exception:
