@@ -655,7 +655,10 @@ async function openDeviceCard(phone, ll) {
         name: d.real_name || d.customer_name || d.name || base.name,
         contact: d.contact_phone || '',
         avatar: d.avatar || '',
-        address: d.address || '',
+        // 定位地址取设备最新逆地理地址(last_address),无则回退客户地址
+        address: d.last_address || '',
+        signal: d.last_signal,           // 信号百分比(第二步补)
+        loc_type: d.last_loc_type,       // 定位方式 1基站/2WIFI/3综合/5蓝牙/其余GPS
         last_battery: d.last_battery ?? base.last_battery,
         last_location_time: d.last_location_time,
         last_seen: d.last_seen,

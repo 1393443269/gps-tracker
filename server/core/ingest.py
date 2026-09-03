@@ -534,6 +534,56 @@ _SLEEP_LOW_BAT_PCT      = int(os.environ.get('SLEEP_LOW_BAT_PCT', '15')) # 低�
 # 避免设备数月前改过一次IP、今天因没电离线也被误标"已迁移"。
 _MIGRATE_LOOKBACK_SEC = int(os.environ.get('MIGRATE_LOOKBACK_SEC', '86400'))  # 默认 24 小时
 
+# 逆地理编码限流:烧第三方配额,不能每帧都调。每台设备记 (上次地址更新时间, lat, lng),
+# 满足"距上次超冷却时间"且"位移超阈值"才重新反查;静止/高频上报设备复用上次地址。
+_ADDR_LAST = {}                 # phone -> (epoch_sec, lat, lng)
+_ADDR_LOCK = threading.Lock()
+_ADDR_COOLDOWN_SEC = int(os.environ.get('ADDR_COOLDOWN_SEC', '300'))   # 同设备最快 5 分钟一次
+_ADDR_MOVE_DEG     = float(os.environ.get('ADDR_MOVE_DEG', '0.0005'))  # 位移阈值≈50m,内不重查
+
+def _update_address(phone, lat, lng):
+    """逆地理编码存 device.last_address(限流)。只读第三方、写一列,失败静默。"""
+    if not geo_resolve.enabled():
+        return
+    try:
+        latf = float(lat); lngf = float(lng)
+    except (TypeError, ValueError):
+        return
+    if latf == 0 and lngf == 0:
+        return
+    # gevent 下用 monkey-patch 后的 time;此处用简单单调判断
+    import time as _t
+    nowsec = _t.time()
+    with _ADDR_LOCK:
+        prev = _ADDR_LAST.get(phone)
+        if prev:
+            dt = nowsec - prev[0]
+            moved = abs(latf - prev[1]) + abs(lngf - prev[2])
+            if dt < _ADDR_COOLDOWN_SEC and moved < _ADDR_MOVE_DEG:
+                return   # 冷却期内且没怎么动,复用旧地址
+        _ADDR_LAST[phone] = (nowsec, latf, lngf)
+    addr = geo_resolve.reverse_geocode(latf, lngf)
+    if addr:
+        db_exec("UPDATE device SET last_address=? WHERE phone=?", (addr, phone))
+
+def _normalize_signal(sig_type, sig_val):
+    """把 G618 0xF9 的信号值按类型归一成 0~100 百分比。无效返回 None。
+    sig_type: 0=已是百分比, 1=五级制(0-4), 2=CSQ值(0-31,常见 GSM 信号)。"""
+    if sig_val is None:
+        return None
+    try:
+        v = int(sig_val)
+    except (TypeError, ValueError):
+        return None
+    if sig_type == 1:            # 五级制 0-4 → 0/25/50/75/100
+        return max(0, min(100, v * 25))
+    if sig_type == 2:            # CSQ 0-31(99=未知) → 百分比
+        if v >= 99 or v < 0:
+            return None
+        return max(0, min(100, round(v / 31 * 100)))
+    # 默认按百分比(sig_type=0 或未知),夹到 0~100
+    return max(0, min(100, v))
+
 def _infer_offline_reason(phone, last_bat):
     """置离线时联查已有数据推断失联原因(第二期)。只读,不改任何状态。
     返回枚举:'migrated'/'battery_drain'/'net_lost'/'unknown'。
@@ -1349,6 +1399,11 @@ def handle_g618g_frame(conn, frame, phone_holder):
         if imei:
             # 心跳即通信活性：无条件刷 last_seen + 置在线(电量可能为空但设备确实活着)
             db_exec("UPDATE device SET status=1,online_time=?,last_seen=?,presence_state='online',offline_reason=NULL WHERE phone=?", (now, now, imei))
+            # 信号强度归一成百分比存 last_signal(供设备卡片显示)。
+            # signal_type: 0百分比 / 1五级制(0-4→×25) / 2 CSQ值(0-31→/31×100)。
+            _sig = _normalize_signal(r.get('signal_type'), r.get('signal'))
+            if _sig is not None:
+                db_exec("UPDATE device SET last_signal=? WHERE phone=?", (_sig, imei))
             # 电量存两处：device.last_battery 存实时值(供列表/详情直接读)，
             # sensor_data 存历史(供以后画电量曲线)。battery_pct 可能为 None(短心跳payload)，判空再存。
             battery_pct = r.get('battery_pct')
@@ -1405,6 +1460,9 @@ def handle_g618g_frame(conn, frame, phone_holder):
                 (did, imei, r['lat'], r['lng'], 0, 0, 0, 0, 2, None, gps_time),
                 (imei, r['lat'], r['lng'], 0, gps_time, 1, now)
             )
+            # 定位方式=GPS(0);并触发逆地理编码存中文地址(限流,见 _update_address)
+            db_exec("UPDATE device SET last_loc_type=0 WHERE phone=?", (imei,))
+            _update_address(imei, r['lat'], r['lng'])
             # WebSocket 实时推送位置到前端地图（与 808/MQTT 路径一致，缺此步则设备有坐标却不上图）
             role_row = db_query_one(
                 "SELECT r.name AS role_name, r.color AS role_color, r.icon_type AS role_icon "
@@ -1496,6 +1554,10 @@ def handle_g618g_frame(conn, frame, phone_holder):
                     (did, imei, fix['lat'], fix['lng'], 0, 0, 0, 0, loc_type, None, gps_time),
                     (imei, fix['lat'], fix['lng'], 0, gps_time, 1, now)
                 )
+                # 卡片"定位方式"字段:WiFi→2(归为WIFI显示)/基站→1;并逆地理编码存地址
+                db_exec("UPDATE device SET last_loc_type=? WHERE phone=?",
+                        (2 if fix['source'] == 'wifi' else 1, imei))
+                _update_address(imei, fix['lat'], fix['lng'])
             else:
                 # 未配 Key 或换算失败：仅调试日志，不落坐标（数据不丢，可后续补算）
                 log.debug("[G618G] WiFi/基站定位未换算 imei=%s wifi=%d cell=%d key=%s",

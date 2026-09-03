@@ -115,3 +115,43 @@ def _extract_latlng(data, source):
         return None
     except Exception:
         return None
+
+
+# 逆地理编码(坐标→中文地址)。腾讯 WebService·逆地址解析 GET 接口。
+# 设备上报的是 WGS-84 坐标，故传 coord_type=1(GPS/WGS84 输入)，避免与默认 GCJ-02 偏移。
+_GEOCODER_URL = 'https://apis.map.qq.com/ws/geocoder/v1'
+
+def reverse_geocode(lat, lng):
+    """把 WGS-84 经纬度反查成中文地址字符串。未配 Key/失败返回 None。
+    返回 result.address(如"广西壮族自治区桂林市七星区..."),不含 POI 以省流量。"""
+    if not LBS_KEY:
+        return None
+    try:
+        latf = float(lat); lngf = float(lng)
+    except (TypeError, ValueError):
+        return None
+    if not (-90 <= latf <= 90) or not (-180 <= lngf <= 180):
+        return None
+    try:
+        from urllib.parse import urlencode
+        qs = urlencode({'location': '%.6f,%.6f' % (latf, lngf),
+                        'key': LBS_KEY, 'coord_type': 1, 'get_poi': 0})
+        req = urllib.request.Request(
+            _GEOCODER_URL + '?' + qs, method='GET',
+            headers={'User-Agent': 'gps-tracker/1.0'})
+        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode('utf-8', errors='replace'))
+        if data.get('status') != 0:
+            log.warning("[geo] 逆地理编码失败 status=%s msg=%s", data.get('status'), data.get('message'))
+            return None
+        result = data.get('result') or {}
+        addr = result.get('address')
+        # 补充推荐地址(更口语,如"XX产业园")优先,否则用标准 address
+        formatted = (result.get('formatted_addresses') or {}).get('recommend')
+        return (addr or '') + (('　' + formatted) if formatted else '') or None
+    except urllib.error.URLError as e:
+        log.warning("[geo] 逆地理编码网络失败: %s", getattr(e, 'reason', e))
+        return None
+    except Exception as e:
+        log.warning("[geo] 逆地理编码异常: %s", type(e).__name__)
+        return None

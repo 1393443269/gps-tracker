@@ -629,7 +629,14 @@ def init_db():
                  # offline_reason：置离线时联查电量/充电/指令日志推断的失联原因，供运维定位。
                  #   枚举:'power_off'主动关机 / 'battery_drain'电量耗尽 / 'charge_off'充电关机 /
                  #        'net_lost'疑似断网 / 'migrated'已迁移(下发过改IP) / 'unknown'未知。
-                 "offline_reason TEXT DEFAULT NULL"]:
+                 "offline_reason TEXT DEFAULT NULL",
+                 # ── 设备卡片补充字段(实时地图信息卡片用) ────────────────────────
+                 # last_signal：最新信号强度(百分比),G618 的 0xF9 心跳带出。
+                 "last_signal INTEGER DEFAULT NULL",
+                 # last_loc_type：最新定位方式。1基站/2WIFI/3综合/5蓝牙,其余(含0/空)按 GPS。
+                 "last_loc_type INTEGER DEFAULT NULL",
+                 # last_address：最新定位的逆地理编码中文地址(腾讯 LBS 反查,失败则空)。
+                 "last_address TEXT DEFAULT NULL"]:
         try:
             conn.execute(f"ALTER TABLE device ADD COLUMN {_col}")
             conn.commit()
@@ -1236,6 +1243,9 @@ def devices_with_customer():
         "SELECT d.id, d.phone, d.name, d.terminal_model, d.last_location_time, "
         "       d.status, d.lifecycle, d.activated_at, d.customer_id, d.role_id, "
         "       d.terminal_id, d.imei, "
+        # 设备卡片补充:电量/最后通信/信号/定位方式/逆地理地址/呈现态
+        "       d.last_battery, d.last_seen, d.last_signal, d.last_loc_type, "
+        "       d.last_address, d.presence_state, d.offline_reason, "
         "       r.name as role_name, r.color as role_color, r.icon_type, "
         "       c.contact as real_name, c.gender, c.age, c.avatar, "
         "       c.phone as contact_phone, c.address, c.remark as customer_remark, "
