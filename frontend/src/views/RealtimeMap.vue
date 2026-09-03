@@ -606,13 +606,17 @@ function popupHtml(info) {
   const locType = _locTypeText(info.loc_type)
   const ph      = _esc(info.phone || '')
   const alarmTag = info.alarm ? '<span style="color:#f56c6c;font-weight:600;">⚠ 报警中</span>' : ''
+  // 头像:有上传图则显示图片,否则默认人形 emoji
+  const avatar  = info.avatar
+    ? `<img src="${_esc(info.avatar)}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;">`
+    : '👤'
   // 底部按钮:图标 emoji + 文字,点击调 window.__rtNav 跳转
   const btn = (icon, text, key) =>
     `<div class="rt-card-btn" onclick="window.__rtNav && window.__rtNav('${key}','${ph}')">
        <div class="rt-card-btn-i">${icon}</div><div>${text}</div></div>`
   return `<div class="rt-card">
     <div class="rt-card-hd">
-      <div class="rt-card-avatar">👤</div>
+      <div class="rt-card-avatar">${avatar}</div>
       <div class="rt-card-name">${name}</div>
       ${alarmTag}
     </div>
@@ -641,13 +645,20 @@ async function openDeviceCard(phone, ll) {
     const res = await deviceApi.withCustomer({ imei: phone, size: 1 })
     const d = (res.data?.records || [])[0]
     if (d && popup && popup.isOpen()) {
+      // 字段名对齐 withCustomer 后端别名:real_name(姓名)/contact_phone(联系方式)/
+      // avatar(头像)/address(地址)/customer_name(归属账号)。
       const merged = {
         ...base,
-        imei: d.imei || d.phone, terminal_model: d.terminal_model,
-        name: d.name || d.customer_name || base.name,
-        contact: d.contact || d.customer_contact || d.phone_no,
+        imei: d.imei || d.phone,
+        terminal_model: d.terminal_model,
+        // 卡片标题优先真人姓名,无则归属账号,再退设备名
+        name: d.real_name || d.customer_name || d.name || base.name,
+        contact: d.contact_phone || '',
+        avatar: d.avatar || '',
+        address: d.address || '',
         last_battery: d.last_battery ?? base.last_battery,
-        last_location_time: d.last_location_time, last_seen: d.last_seen,
+        last_location_time: d.last_location_time,
+        last_seen: d.last_seen,
       }
       popup.setHTML(popupHtml(merged))
     }
