@@ -620,7 +620,16 @@ def init_db():
                  # expected_interval_sec：该设备的「期望上报间隔」(秒)，离线阈值 = 本值×倍数+冗余。
                  #   建档按型号给默认值；G618G 的 0xE9 状态报文带真实频率时会回写更新。
                  #   NULL/<=0 时离线扫描回退到按型号名的静态阈值。
-                 "expected_interval_sec INTEGER DEFAULT NULL"]:
+                 "expected_interval_sec INTEGER DEFAULT NULL",
+                 # ── 四态判定(在线/休眠/离线/停用) ────────────────────────────
+                 # presence_state：比 status(0/1/2)更细的呈现态，不动 status 以保前端兼容,前端渐进切换。
+                 #   取值:'online'在线 / 'sleeping'休眠(G618正常省电,仍算广义在线) /
+                 #        'offline'离线失联 / 'disabled'停用(生命周期下线)。
+                 "presence_state TEXT DEFAULT 'online'",
+                 # offline_reason：置离线时联查电量/充电/指令日志推断的失联原因，供运维定位。
+                 #   枚举:'power_off'主动关机 / 'battery_drain'电量耗尽 / 'charge_off'充电关机 /
+                 #        'net_lost'疑似断网 / 'migrated'已迁移(下发过改IP) / 'unknown'未知。
+                 "offline_reason TEXT DEFAULT NULL"]:
         try:
             conn.execute(f"ALTER TABLE device ADD COLUMN {_col}")
             conn.commit()

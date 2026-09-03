@@ -146,9 +146,12 @@ def _do_db_write(rows, dev_snapshot):
                     if dev_snapshot:
                         # last_seen 与 last_location_time 一并刷成本次定位时间(d[4])：定位也是一次上报，
                         # 通信活性时间戳同步前移，离线扫描据此判定(见 _offline_scan_once)。
+                        # 定位即"活着"的强信号:presence_state 复位 online、清 offline_reason
+                        # (休眠/离线设备一旦重新上报即自动恢复在线)。仅对 status!=2(非报警态)复位。
                         conn.executemany(
                             "UPDATE device SET last_lat=?,last_lng=?,last_speed=?,"
-                            "last_location_time=?,status=?,updated_at=?,last_seen=? WHERE phone=?",
+                            "last_location_time=?,status=?,updated_at=?,last_seen=?,"
+                            "presence_state='online',offline_reason=NULL WHERE phone=?",
                             [(d[1],d[2],d[3],d[4],d[5],d[6],d[4],d[0]) for d in dev_snapshot])
                     conn.commit()
                 finally:
@@ -516,6 +519,35 @@ _OFFLINE_INTERVAL_GRACE  = int(os.environ.get('OFFLINE_INTERVAL_GRACE_SEC', '120
 _OFFLINE_DYN_MIN_SEC     = int(os.environ.get('OFFLINE_DYN_MIN_SEC', '300'))    # 阈值下限 5 分钟
 _OFFLINE_DYN_MAX_SEC     = int(os.environ.get('OFFLINE_DYN_MAX_SEC', '10800'))  # 阈值上限 3 小时
 
+# ── 四态判定(在线/休眠/离线/停用):休眠识别 + 失联原因推断 ─────────────────────────
+# G618 休眠窗口:超过离线阈值、但未超「休眠最长时限」且设备健康(电量非低)时,判"休眠"而非离线。
+# 休眠也有上限——超过则复核为失联,避免"永久休眠"变相成僵尸在线。
+_SLEEP_MAX_SEC          = int(os.environ.get('SLEEP_MAX_SEC', '10800'))  # 休眠最长时限,默认 3 小时
+_SLEEP_LOW_BAT_PCT      = int(os.environ.get('SLEEP_LOW_BAT_PCT', '15')) # 低于此电量不认为在健康休眠
+
+def _infer_offline_reason(phone, last_bat):
+    """置离线时联查已有数据推断失联原因(第二期)。只读,不改任何状态。
+    返回枚举:'migrated'/'battery_drain'/'net_lost'/'unknown'。
+    (充电关机 charge_off、主动/低电关机由 0x21 关机报文分支即时判定,不在超时兜底里推断。)
+    依据优先级:下发过改IP(强证据) > 电量耗尽 > 电量健康(疑似断网) > 未知。"""
+    try:
+        # ① 迁移:失联前平台下发过改 IP 类指令(command_history 里含 IP/set_server_ip/域名设置)
+        row = db_query_one(
+            "SELECT COUNT(*) AS n FROM command_history WHERE phone=? "
+            "AND (command LIKE '%IP%' OR command LIKE '%set_server%' OR command LIKE '%域名%' "
+            "OR command LIKE '%C3%')", (phone,))
+        if row and (row.get('n') or 0) > 0:
+            return 'migrated'
+    except Exception:
+        pass
+    # ② 电量耗尽:最后电量已很低
+    if isinstance(last_bat, (int, float)) and last_bat <= _SLEEP_LOW_BAT_PCT:
+        return 'battery_drain'
+    # ③ 电量健康却失联 → 疑似断网(有电但连不上)
+    if isinstance(last_bat, (int, float)) and last_bat > _SLEEP_LOW_BAT_PCT:
+        return 'net_lost'
+    return 'unknown'
+
 def _offline_scan_once():
     """把超过静默阈值仍无「任何上报」的在线设备置离线。返回置离线的设备数。
 
@@ -538,43 +570,61 @@ def _offline_scan_once():
     # "now - expected×factor" 减法，而是把候选在线设备读到 Python 侧按各自阈值判定(设备量小，可行)。
     ts_col = "COALESCE(last_seen, last_location_time)"
     base_cond = (f"status=1 AND {ts_col} IS NOT NULL AND {ts_col} <> ''")
-    total = 0
+    sleep_phones   = []   # 判为休眠(G618 正常省电,status 保持 1、presence_state='sleeping')
+    offline_items  = []   # 判为离线(失联):(phone, reason)
     try:
         rows = db_query(
-            f"SELECT phone, terminal_model, expected_interval_sec, {ts_col} AS ts "
-            f"FROM device WHERE {base_cond}")
-        offline_phones = []
+            f"SELECT phone, terminal_model, expected_interval_sec, last_battery, "
+            f"presence_state, {ts_col} AS ts FROM device WHERE {base_cond}")
         for r in rows:
             exp = r.get('expected_interval_sec')
             if exp and exp > 0:
-                # 动态档：间隔×倍数+冗余，夹到安全区间
                 thr = int(exp * _OFFLINE_INTERVAL_FACTOR + _OFFLINE_INTERVAL_GRACE)
                 thr = max(_OFFLINE_DYN_MIN_SEC, min(_OFFLINE_DYN_MAX_SEC, thr))
             else:
-                # 静态档：按型号名回退(与历史一致)
-                model = (r.get('terminal_model') or '').upper()
-                mins = OFFLINE_TIMEOUT_SLEEP_MIN if 'G618' in model else OFFLINE_TIMEOUT_MIN
+                model0 = (r.get('terminal_model') or '').upper()
+                mins = OFFLINE_TIMEOUT_SLEEP_MIN if 'G618' in model0 else OFFLINE_TIMEOUT_MIN
                 thr = mins * 60
-            if (r.get('ts') or '') < _cut(thr):
-                offline_phones.append(r['phone'])
-        if offline_phones:
-            # 分批 UPDATE，避免 IN 列表过长；仅动仍为 status=1 的设备(防扫描期间设备刚上线又被误置)
-            for i in range(0, len(offline_phones), 500):
-                chunk = offline_phones[i:i + 500]
+            ts = r.get('ts') or ''
+            if ts >= _cut(thr):
+                continue   # 未超阈值,仍在线,不动
+            # —— 已超上报阈值,进入四态判定 ——
+            model = (r.get('terminal_model') or '').upper()
+            bat   = r.get('last_battery')
+            is_g618 = 'G618' in model
+            # 休眠判据:G618 + 未超休眠最长时限 + 电量健康(非低电) → 判休眠,不掉线
+            healthy_bat = (bat is None) or (isinstance(bat, (int, float)) and bat > _SLEEP_LOW_BAT_PCT)
+            if is_g618 and ts >= _cut(_SLEEP_MAX_SEC) and healthy_bat:
+                sleep_phones.append(r['phone'])
+            else:
+                # 失联:超休眠上限 / 非G618 / 电量已低 → 置离线并推断原因
+                offline_items.append((r['phone'], _infer_offline_reason(r['phone'], bat)))
+        # 置休眠:status 保持 1(广义在线,不掉线),仅改 presence_state
+        for i in range(0, len(sleep_phones), 500):
+            chunk = sleep_phones[i:i + 500]
+            ph = ','.join(['?'] * len(chunk))
+            db_exec(f"UPDATE device SET presence_state='sleeping', updated_at=? "
+                    f"WHERE status=1 AND phone IN ({ph})", (stamp, *chunk))
+        # 置离线:status=0 + presence_state='offline' + 原因。按 reason 分组批量写。
+        by_reason = {}
+        for phone, reason in offline_items:
+            by_reason.setdefault(reason, []).append(phone)
+        for reason, phones in by_reason.items():
+            for i in range(0, len(phones), 500):
+                chunk = phones[i:i + 500]
                 ph = ','.join(['?'] * len(chunk))
-                db_exec(f"UPDATE device SET status=0, offline_time=?, updated_at=? "
-                        f"WHERE status=1 AND phone IN ({ph})",
-                        (stamp, stamp, *chunk))
-            total = len(offline_phones)
+                db_exec(f"UPDATE device SET status=0, presence_state='offline', offline_reason=?, "
+                        f"offline_time=?, updated_at=? WHERE status=1 AND phone IN ({ph})",
+                        (reason, stamp, stamp, *chunk))
     except Exception as e:
-        log.error("[离线扫描] 置离线失败: %s", e)
+        log.error("[离线扫描] 四态判定失败: %s", e)
         return 0
-    if total:
-        log.info("[离线扫描] 已将 %d 台超时未上报的设备置离线(动态档=期望间隔×%.1f+%d秒;"
-                 "静态档=持续型%d分/休眠型%d分)",
-                 total, _OFFLINE_INTERVAL_FACTOR, _OFFLINE_INTERVAL_GRACE,
-                 OFFLINE_TIMEOUT_MIN, OFFLINE_TIMEOUT_SLEEP_MIN)
-    return total
+    if sleep_phones or offline_items:
+        log.info("[离线扫描] 本轮:休眠 %d 台(G618省电,不掉线);离线 %d 台(失联,附原因)。"
+                 "阈值动态档=期望间隔×%.1f+%d秒,休眠上限%d秒",
+                 len(sleep_phones), len(offline_items),
+                 _OFFLINE_INTERVAL_FACTOR, _OFFLINE_INTERVAL_GRACE, _SLEEP_MAX_SEC)
+    return len(offline_items)
 
 
 _offline_scanner_started = False
@@ -995,7 +1045,7 @@ def handle_auth(sock, phone, serial, body):
         # 先应答设备（不被数据库写锁阻塞，避免高并发下设备超时断连），再异步更新状态
         sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0102, 0))
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        db_exec("UPDATE device SET status=1, online_time=?, last_seen=? WHERE phone=?", (now, now, canonical))
+        db_exec("UPDATE device SET status=1, online_time=?, last_seen=?, presence_state='online', offline_reason=NULL WHERE phone=?", (now, now, canonical))
         # 按 canonical 登记会话(设备可能只发鉴权不发注册),保证指令下发能按 device 表 phone 命中
         if canonical:
             with sessions_lock:
@@ -1021,7 +1071,7 @@ def handle_heartbeat(sock, phone, serial):
     sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0002, 0))
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     # 心跳只刷通信活性(last_seen)与在线态，不动 last_location_time(前端"最后定位时间"保持真实)
-    db_exec("UPDATE device SET status=1, online_time=?, last_seen=? WHERE phone=?", (now, now, canonical))
+    db_exec("UPDATE device SET status=1, online_time=?, last_seen=?, presence_state='online', offline_reason=NULL WHERE phone=?", (now, now, canonical))
     log.debug("[808] 心跳: phone=%s", canonical)
 
 
@@ -1268,7 +1318,7 @@ def handle_g618g_frame(conn, frame, phone_holder):
                     "VALUES (?,?,?,?,1,1,1,?,?,600,?,?)",
                     (imei, 'G618G-'+imei[-6:], 'OFERT', 'G618G', now, now, now, now))
         else:
-            db_exec("UPDATE device SET status=1,online_time=?,last_seen=?,updated_at=? WHERE phone=?", (now, now, now, imei))
+            db_exec("UPDATE device SET status=1,online_time=?,last_seen=?,updated_at=?,presence_state='online',offline_reason=NULL WHERE phone=?", (now, now, now, imei))
         # 回复 F1（时间戳用当前秒）
         import time as _t
         conn.sendall(g618.build_login_reply(int(_t.time())))
@@ -1284,7 +1334,7 @@ def handle_g618g_frame(conn, frame, phone_holder):
         imei = phone_holder[0]
         if imei:
             # 心跳即通信活性：无条件刷 last_seen + 置在线(电量可能为空但设备确实活着)
-            db_exec("UPDATE device SET status=1,online_time=?,last_seen=? WHERE phone=?", (now, now, imei))
+            db_exec("UPDATE device SET status=1,online_time=?,last_seen=?,presence_state='online',offline_reason=NULL WHERE phone=?", (now, now, imei))
             # 电量存两处：device.last_battery 存实时值(供列表/详情直接读)，
             # sensor_data 存历史(供以后画电量曲线)。battery_pct 可能为 None(短心跳payload)，判空再存。
             battery_pct = r.get('battery_pct')
@@ -1379,9 +1429,17 @@ def handle_g618g_frame(conn, frame, phone_holder):
             # 那几种情况平台仍显示在线(已与用户确认，属纯信号驱动的已知取舍)。
             _is_shutdown = any(('关机' in a) for a in _alarm_list)
             if _is_shutdown:
-                db_exec("UPDATE device SET status=0, offline_time=?, updated_at=? WHERE phone=?",
-                        (now, now, imei))
-                log.info("[G618G] 收到关机报警(%s)判离线 imei=%s", desc, imei)
+                # 收到明确关机报文：置离线并按关机类型定原因(充电关机/低电关机/主动关机)。
+                if any('充电关机' in a for a in _alarm_list):
+                    _reason = 'charge_off'
+                elif any(('低电' in a) for a in _alarm_list):
+                    _reason = 'battery_drain'
+                else:
+                    _reason = 'power_off'
+                db_exec("UPDATE device SET status=0, presence_state='offline', offline_reason=?, "
+                        "offline_time=?, updated_at=? WHERE phone=?",
+                        (_reason, now, now, imei))
+                log.info("[G618G] 收到关机报警(%s)判离线 imei=%s reason=%s", desc, imei, _reason)
                 # 实时推送离线状态到前端，使地图/列表即时反映
                 _sio_emit('device_offline', {'phone': imei, 'time': now, 'reason': desc}, imei)
 
@@ -1461,12 +1519,12 @@ def handle_g618g_frame(conn, frame, phone_holder):
             # 离线扫描据此为这台设备算专属阈值(见 _offline_scan_once 动态档)。同时刷 last_seen。
             if isinstance(loc_freq, int) and 1 <= loc_freq <= 1440:
                 db_exec("UPDATE device SET status=1,online_time=?,last_seen=?,"
-                        "expected_interval_sec=? WHERE phone=?",
+                        "expected_interval_sec=?,presence_state='online',offline_reason=NULL WHERE phone=?",
                         (now, now, loc_freq * 60, imei))
                 log.info("[G618G] 设备状态: IMEI=%s 定位上报频率=%d分钟(已更新离线阈值基准)",
                          imei, loc_freq)
             else:
-                db_exec("UPDATE device SET status=1,online_time=?,last_seen=? WHERE phone=?",
+                db_exec("UPDATE device SET status=1,online_time=?,last_seen=?,presence_state='online',offline_reason=NULL WHERE phone=?",
                         (now, now, imei))
 
     return typ
