@@ -529,6 +529,9 @@ _OFFLINE_DYN_MAX_SEC     = int(os.environ.get('OFFLINE_DYN_MAX_SEC', '10800'))  
 # 默认 6 小时,明显大于离线动态上限默认 3 小时。
 _SLEEP_MAX_SEC          = int(os.environ.get('SLEEP_MAX_SEC', '21600'))  # 休眠最长时限,默认 6 小时
 _SLEEP_LOW_BAT_PCT      = int(os.environ.get('SLEEP_LOW_BAT_PCT', '15')) # 低于此电量不认为在健康休眠
+# 长连接判据:实测上报间隔 < 此值(秒)视为持续型/长连接设备,TCP 断开即判离线(第三期主动探测)。
+# 默认 300 秒——天禧(3分钟)算长连接、G618 短连接(5~10分钟+休眠)不算,断开不误判。
+_LONGCONN_MAX_SEC       = int(os.environ.get('LONGCONN_MAX_SEC', '300'))
 
 # 迁移推断的时间窗:只有「失联前最近这段时间内」下发过改IP才算迁移证据,
 # 避免设备数月前改过一次IP、今天因没电离线也被误标"已迁移"。
@@ -565,6 +568,53 @@ def _update_address(phone, lat, lng):
     addr = geo_resolve.reverse_geocode(latf, lngf)
     if addr:
         db_exec("UPDATE device SET last_address=? WHERE phone=?", (addr, phone))
+
+# 开机时间记录:G618 的 ICCID(0xF3)/版本(0xA9)"开机才上报一笔",开机类报警也是开机点。
+# 但设备可能短时间内重连多次,故距上次 boot_time 超过 _BOOT_GAP_SEC 才更新,避免误刷成"每次上报"。
+_BOOT_GAP_SEC = int(os.environ.get('BOOT_GAP_SEC', '300'))   # 两次开机记录最小间隔,默认 5 分钟
+
+def _record_boot(phone, now_str):
+    """收到开机特征报文时记 boot_time(距上次超 _BOOT_GAP_SEC 才更新)。只读+写一列,失败静默。"""
+    try:
+        row = db_query_one("SELECT boot_time FROM device WHERE phone=?", (phone,))
+        prev = (row.get('boot_time') if row else None) or ''
+        if prev:
+            # 字符串时间戳同格式,直接比较:距今不足 _BOOT_GAP_SEC 则不重复记
+            cut = (datetime.now() - timedelta(seconds=_BOOT_GAP_SEC)).strftime('%Y-%m-%d %H:%M:%S')
+            if prev >= cut:
+                return
+        db_exec("UPDATE device SET boot_time=? WHERE phone=?", (now_str, phone))
+        log.info("[开机] phone=%s 记录开机时间 %s", phone, now_str)
+    except Exception as e:
+        log.warning("[开机] 记录 boot_time 失败 phone=%s err=%s", phone, e)
+
+# 天禧等无"频率上报报文"的设备:由相邻上报时间差实测平均间隔,回写 expected_interval_sec,
+# 让离线阈值自适应设备实际频率(不必人工填)。用指数移动平均(EMA)平滑抖动。
+_MEAS_MIN_GAP = int(os.environ.get('MEAS_MIN_GAP_SEC', '10'))     # 小于此间隔视为重复帧,不计入
+_MEAS_MAX_GAP = int(os.environ.get('MEAS_MAX_GAP_SEC', '3600'))   # 大于此间隔(可能刚重连)不计入,避免拉偏
+_MEAS_ALPHA   = float(os.environ.get('MEAS_ALPHA', '0.3'))        # EMA 权重:新样本占 30%
+
+def _update_measured_interval(phone, prev_last_seen, now_dt):
+    """用本次与上次上报的时间差更新实测间隔并回写 expected_interval_sec。
+    prev_last_seen 为更新前的 last_seen 字符串;now_dt 为本次时间(datetime)。"""
+    if not prev_last_seen:
+        return
+    try:
+        prev_dt = datetime.strptime(prev_last_seen, '%Y-%m-%d %H:%M:%S')
+    except (ValueError, TypeError):
+        return
+    gap = (now_dt - prev_dt).total_seconds()
+    if gap < _MEAS_MIN_GAP or gap > _MEAS_MAX_GAP:
+        return   # 重复帧/刚重连的异常大间隔,不计入
+    try:
+        row = db_query_one("SELECT measured_interval_sec FROM device WHERE phone=?", (phone,))
+        prev_meas = (row.get('measured_interval_sec') if row else None) or 0
+        # 首个样本直接用 gap,之后 EMA 平滑
+        new_meas = int(gap) if prev_meas <= 0 else int(prev_meas * (1 - _MEAS_ALPHA) + gap * _MEAS_ALPHA)
+        db_exec("UPDATE device SET measured_interval_sec=?, expected_interval_sec=? WHERE phone=?",
+                (new_meas, new_meas, phone))
+    except Exception as e:
+        log.warning("[实测间隔] 更新失败 phone=%s err=%s", phone, e)
 
 def _normalize_signal(sig_type, sig_val):
     """把 G618 0xF9 的信号值按类型归一成 0~100 百分比。无效返回 None。
@@ -1183,6 +1233,14 @@ def handle_location(sock, phone, serial, body):
         except Exception as e:
             log.warning("[808] 电量落库失败 phone=%s err=%s", canonical, e)
 
+    # 天禧无频率上报报文:用本次与上次上报的时间差实测平均间隔,自动回写 expected_interval_sec。
+    # 此刻 device.last_seen 尚是"上一次"的值(本次 last_seen 由后续异步批量写刷新),正好用来算间隔。
+    try:
+        _drow = db_query_one("SELECT last_seen FROM device WHERE phone=?", (canonical,))
+        _update_measured_interval(canonical, (_drow.get('last_seen') if _drow else None), datetime.now())
+    except Exception:
+        pass
+
     # 信号强度(0x30)+定位方式(GPS)+逆地理地址:供设备卡片显示,与 G618 路径对齐。
     _sig808 = loc.get('signal')
     if _sig808 is not None:
@@ -1534,6 +1592,8 @@ def handle_g618g_frame(conn, frame, phone_holder):
         if imei:
             iccid = r['iccid']
             db_exec("UPDATE device SET remark=? WHERE phone=?", ('ICCID:'+iccid, imei))
+            # ICCID"开机上报一笔"(协议 2.2),据此记开机时间
+            _record_boot(imei, now)
             # 打通 SIM 卡管理：设备上报的 ICCID 自动登记/关联到 sim_card 表，
             # 使 SIM 卡管理页能看到该卡及其绑定设备。iccid 唯一，存在则仅更新绑定设备，
             # 不覆盖运营商/套餐/到期等人工维护字段。跨库(SQLite/PG)用先查后写，避免 UPSERT 方言差异。
@@ -1725,9 +1785,24 @@ def handle_client(conn, addr):
                 for _k in [k for k, v in sessions.items() if v is conn]:
                     sessions.pop(_k, None)
             _fence_cleanup(phone)   # 清理围栏状态，防内存泄漏和 phone 复用时状态污染
-            # 关机报警驱动离线方案：短连接设备(G618G等)上报完即断开 TCP，这是正常低功耗行为，
-            # 【不能】据此判离线，否则设备每次上报完就被置离线、离线状态形同虚设。
-            # 设备离线只由「收到关机报警(0x21)」置位(见 alarm2 分支)，TCP 断开只记日志、不改 status。
+            # 主动探测(第三期)——仅对【长连接】设备:TCP 断开=真离线,即时置位,不等超时扫描。
+            # 判据:实测上报间隔很短(< _LONGCONN_MAX_SEC)说明是持续型/长连接设备,断开即离线;
+            # 短连接/休眠设备(G618G 默认)上报完即断属正常,间隔长或未知,【维持原逻辑不动】,
+            # 只由关机报警或超时扫描判离线。既取得"长连接即时发现"之利,又不误伤短连接。
+            try:
+                _canon = resolve_phone(phone)
+                _row = db_query_one(
+                    "SELECT measured_interval_sec, status FROM device WHERE phone=?", (_canon,))
+                _mi = (_row.get('measured_interval_sec') if _row else None) or 0
+                if _row and _row.get('status') == 1 and 0 < _mi < _LONGCONN_MAX_SEC:
+                    _dnow = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    db_exec("UPDATE device SET status=0, presence_state='offline', "
+                            "offline_reason='net_lost', offline_time=?, updated_at=? "
+                            "WHERE phone=? AND status=1", (_dnow, _dnow, _canon))
+                    _sio_emit('device_offline', {'phone': _canon, 'time': _dnow, 'reason': '连接断开'}, _canon)
+                    log.info("[808] 长连接设备断开即判离线 phone=%s(实测间隔%ds)", _canon, _mi)
+            except Exception as _e:
+                log.warning("[808] 断开离线判定异常 phone=%s err=%s", phone, _e)
         log.info("[808] 连接断开: %s phone=%s", addr, phone)
 
 

@@ -636,7 +636,14 @@ def init_db():
                  # last_loc_type：最新定位方式。1基站/2WIFI/3综合/5蓝牙,其余(含0/空)按 GPS。
                  "last_loc_type INTEGER DEFAULT NULL",
                  # last_address：最新定位的逆地理编码中文地址(腾讯 LBS 反查,失败则空)。
-                 "last_address TEXT DEFAULT NULL"]:
+                 "last_address TEXT DEFAULT NULL",
+                 # boot_time：设备本次开机时间。区别于 online_time(每次短连接上报都刷)——
+                 #   仅在收到"开机才上报"的特征报文(G618 的 0xF3 ICCID/0xA9 版本、开机类报警)时记录,
+                 #   且距上次 boot_time 超过 _BOOT_GAP_SEC 才更新,更贴近真实硬件开机时刻。
+                 "boot_time TEXT DEFAULT NULL",
+                 # measured_interval_sec：天禧等无频率上报报文的设备,由相邻上报时间差实测出的
+                 #   平均上报间隔(滑动更新),回写 expected_interval_sec 让离线阈值自适应实际频率。
+                 "measured_interval_sec INTEGER DEFAULT NULL"]:
         try:
             conn.execute(f"ALTER TABLE device ADD COLUMN {_col}")
             conn.commit()
