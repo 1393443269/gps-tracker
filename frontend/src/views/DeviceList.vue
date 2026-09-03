@@ -63,9 +63,12 @@
           <el-tag :type="lcTagType(row.lifecycle)" size="small">{{ lcLabel(row.lifecycle) }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="在线状态" width="80">
+      <el-table-column label="在线状态" width="90">
         <template #default="{ row }">
-          <el-tag :type="statusType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
+          <el-tooltip v-if="offlineReasonText(row)" :content="'离线原因:' + offlineReasonText(row)" placement="top">
+            <el-tag :type="presenceType(row)" size="small">{{ presenceLabel(row) }}</el-tag>
+          </el-tooltip>
+          <el-tag v-else :type="presenceType(row)" size="small">{{ presenceLabel(row) }}</el-tag>
         </template>
       </el-table-column>
       <el-table-column label="电量" width="80">
@@ -264,6 +267,26 @@ const lcTagType = (v) => LC_OPTIONS.find(o => o.value === v)?.tagType ?? ''
 // ── 状态辅助 ─────────────────────────────────────────────────────────────────
 const statusLabel    = (s) => ({ 0:'离线', 1:'在线', 2:'报警' }[s] ?? '—')
 const statusType     = (s) => ({ 0:'info',  1:'success', 2:'danger' }[s] ?? '')
+// 四态呈现:优先看 presence_state(sleeping 休眠),报警(status=2)仍最高优先。
+const presenceLabel  = (row) => {
+  if (row.status === 2) return '报警'
+  if (row.presence_state === 'sleeping') return '休眠'
+  if (row.presence_state === 'disabled') return '停用'
+  return statusLabel(row.status)
+}
+const presenceType   = (row) => {
+  if (row.status === 2) return 'danger'
+  if (row.presence_state === 'sleeping') return 'warning'   // 休眠=黄,区别于在线绿/离线灰
+  if (row.presence_state === 'disabled') return 'info'
+  return statusType(row.status)
+}
+// 离线原因中文
+const OFFLINE_REASON = {
+  power_off:'主动关机', battery_drain:'电量耗尽', charge_off:'充电关机',
+  net_lost:'疑似断网', migrated:'已迁移(下发过改IP)', unknown:'未知',
+}
+const offlineReasonText = (row) =>
+  (row.status === 0 && row.offline_reason) ? (OFFLINE_REASON[row.offline_reason] || row.offline_reason) : ''
 const fenceTypeLabel = (t) => ({ circle:'圆形', polygon:'多边形', administrative:'行政区' }[t] || t)
 
 // ── 列表状态 ─────────────────────────────────────────────────────────────────
