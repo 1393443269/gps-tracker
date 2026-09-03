@@ -112,6 +112,9 @@ import { deviceApi, portalApi, fenceApi, customerApi, isAdmin } from '@/api'
 import { ElNotification, ElMessage } from 'element-plus'
 import { Search, ArrowRight, Close } from '@element-plus/icons-vue'
 import { TDT_MAP_STYLE, circleToPolygon } from '@/utils/mapStyle'
+import { useRouter } from 'vue-router'
+
+const router = useRouter()
 
 // ── 常量：GeoJSON source / layer 标识 ──────────────────────────────────────────
 const SRC_ID   = 'devices'
@@ -580,17 +583,83 @@ function _esc(s) {
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;')
 }
 
+// 定位方式代码 → 文字(设备上报的定位类型:1基站/2wifi/3综合/5蓝牙,其余按GPS)
+function _locTypeText(t) {
+  return ({ 1: '基站', 2: 'WIFI', 3: '综合', 5: '蓝牙' })[t] || 'GPS'
+}
+// 信号百分比(有则显示,缺则 —)
+function _signalText(v) { return (v == null || v === '') ? '—' : (v + '%') }
+
+// 设备信息卡片(对标设计稿):头像+姓名 / IMEI·信号·电量 / 型号 / 联系方式 /
+// 定位地址 / 最后定位·方式 / 最后通信 / 底部功能按钮排。
+// 缺字段(信号/地址等实时推送不带)先占位显示 —,由点击后的详情查询异步回填。
 function popupHtml(info) {
-  const roleLine = info.roleName
-    ? `角色: <span style="color:${_esc(info.roleColor || '#409eff')}">${_esc(info.roleName)}</span><br>`
-    : ''
-  return `<b>${_esc(info.terminal_id || info.phone)}</b><br>
-    ${roleLine}纬度: ${Number(info.lat).toFixed(6)}<br>
-    经度: ${Number(info.lng).toFixed(6)}<br>
-    速度: ${_esc(info.speed)} km/h<br>
-    电量: ${info.last_battery != null ? info.last_battery + '%' : '—'}<br>
-    时间: ${_esc(info.time)}<br>
-    ${info.alarm ? '<span style="color:red;">⚠ 报警中</span>' : '正常'}`
+  const name    = _esc(info.name || info.contact_name || info.terminal_id || info.phone || '')
+  const imei    = _esc(info.imei || info.phone || '')
+  const model   = _esc(info.terminal_model || '—')
+  const contact = _esc(info.contact || info.contact_phone || '—')
+  const addr    = _esc(info.address || '—')                 // 逆地理编码地址(第二步补)
+  const bat     = info.last_battery != null ? info.last_battery + '%' : '—'
+  const sig     = _signalText(info.signal)                  // 信号(第二步补)
+  const locTime = _esc(info.last_location_time || info.time || '—')
+  const comTime = _esc(info.last_seen || info.time || '—')
+  const locType = _locTypeText(info.loc_type)
+  const ph      = _esc(info.phone || '')
+  const alarmTag = info.alarm ? '<span style="color:#f56c6c;font-weight:600;">⚠ 报警中</span>' : ''
+  // 底部按钮:图标 emoji + 文字,点击调 window.__rtNav 跳转
+  const btn = (icon, text, key) =>
+    `<div class="rt-card-btn" onclick="window.__rtNav && window.__rtNav('${key}','${ph}')">
+       <div class="rt-card-btn-i">${icon}</div><div>${text}</div></div>`
+  return `<div class="rt-card">
+    <div class="rt-card-hd">
+      <div class="rt-card-avatar">👤</div>
+      <div class="rt-card-name">${name}</div>
+      ${alarmTag}
+    </div>
+    <div class="rt-card-row"><b>设备IMEI:</b>${imei}　<span class="rt-sig">📶 ${sig}</span>　<span class="rt-bat">🔋 ${bat}</span></div>
+    <div class="rt-card-row"><b>设备型号:</b>${model}</div>
+    <div class="rt-card-row"><b>联系方式:</b>${contact}</div>
+    <div class="rt-card-row"><b>定位地址:</b>${addr}</div>
+    <div class="rt-card-row"><b>最后定位:</b>${locTime}　<span class="rt-loct">${locType}</span></div>
+    <div class="rt-card-row"><b>最后通信:</b>${comTime}</div>
+    <div class="rt-card-btns">
+      ${btn('📍','轨迹','track')}${btn('❤️','健康','health')}${btn('🔔','报警','alarms')}
+      ${btn('⬡','围栏','fence')}${btn('⚙️','指令','query')}${btn('📋','详情','device-info')}
+    </div>
+  </div>`
+}
+
+// 打开设备信息卡片:先用已有(推送)数据即时渲染,再按 phone 异步查设备档案回填
+// 型号/联系方式/最后通信/最后定位等实时推送不带的字段。
+async function openDeviceCard(phone, ll) {
+  const rec = featureStore[String(phone)]
+  const base = rec ? rec.properties : { phone }
+  if (!popup) popup = new maplibregl.Popup({ closeButton: true, maxWidth: '340px' })
+  popup.setLngLat(ll).setHTML(popupHtml(base)).addTo(map)
+  // 异步回填设备档案(JOIN 客户,带型号/联系方式/电量/最后通信)
+  try {
+    const res = await deviceApi.withCustomer({ imei: phone, size: 1 })
+    const d = (res.data?.records || [])[0]
+    if (d && popup && popup.isOpen()) {
+      const merged = {
+        ...base,
+        imei: d.imei || d.phone, terminal_model: d.terminal_model,
+        name: d.name || d.customer_name || base.name,
+        contact: d.contact || d.customer_contact || d.phone_no,
+        last_battery: d.last_battery ?? base.last_battery,
+        last_location_time: d.last_location_time, last_seen: d.last_seen,
+      }
+      popup.setHTML(popupHtml(merged))
+    }
+  } catch { /* 查询失败保持基础卡片,不影响展示 */ }
+}
+
+// 卡片底部按钮跳转(挂到 window 供内联 onclick 调用),按 phone 带参跳到对应功能页
+function _rtNav(key, phone) {
+  const map1 = { track:'/track', health:'/health', alarms:'/alarms',
+                 fence:'/fence', query:'/query', 'device-info':'/device-info' }
+  const path = map1[key]
+  if (path) router.push({ path, query: { phone } })
 }
 
 // ── 设备点数据记录（featureStore 存 properties+坐标，供面板列表 onlineDevices 用） ──
@@ -685,10 +754,7 @@ function updateFeature(info, { refresh = true } = {}) {
       }
     } else {
       const el = makeMarkerEl(rec.properties)
-      el.addEventListener('click', () => {
-        if (!popup) popup = new maplibregl.Popup({ closeButton: true, maxWidth: '240px' })
-        popup.setLngLat(ll).setHTML(popupHtml(rec.properties)).addTo(map)
-      })
+      el.addEventListener('click', () => openDeviceCard(phone, ll))
       markerStore[phone] = new maplibregl.Marker({ element: el }).setLngLat(ll).addTo(map)
     }
   }
@@ -770,7 +836,7 @@ async function loadOnlineDevices() {
 // 设备点改用 DOM Marker（见 updateFeature），无需 GeoJSON source/circle 图层。
 // 此处仅预建可复用 popup。
 function initDeviceLayer() {
-  popup = new maplibregl.Popup({ closeButton: true, maxWidth: '240px' })
+  popup = new maplibregl.Popup({ closeButton: true, maxWidth: '340px' })
 }
 
 // ── Socket.IO ─────────────────────────────────────────────────────────────────
@@ -818,6 +884,8 @@ function connectSocket() {
 
 // ── 生命周期 ──────────────────────────────────────────────────────────────────
 onMounted(async () => {
+  // 卡片底部按钮的内联 onclick 通过 window.__rtNav 调用组件内跳转
+  window.__rtNav = _rtNav
   try {
     map = new maplibregl.Map({
       container: 'map-container',
@@ -843,6 +911,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  if (window.__rtNav) delete window.__rtNav
   if (onlineTimer) clearInterval(onlineTimer)
   // 先解绑所有 socket 监听再断开，避免监听器/闭包残留导致内存泄漏
   if (socket) {
@@ -940,4 +1009,30 @@ onUnmounted(() => {
   font-size: 11px; color: #303133; white-space: nowrap;
   box-shadow: 0 1px 3px rgba(0,0,0,.25); pointer-events: none;
 }
+
+/* ── 设备信息卡片(popup 内容,scoped 需用 :deep) ── */
+:deep(.rt-card) { font-size: 12px; color: #303133; line-height: 1.7; min-width: 250px; }
+:deep(.rt-card-hd) {
+  display: flex; align-items: center; gap: 8px;
+  padding-bottom: 6px; margin-bottom: 6px; border-bottom: 1px solid #eee;
+}
+:deep(.rt-card-avatar) {
+  width: 34px; height: 34px; border-radius: 4px; background: #f0f2f5;
+  display: flex; align-items: center; justify-content: center; font-size: 20px;
+}
+:deep(.rt-card-name) { font-size: 14px; font-weight: 600; color: #303133; }
+:deep(.rt-card-row) { color: #606266; word-break: break-all; }
+:deep(.rt-card-row b) { color: #303133; font-weight: 600; }
+:deep(.rt-sig), :deep(.rt-bat) { color: #67c23a; font-weight: 600; }
+:deep(.rt-loct) { color: #409eff; }
+:deep(.rt-card-btns) {
+  display: flex; justify-content: space-between; gap: 2px;
+  margin-top: 8px; padding-top: 8px; border-top: 1px solid #eee;
+}
+:deep(.rt-card-btn) {
+  flex: 1; text-align: center; cursor: pointer; color: #606266;
+  font-size: 11px; padding: 2px 0; border-radius: 4px; transition: background .15s;
+}
+:deep(.rt-card-btn:hover) { background: #ecf5ff; color: #409eff; }
+:deep(.rt-card-btn-i) { font-size: 16px; line-height: 1.4; }
 </style>

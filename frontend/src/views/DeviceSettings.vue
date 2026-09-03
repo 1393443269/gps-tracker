@@ -63,7 +63,6 @@
       @selection-change="onSelectionChange">
       <el-table-column type="selection" width="45" />
       <el-table-column type="index" label="#" width="50" />
-      <el-table-column prop="name"           label="设备名称"   width="120" />
       <el-table-column label="设备号" width="160">
         <template #default="{ row }"><span>{{ row.terminal_id || row.phone }}</span></template>
       </el-table-column>
