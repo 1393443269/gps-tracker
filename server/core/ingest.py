@@ -494,6 +494,76 @@ def start_location_cleaner():
     log.info("[位置清理] 位置数据清理线程已启动(保留 %d 天)", LOCATION_RETENTION_DAYS)
 
 
+# ── 离线判定：超时兜底(关机报警之外的失联/关机/没电/迁走场景)──────────────────
+# 背景：原「关机报警驱动」只在收到关机报警(0x21)时判离线，设备被改IP迁走/手动关机/
+# 没电耗尽/死机失联时不会发关机报警，导致永久显示在线(僵尸在线)。此线程按设备类型的
+# 「最大允许静默时长」兜底：超过阈值仍无任何上报(last_location_time 落后)即置 status=0。
+# 分类型阈值——G618G 等短连接+休眠设备静止 20~40 分钟不报属正常，阈值放宽；LT115 等
+# 持续上报设备阈值收紧。收到新上报时 ingest 写入侧会把 status 置回 1，无需本线程恢复。
+# 报警态(status=2)不动，避免把未处理报警的设备误改成离线。
+# OFFLINE_TIMEOUT_MIN：持续型设备静默判离线阈值(分钟)；G618 类用 OFFLINE_TIMEOUT_SLEEP_MIN。
+OFFLINE_TIMEOUT_MIN       = int(os.environ.get('OFFLINE_TIMEOUT_MIN', '15'))
+OFFLINE_TIMEOUT_SLEEP_MIN = int(os.environ.get('OFFLINE_TIMEOUT_SLEEP_MIN', '60'))
+_OFFLINE_SCAN_INTERVAL    = int(os.environ.get('OFFLINE_SCAN_INTERVAL', '120'))  # 扫描周期(秒)
+
+def _offline_scan_once():
+    """把超过静默阈值仍无上报的在线设备置离线。返回置离线的设备数。
+    last_location_time 为 'YYYY-MM-DD HH:MM:SS' 字符串，直接字符串边界比较。"""
+    now = datetime.now()
+    cut_normal = (now - timedelta(minutes=OFFLINE_TIMEOUT_MIN)).strftime('%Y-%m-%d %H:%M:%S')
+    cut_sleep  = (now - timedelta(minutes=OFFLINE_TIMEOUT_SLEEP_MIN)).strftime('%Y-%m-%d %H:%M:%S')
+    stamp = now.strftime('%Y-%m-%d %H:%M:%S')
+    # G618 类（短连接+休眠）用宽松阈值；其余设备用收紧阈值。仅动 status=1 的在线设备。
+    # last_location_time 为空的设备（从未上报）不动，避免刚建档未通信就被判离线。
+    _cond = ("status=1 AND last_location_time IS NOT NULL AND last_location_time <> '' "
+             "AND ( (UPPER(COALESCE(terminal_model,'')) LIKE '%G618%' AND last_location_time < ?) "
+             "   OR (UPPER(COALESCE(terminal_model,'')) NOT LIKE '%G618%' AND last_location_time < ?) )")
+    total = 0
+    try:
+        # db_exec 不返回行数，故先 COUNT 拿到将置离线的数量(仅用于日志)，再 UPDATE。
+        row = db_query_one(f"SELECT COUNT(*) AS n FROM device WHERE {_cond}", (cut_sleep, cut_normal))
+        total = (row.get('n') if row else 0) or 0
+        if total:
+            db_exec(f"UPDATE device SET status=0, offline_time=?, updated_at=? WHERE {_cond}",
+                    (stamp, stamp, cut_sleep, cut_normal))
+    except Exception as e:
+        log.error("[离线扫描] 置离线失败: %s", e)
+        return 0
+    if total:
+        log.info("[离线扫描] 已将 %d 台超时未上报的设备置离线(持续型阈值%d分/休眠型阈值%d分)",
+                 total, OFFLINE_TIMEOUT_MIN, OFFLINE_TIMEOUT_SLEEP_MIN)
+    return total
+
+
+_offline_scanner_started = False
+_offline_scanner_lock    = threading.Lock()
+
+def _offline_scanner_loop():
+    """后台线程：每 _OFFLINE_SCAN_INTERVAL 秒扫描一次，把超时设备置离线。响应 _stop_event。"""
+    while not _stop_event.is_set():
+        try:
+            _offline_scan_once()
+        except Exception as e:
+            log.warning("[离线扫描] 扫描线程异常: %s", e)
+        if _stop_event.wait(_OFFLINE_SCAN_INTERVAL):
+            break
+
+def start_offline_scanner():
+    """启动离线扫描后台线程(幂等)。阈值任一<=0 视为禁用。"""
+    global _offline_scanner_started
+    with _offline_scanner_lock:
+        if _offline_scanner_started:
+            return
+        _offline_scanner_started = True
+    if OFFLINE_TIMEOUT_MIN <= 0 or OFFLINE_TIMEOUT_SLEEP_MIN <= 0:
+        log.info("[离线扫描] 阈值<=0,不启用超时离线判定")
+        return
+    threading.Thread(target=_offline_scanner_loop, daemon=True,
+                     name='offline-scanner').start()
+    log.info("[离线扫描] 离线扫描线程已启动(持续型%d分/休眠型%d分,每%d秒扫一次)",
+             OFFLINE_TIMEOUT_MIN, OFFLINE_TIMEOUT_SLEEP_MIN, _OFFLINE_SCAN_INTERVAL)
+
+
 # ── 设备标识解析 ───────────────────────────────────────────────────────────────
 
 def resolve_phone(bcd_phone: str) -> str:
@@ -885,6 +955,9 @@ def handle_auth(sock, phone, serial, body):
             with sessions_lock:
                 sessions[canonical] = sock
         log.info("[808] 鉴权成功: phone=%s", canonical)
+        # 补发待发指令：天禧短连接在线窗口极短，趁鉴权成功、连接确定活跃时把队列里的指令送出去
+        if canonical:
+            _flush_pending_808(sock, canonical)
     else:
         log.warning("[808] 鉴权失败断开连接 phone=%s auth=%s", canonical, auth_code)
         # 鉴权失败：从 sessions 中删除，防止未鉴权设备被下发指令
@@ -932,6 +1005,22 @@ def handle_location(sock, phone, serial, body):
     direction = int(direction) % 360   # 方向截断到 0-359
 
     device_id = _get_device_id(canonical)   # 缓存查询，免每次上报查库
+
+    # 电量落库：808 位置报文的 0xFB 附加字段(level 电量%/voltage 电压/charge_state 充电状态)
+    # 已由 parse_location_body 解析进 loc['battery_data']。之前只有 G618 心跳分支存电量、808 路径
+    # 漏存，导致天禧LT115等808设备电量查不到。此处补上：有 level 才更新，避免无电量帧覆盖。
+    _bat = loc.get('battery_data')
+    if _bat:
+        log.info("[电量调试] phone=%s battery_data原始=%s (level=%s voltage=%s charge=%s)",
+                 canonical, _bat, _bat.get('level'), _bat.get('voltage'), _bat.get('charge_state'))
+    if _bat and _bat.get('level') is not None:
+        try:
+            _bnow = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            db_exec("UPDATE device SET last_battery=?, last_battery_time=?, updated_at=? WHERE phone=?",
+                    (_bat['level'], _bnow, _bnow, canonical))
+            insert_sensor_data(canonical, 'battery', value=_bat['level'], unit='%')
+        except Exception as e:
+            log.warning("[808] 电量落库失败 phone=%s err=%s", canonical, e)
 
     # 从位置报文附加字段拿到设备真实 IMEI(0xF6)/ICCID(0xF1)：设备注册头里的 phone 可能只是
     # 终端ID(非IMEI)，真实身份走位置附加字段上报。只在值有效且与库中不同时更新(避免每帧写库)，
@@ -1073,6 +1162,34 @@ def _flush_pending_commands(conn, imei):
             break   # 发送通道异常，剩余留到下次上线
     if sent:
         log.info("[G618G] 补发待发指令 imei=%s 成功 %d 条", imei, sent)
+
+
+def _flush_pending_808(conn, phone):
+    """天禧(808)设备鉴权成功后补发待发队列里的指令。
+    payload_hex 是入队时构造好的完整 0x8300 下行帧，此处直接发一次(长连接窗口，不需连发两次)。
+    天禧是短连接、在线窗口极短，直发常发给已断连接而丢失，故指令一律入队、由本函数在
+    鉴权成功这一刻(连接确定活跃)送达。单条失败即停，剩余留到下次上线。"""
+    try:
+        rows = db_query(
+            "SELECT id, payload_hex FROM pending_command WHERE phone=? AND status='pending' ORDER BY id",
+            (phone,))
+    except Exception as e:
+        log.warning("[808] 待发队列查询失败 phone=%s err=%s", phone, e)
+        return
+    if not rows:
+        return
+    sent = 0
+    for row in rows:
+        try:
+            conn.sendall(bytes.fromhex(row['payload_hex']))
+            db_exec("UPDATE pending_command SET status='sent', sent_at=? WHERE id=?",
+                    (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), row['id']))
+            sent += 1
+        except Exception as e:
+            log.warning("[808] 待发指令补发失败 phone=%s id=%s err=%s", phone, row['id'], e)
+            break
+    if sent:
+        log.info("[808] 补发待发指令 phone=%s 成功 %d 条", phone, sent)
 
 
 def handle_g618g_frame(conn, frame, phone_holder):

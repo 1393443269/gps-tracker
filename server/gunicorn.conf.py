@@ -34,13 +34,14 @@ def post_fork(server, worker):
     import threading
     from app import (init_db, start_batch_writer, start_tcp_server, start_mqtt_subscriber,
                      _setup_pg_partitions, start_partition_maintainer)
-    from core.ingest import start_location_cleaner
+    from core.ingest import start_location_cleaner, start_offline_scanner
 
     init_db()
     _setup_pg_partitions()       # PG：location_record 按月分区初始化（SQLite 跳过）
     start_partition_maintainer() # PG：每日预建分区的维护线程
     start_batch_writer()
     start_location_cleaner()     # 位置数据保留期清理线程（LOCATION_RETENTION_DAYS，默认 90 天）
+    start_offline_scanner()      # 超时未上报设备置离线线程(关机报警之外的失联/关机/迁走兜底)
 
     threading.Thread(target=start_tcp_server,      daemon=True, name='tcp-808').start()
     threading.Thread(target=start_mqtt_subscriber, daemon=True, name='mqtt-sub').start()

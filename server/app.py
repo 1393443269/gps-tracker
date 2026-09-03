@@ -985,8 +985,9 @@ def create_device():
 
 @app.post('/api/devices/import')
 def import_devices():
-    """批量导入设备。请求体:{"rows":[{phone,name,plateNo,terminalModel,remark}, ...]}
-    规则:IMEI/设备号(phone)必填;库内已存在或本批内重复的跳过;其余建档。
+    """批量导入设备。请求体:{"rows":[{deviceNo,imei,name,plateNo,terminalModel,remark}, ...]}
+    规则:设备号(deviceNo)与 IMEI 至少填一个;主键 phone 优先取设备号、没有则用 IMEI;
+         库内已存在或本批内重复的跳过;其余建档。兼容旧模板单列 phone(当设备号)。
     返回:{created, skipped, failed, details:[{row,phone,status,reason}]}
     """
     data = request.get_json() or {}
@@ -1007,10 +1008,18 @@ def import_devices():
             failed += 1
             details.append({'row': rownum, 'phone': '', 'status': 'failed', 'reason': '行格式错误'})
             continue
-        phone = (str(r.get('phone') or '')).strip()
+        # 设备号(terminal_id)与 IMEI 二选一即可:主键 phone 优先取设备号,没有则用 IMEI
+        dev_no = (str(r.get('deviceNo') or r.get('terminalId') or '')).strip()
+        imei   = (str(r.get('imei') or '')).strip()
+        # 兼容旧模板单列「IMEI/设备号」→ phone 字段:若没分开填,则拿它当设备号
+        if not dev_no and not imei:
+            _legacy = (str(r.get('phone') or '')).strip()
+            if _legacy:
+                dev_no = _legacy
+        phone = dev_no or imei   # 唯一标识
         if not phone:
             failed += 1
-            details.append({'row': rownum, 'phone': '', 'status': 'failed', 'reason': 'IMEI/设备号为空'})
+            details.append({'row': rownum, 'phone': '', 'status': 'failed', 'reason': '设备号和 IMEI 至少填一个'})
             continue
         if phone in seen_in_batch:
             skipped += 1
@@ -1019,16 +1028,16 @@ def import_devices():
         seen_in_batch.add(phone)
         if db_query_one("SELECT id FROM device WHERE phone=?", (phone,)):
             skipped += 1
-            details.append({'row': rownum, 'phone': phone, 'status': 'skipped', 'reason': '设备号已存在'})
+            details.append({'row': rownum, 'phone': phone, 'status': 'skipped', 'reason': '设备号/IMEI 已存在'})
             continue
         try:
             db_exec(
                 "INSERT INTO device (phone,name,plate_no,manufacturer,terminal_model,"
-                "terminal_id,plate_color,auth_code,status,org_id,lifecycle,remark,created_at,updated_at)"
-                " VALUES (?,?,?,?,?,?,1,'DEFAULT',0,1,0,?,?,?)",
+                "terminal_id,imei,plate_color,auth_code,status,org_id,lifecycle,remark,created_at,updated_at)"
+                " VALUES (?,?,?,?,?,?,?,1,'DEFAULT',0,1,0,?,?,?)",
                 (phone, str(r.get('name', '') or ''), str(r.get('plateNo', '') or ''),
                  str(r.get('manufacturer', '') or ''), str(r.get('terminalModel', '') or ''),
-                 str(r.get('terminalId', '') or ''), str(r.get('remark', '') or ''), now, now)
+                 dev_no, imei, str(r.get('remark', '') or ''), now, now)
             )
             created += 1
             details.append({'row': rownum, 'phone': phone, 'status': 'created', 'reason': ''})
@@ -2206,10 +2215,14 @@ def g618g_command():
 # 天禧协议规定：参数设置/查询/控制统一走「0x8300 类型0x01 下发命令字符串」，
 # 不使用标准 808 的 0x8103/0x8105/0x8202。命令字符串按协议用 GBK 编码。
 
+def build_zhiling_frame(phone, cmd_str):
+    """构造天禧 0x8300(类型0x01, GBK) 完整下行帧字节，供直发或离线入队复用。"""
+    body = bytes([0x01]) + cmd_str.encode('gbk', errors='replace')
+    return p.encode_message(0x8300, phone, next_serial(), body)
+
 def send_zhiling_cmd(conn, phone, cmd_str):
     """把智令命令字符串 *XXX# 经 0x8300(类型0x01, GBK) 下发给天禧设备。"""
-    body = bytes([0x01]) + cmd_str.encode('gbk', errors='replace')
-    conn.sendall(p.encode_message(0x8300, phone, next_serial(), body))
+    conn.sendall(build_zhiling_frame(phone, cmd_str))
     return cmd_str
 
 @app.post('/api/commands/zhiling')
@@ -2230,10 +2243,6 @@ def zhiling_command():
     spec = zl.AVAILABLE_COMMANDS.get(cmd)
     if not spec:
         return fail(f'不支持的天禧指令: {cmd}，支持: {", ".join(zl.AVAILABLE_COMMANDS.keys())}')
-    with sessions_lock:
-        conn = sessions.get(phone)
-    if not conn:
-        return fail(f'设备不在线: {phone}', 404)
     # 按命令声明的 params 顺序从 body 取值，缺参即报错（避免拼出错误命令串）
     try:
         args = []
@@ -2250,17 +2259,39 @@ def zhiling_command():
             cmd_str = spec['func'](*args)
     except Exception as e:
         return fail(f'构造指令失败: {e}')
+    # 预构造下行帧（在线直发 / 离线入队都用它，故提前构造）
     try:
-        send_zhiling_cmd(conn, phone, cmd_str)
+        frame = build_zhiling_frame(phone, cmd_str)
+    except Exception as e:
+        return fail(f'构造指令帧失败: {e}')
+    with sessions_lock:
+        conn = sessions.get(phone)
+    # 设备离线：入待发队列，下次上线自动补发。
+    # 天禧 LT115 是「短连接」——报完即断、在线窗口极短，直发极易发给已断开的连接而丢失，
+    # 故一律入队、由注册/鉴权成功时的补发逻辑在连接活跃窗口内送达（QS 验证：直发收不到回复）。
+    if not conn:
+        db_exec("INSERT INTO pending_command (phone,cmd,payload_hex,status) VALUES (?,?,?,?)",
+                (phone, cmd, frame.hex(), 'pending'))
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, resolve_phone(phone), f'{cmd} {cmd_str}', 'queued', '设备离线，已入待发队列，上线后自动下发'))
+        add_op_log('天禧指令入队', f'phone={phone} cmd={cmd} str={cmd_str}（设备离线，待上线补发）')
+        return ok({'cmd': cmd, 'phone': phone, 'cmd_str': cmd_str, 'queued': True,
+                   'message': '设备当前离线，指令已排队，设备下次上线时自动下发'})
+    try:
+        conn.sendall(frame)
         db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
                 (phone, resolve_phone(phone), f'{cmd} {cmd_str}', 'success', ''))
         add_op_log('天禧指令下发', f'phone={phone} cmd={cmd} str={cmd_str}')
-        return ok({'cmd': cmd, 'phone': phone, 'cmd_str': cmd_str})
+        return ok({'cmd': cmd, 'phone': phone, 'cmd_str': cmd_str, 'queued': False})
     except Exception as e:
+        # 直发失败（连接刚断）：转入待发队列，避免丢失
+        db_exec("INSERT INTO pending_command (phone,cmd,payload_hex,status) VALUES (?,?,?,?)",
+                (phone, cmd, frame.hex(), 'pending'))
         db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
-                (phone, resolve_phone(phone), f'{cmd} {cmd_str}', 'fail', str(e)))
-        log.warning("[指令下发] 失败 phone=%s err=%s", phone, e)
-        return fail('指令下发失败，请稍后重试')
+                (phone, resolve_phone(phone), f'{cmd} {cmd_str}', 'queued', f'实时下发失败已转待发队列: {e}'))
+        log.warning("[指令下发] 天禧实时失败转入队 phone=%s err=%s", phone, e)
+        return ok({'cmd': cmd, 'phone': phone, 'cmd_str': cmd_str, 'queued': True,
+                   'message': '实时下发失败，已转入待发队列，设备下次上线时自动下发'})
 
 
 # ── 蓝牙信标位置对照表管理（major/minor → 坐标）────────────────────────────────
@@ -2824,11 +2855,23 @@ def _sync_fence_devices(fence_id, devices_str, conn=None):
 
 @app.get('/api/fences')
 def list_fences():
-    name   = request.args.get('name', '').strip()
-    ftype  = request.args.get('fence_type', '').strip()
-    sids   = _org_scope_ids(request)
-    conds  = ["customer_id IS NULL"]   # 管理员接口只看全局围栏（非客户私建的）
-    args   = []
+    name    = request.args.get('name', '').strip()
+    ftype   = request.args.get('fence_type', '').strip()
+    cust_id = request.args.get('customer_id', '').strip()
+    sids    = _org_scope_ids(request)
+    args    = []
+    # 默认只看全局围栏(customer_id IS NULL)。管理员传 customer_id 时改为查看该账号
+    # 及其所有下级子账号私建的围栏(账号围栏查看)。
+    if cust_id:
+        try:
+            cids = _customer_and_descendants(int(cust_id))
+            ph   = ','.join('?' * len(cids))
+            conds = [f"customer_id IN ({ph})"]
+            args += cids
+        except ValueError:
+            conds = ["customer_id IS NULL"]
+    else:
+        conds = ["customer_id IS NULL"]   # 管理员接口默认只看全局围栏（非客户私建的）
     if name:
         conds.append("name LIKE ?"); args.append(f'%{name}%')
     if ftype:
@@ -3418,8 +3461,27 @@ def _require_admin_for_api():
         return None
     # 其余所有管理员接口：校验 X-Admin-Token
     token = request.headers.get('X-Admin-Token', '')
-    if not token or not _verify_admin_token(token):
+    admin_id = _verify_admin_token(token)
+    if not token or not admin_id:
         return fail('未授权，请先登录', 401)
+    # 账号级功能权限：非超管账号，访问受菜单保护的接口前缀时，需拥有对应菜单权限。
+    # 未配置权限的账号视为拥有全部(向后兼容),不拦截。放行 GET 读接口只拦写操作,
+    # 避免误伤跨页面公共读取——仅对明确归属某菜单的写接口(POST/PUT/DELETE)做拦截。
+    if request.method in ('POST', 'PUT', 'DELETE', 'PATCH'):
+        try:
+            me = db_query_one("SELECT username, user_type FROM admin_user WHERE id=?", (admin_id,))
+            if me and not _admin_is_super(me):
+                allowed = _get_account_menu_keys(admin_id)
+                if allowed is not None:            # None=未配置=全部放行
+                    allowed_set = set(allowed)
+                    for _menu, _prefixes in _MENU_API_PREFIX.items():
+                        if _menu in allowed_set:
+                            continue               # 有该菜单权限,不拦
+                        for _pfx in _prefixes:
+                            if path == _pfx or path.startswith(_pfx + '/'):
+                                return fail('无该功能的操作权限', 403)
+        except Exception as _e:
+            log.warning("[账号权限] 接口校验异常(放行): %s", _e)
     return None
 
 
@@ -3450,6 +3512,13 @@ def admin_login():
     db_exec("UPDATE admin_user SET last_login=? WHERE id=?", (now, row['id']))
     token = _make_admin_token(row['id'])
     add_op_log('管理员登录', f'{row["username"]} 登录')
+    # 下发该账号的可见菜单权限：超管或未配置=全部菜单；否则=已配置的菜单 keys
+    _is_super = _admin_is_super(row)
+    if _is_super:
+        _menus = _ALL_MENU_KEYS
+    else:
+        _mk = _get_account_menu_keys(row['id'])
+        _menus = _ALL_MENU_KEYS if _mk is None else _mk
     return ok({
         'token':    token,
         'userId':   row['id'],
@@ -3458,6 +3527,8 @@ def admin_login():
         'orgId':    row.get('org_id') or 1,
         'orgLevel': row.get('org_level') or 1,
         'userType': row.get('user_type') or 9,
+        'isSuper':  _is_super,
+        'menuKeys': _menus,
     })
 
 @app.post('/api/auth/logout')
@@ -3536,8 +3607,11 @@ def portal_devices():
     all_cids = _get_all_descendant_cids(cid)
     cid_ph   = ','.join('?' * len(all_cids))
     records  = db_query(
-        f"SELECT phone, name, last_lat, last_lng, last_speed, last_location_time, status "
-        f"FROM device WHERE customer_id IN ({cid_ph})",
+        f"SELECT d.phone, d.name, d.last_lat, d.last_lng, d.last_speed, "
+        f"d.last_location_time, d.status, d.last_battery, d.last_battery_time, "
+        f"d.terminal_id, d.imei, d.terminal_model, c.name AS customer_name "
+        f"FROM device d LEFT JOIN customer c ON d.customer_id = c.id "
+        f"WHERE d.customer_id IN ({cid_ph})",
         all_cids
     )
     return ok(records)
@@ -3708,6 +3782,128 @@ def portal_health():
         " ORDER BY h.record_time DESC LIMIT ? OFFSET ?",
         params + [size, offset])
     return ok({'records': records, 'total': total, 'page': page})
+
+
+def _portal_device_owned(cid, phone):
+    """校验 phone 设备是否属于当前客户(含下级子账号)。返回 device 行或 None。"""
+    all_cids = _get_all_descendant_cids(cid)
+    cid_ph   = ','.join('?' * len(all_cids))
+    return db_query_one(
+        f"SELECT id, name FROM device WHERE phone=? AND customer_id IN ({cid_ph})",
+        [phone] + all_cids)
+
+
+@app.post('/api/customer/commands/zhiling')
+def portal_zhiling_command():
+    """客户向自己名下的天禧设备下发智令指令。逻辑同管理端 zhiling_command,
+    但设备归属校验改为「属于当前客户子树」。短连接设备离线时入待发队列,上线补发。"""
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    data  = request.get_json() or {}
+    phone = (data.get('phone') or '').strip()
+    cmd   = (data.get('cmd')   or '').strip()
+    if not phone or not cmd:
+        return fail('phone 和 cmd 不能为空')
+    dev = _portal_device_owned(cid, phone)
+    if not dev:
+        return fail('设备不存在或无权限', 403)
+    spec = zl.AVAILABLE_COMMANDS.get(cmd)
+    if not spec:
+        return fail(f'不支持的天禧指令: {cmd}')
+    try:
+        args = []
+        for pname in spec['params']:
+            if pname not in data:
+                return fail(f'缺少参数: {pname}（命令 {cmd} 需要 {spec["params"]}）')
+            args.append(data[pname])
+        if cmd == 'set_sos_numbers' and len(args) == 1:
+            nums = args[0] if isinstance(args[0], (list, tuple)) else [args[0]]
+            cmd_str = spec['func'](*nums)
+        else:
+            cmd_str = spec['func'](*args)
+    except Exception as e:
+        return fail(f'构造指令失败: {e}')
+    try:
+        frame = build_zhiling_frame(phone, cmd_str)
+    except Exception as e:
+        return fail(f'构造指令帧失败: {e}')
+    with sessions_lock:
+        conn = sessions.get(phone)
+    if not conn:
+        db_exec("INSERT INTO pending_command (phone,cmd,payload_hex,status) VALUES (?,?,?,?)",
+                (phone, cmd, frame.hex(), 'pending'))
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, dev['name'] or phone, f'{cmd} {cmd_str}', 'queued', '设备离线，已入待发队列，上线后自动下发'))
+        return ok({'cmd': cmd, 'phone': phone, 'cmd_str': cmd_str, 'queued': True,
+                   'message': '设备当前离线，指令已排队，设备下次上线时自动下发'})
+    try:
+        conn.sendall(frame)
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, dev['name'] or phone, f'{cmd} {cmd_str}', 'success', ''))
+        return ok({'cmd': cmd, 'phone': phone, 'cmd_str': cmd_str, 'queued': False})
+    except Exception as e:
+        db_exec("INSERT INTO pending_command (phone,cmd,payload_hex,status) VALUES (?,?,?,?)",
+                (phone, cmd, frame.hex(), 'pending'))
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, dev['name'] or phone, f'{cmd} {cmd_str}', 'queued', f'实时下发失败已转待发队列: {e}'))
+        return ok({'cmd': cmd, 'phone': phone, 'cmd_str': cmd_str, 'queued': True,
+                   'message': '实时下发失败，已转入待发队列，设备下次上线时自动下发'})
+
+
+@app.post('/api/customer/commands/g618g')
+def portal_g618g_command():
+    """客户向自己名下的 G618G 设备下发指令。逻辑同管理端 g618g_command,
+    设备归属校验改为属于当前客户子树。G618G 短连接,离线入队、上线补发。"""
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    data  = request.get_json() or {}
+    phone = (data.get('phone') or '').strip()
+    cmd   = (data.get('cmd')   or '').strip()
+    if not phone or not cmd:
+        return fail('phone 和 cmd 不能为空')
+    dev = _portal_device_owned(cid, phone)
+    if not dev:
+        return fail('设备不存在或无权限', 403)
+    builder = _G618G_CMD_MAP.get(cmd)
+    if not builder:
+        return fail(f'不支持的 G618G 指令: {cmd}')
+    if cmd == 'set_server_ip':
+        ip = data.get('ip', '')
+        try:
+            port = int(data.get('port', 0))
+        except (ValueError, TypeError):
+            port = 0
+        if not _re.match(r'^(\d{1,3}\.){3}\d{1,3}$', ip) or not (1 <= port <= 65535):
+            return fail('IP 地址或端口格式错误')
+    try:
+        payload = builder(data)
+    except Exception as e:
+        return fail(f'指令参数错误: {e}')
+    with sessions_lock:
+        conn = sessions.get(phone)
+    if not conn:
+        db_exec("INSERT INTO pending_command (phone,cmd,payload_hex,status) VALUES (?,?,?,?)",
+                (phone, cmd, payload.hex(), 'pending'))
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, dev['name'] or ('G618G-'+phone[-6:]), cmd, 'queued', '设备离线，已加入待发队列，上线后自动下发'))
+        return ok({'cmd': cmd, 'phone': phone, 'queued': True,
+                   'message': '设备当前离线，指令已排队，设备下次上线时自动下发'})
+    try:
+        conn.sendall(payload)
+        import time as _t; _t.sleep(0.01)
+        conn.sendall(payload)
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, dev['name'] or ('G618G-'+phone[-6:]), cmd, 'success', ''))
+        return ok({'cmd': cmd, 'phone': phone, 'queued': False})
+    except Exception as e:
+        db_exec("INSERT INTO pending_command (phone,cmd,payload_hex,status) VALUES (?,?,?,?)",
+                (phone, cmd, payload.hex(), 'pending'))
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, dev['name'] or ('G618G-'+phone[-6:]), cmd, 'queued', f'实时下发失败已转待发队列: {e}'))
+        return ok({'cmd': cmd, 'phone': phone, 'queued': True,
+                   'message': '实时下发失败，已转入待发队列，设备下次上线时自动下发'})
 
 
 @app.post('/api/customer/commands/text')
@@ -3987,28 +4183,129 @@ def portal_device_list():
         return fail('未授权', 401)
     page, size = _page_params(20)
     keyword = request.args.get('keyword', '').strip()
+    model   = request.args.get('terminal_model', '').strip()
+    imei    = request.args.get('imei', '').strip()
+    sub_cid = request.args.get('customer_id', '').strip()
     offset  = (page - 1) * size
     base_cols = ("SELECT device.id, device.phone, device.name, device.plate_no, "
                  "device.manufacturer, device.terminal_model, device.terminal_id, device.imei, "
                  "device.last_lat, device.last_lng, "
                  "device.last_speed, device.last_location_time, device.online_time, device.status, device.customer_id, "
-                 "r.name AS role_name, r.color AS role_color, r.icon_type AS role_icon "
-                 "FROM device LEFT JOIN device_role r ON device.role_id = r.id")
+                 "device.last_battery, device.last_battery_time, "
+                 "c.name AS customer_name, c.login_name AS account, "
+                 "c.contact AS real_name, c.phone AS contact_phone, "
+                 "r.name AS role_name, r.color AS role_color, r.icon_type AS role_icon, "
+                 "r.customer_id AS role_cust "
+                 "FROM device LEFT JOIN device_role r ON device.role_id = r.id "
+                 "LEFT JOIN customer c ON device.customer_id = c.id")
     all_cids = _get_all_descendant_cids(cid)
-    cid_ph   = ','.join('?' * len(all_cids))
-    if keyword:
-        kw      = f'%{keyword}%'
-        total   = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND (name LIKE ? OR phone LIKE ?)",
-                            all_cids + [kw, kw])
-        records = db_query(f"{base_cols} WHERE device.customer_id IN ({cid_ph}) AND (device.name LIKE ? OR device.phone LIKE ?) "
-                           f"ORDER BY device.id LIMIT ? OFFSET ?",
-                           all_cids + [kw, kw, size, offset])
+    # 账号筛选：若指定了子客户，须落在本客户子树内(防越权)，否则忽略该条件
+    if sub_cid:
+        try:
+            _sub = int(sub_cid)
+            if _sub in all_cids:
+                scope_cids = _get_all_descendant_cids(_sub)
+            else:
+                scope_cids = all_cids
+        except ValueError:
+            scope_cids = all_cids
     else:
-        total   = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph})", all_cids)
-        records = db_query(f"{base_cols} WHERE device.customer_id IN ({cid_ph}) ORDER BY device.id LIMIT ? OFFSET ?",
-                           all_cids + [size, offset])
+        scope_cids = all_cids
+    cid_ph = ','.join('?' * len(scope_cids))
+    conds  = [f"device.customer_id IN ({cid_ph})"]
+    params = list(scope_cids)
+    if keyword:
+        conds.append("(device.name LIKE ? OR device.phone LIKE ?)")
+        params += [f'%{keyword}%', f'%{keyword}%']
+    if model:
+        conds.append("device.terminal_model LIKE ?")
+        params.append(f'%{model}%')
+    if imei:
+        # 客户端「设备IMEI」框：按 IMEI 或 设备号/主键 模糊匹配
+        conds.append("(device.imei LIKE ? OR device.phone LIKE ? OR device.terminal_id LIKE ?)")
+        params += [f'%{imei}%', f'%{imei}%', f'%{imei}%']
+    where = "WHERE " + " AND ".join(conds)
+    total   = db_scalar(f"SELECT COUNT(*) FROM device LEFT JOIN customer c ON device.customer_id = c.id {where}", params)
+    records = db_query(f"{base_cols} {where} ORDER BY device.id LIMIT ? OFFSET ?", params + [size, offset])
     # 在线状态直接用 status 字段(关机报警驱动)，不再按时间窗口覆盖。
+    # 角色隔离：设备若挂着不属于本客户子树的角色(如管理员建的全局角色)，
+    # 在客户端不显示该角色，避免出现「客户角色列表里没有、设备却挂着」的错位。
+    _scope = set(all_cids)
+    for _rec in records:
+        _rc = _rec.pop('role_cust', None)
+        if _rc not in _scope:
+            _rec['role_id']    = None
+            _rec['role_name']  = None
+            _rec['role_color'] = None
+            _rec['role_icon']  = None
     return ok({'records': records, 'total': total, 'page': page})
+
+
+# ── 客户门户：批量导入设备（自动归到当前客户名下） ───────────────────────────
+
+@app.post('/api/customer/devices/import')
+def portal_import_devices():
+    """客户端批量导入设备。规则同管理端 import_devices,但强制把新建设备
+    customer_id 设为当前登录客户(防越权把设备建到别人名下)。
+    设备号(deviceNo)与 IMEI 至少填一个;已存在或本批重复的跳过。"""
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    data = request.get_json() or {}
+    rows = data.get('rows')
+    if not isinstance(rows, list) or not rows:
+        return fail('导入数据为空')
+    if len(rows) > 5000:
+        return fail('单次导入不能超过 5000 条,请分批导入')
+    # 客户所属组织(建档时 org_id 跟随客户)
+    _cust = db_query_one("SELECT org_id FROM customer WHERE id=?", (cid,))
+    org_id = (_cust.get('org_id') if _cust else 1) or 1
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    created = skipped = failed = 0
+    details = []
+    seen_in_batch = set()
+    for idx, r in enumerate(rows):
+        rownum = idx + 1
+        if not isinstance(r, dict):
+            failed += 1
+            details.append({'row': rownum, 'phone': '', 'status': 'failed', 'reason': '行格式错误'})
+            continue
+        dev_no = (str(r.get('deviceNo') or r.get('terminalId') or '')).strip()
+        imei   = (str(r.get('imei') or '')).strip()
+        if not dev_no and not imei:
+            _legacy = (str(r.get('phone') or '')).strip()
+            if _legacy:
+                dev_no = _legacy
+        phone = dev_no or imei
+        if not phone:
+            failed += 1
+            details.append({'row': rownum, 'phone': '', 'status': 'failed', 'reason': '设备号和 IMEI 至少填一个'})
+            continue
+        if phone in seen_in_batch:
+            skipped += 1
+            details.append({'row': rownum, 'phone': phone, 'status': 'skipped', 'reason': '文件内重复'})
+            continue
+        seen_in_batch.add(phone)
+        if db_query_one("SELECT id FROM device WHERE phone=?", (phone,)):
+            skipped += 1
+            details.append({'row': rownum, 'phone': phone, 'status': 'skipped', 'reason': '设备号/IMEI 已存在'})
+            continue
+        try:
+            db_exec(
+                "INSERT INTO device (phone,name,plate_no,manufacturer,terminal_model,"
+                "terminal_id,imei,customer_id,plate_color,auth_code,status,org_id,lifecycle,remark,created_at,updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,1,'DEFAULT',0,?,0,?,?,?)",
+                (phone, str(r.get('name', '') or ''), str(r.get('plateNo', '') or ''),
+                 str(r.get('manufacturer', '') or ''), str(r.get('terminalModel', '') or ''),
+                 dev_no, imei, cid, org_id, str(r.get('remark', '') or ''), now, now)
+            )
+            created += 1
+            details.append({'row': rownum, 'phone': phone, 'status': 'created', 'reason': ''})
+        except Exception as e:
+            failed += 1
+            details.append({'row': rownum, 'phone': phone, 'status': 'failed', 'reason': str(e)[:120]})
+    add_op_log('客户批量导入设备', f'客户#{cid} 导入 {created} 台,跳过 {skipped} 台,失败 {failed} 台')
+    return ok({'created': created, 'skipped': skipped, 'failed': failed, 'details': details})
 
 
 # ── 客户门户：编辑自己名下设备（名称 / 备注） ─────────────────────────────────
@@ -5240,6 +5537,144 @@ def _serve_spa(path):
             return _send_abs(fp)
     # 其余全部返回 index.html（Vue Router 接管）
     return _send_abs(os.path.join(_DIST, 'index.html'))
+
+
+# ── 账号级功能权限（菜单可见 + 接口校验双重管控）────────────────────────────────
+# 需求：给每个管理账号(admin_user)单独勾选它能访问的功能菜单。未配置=拥有全部(向后兼容)。
+# 权限项 key 用前端路由 path(与菜单一一对应)。存 account_permission 表，登录时下发。
+# 超级管理员(user_type>=9 或 username=admin)不受限，始终拥有全部权限。
+
+# 全部可授权的功能菜单(key=前端路由path, name=显示名, group=分组)
+MENU_PERMISSIONS = [
+    ('bigscreen',        '大屏展示',   '监控'),
+    ('dashboard',        '系统概览',   '监控'),
+    ('map',              '实时地图',   '监控'),
+    ('track',            '轨迹回放',   '监控'),
+    ('fence',            '电子围栏',   '监控'),
+    ('health',           '健康数据',   '监控'),
+    ('query',            '设备查询',   '监控'),
+    ('device-info',      '设备信息',   '管理'),
+    ('device-settings',  '设备设置',   '管理'),
+    ('role-settings',    '角色设置',   '管理'),
+    ('sims',             'SIM卡管理',  '管理'),
+    ('customers',        '客户管理',   '管理'),
+    ('org',              '组织管理',   '系统'),
+    ('module-auth',      '模块授权',   '系统'),
+    ('platform-setting', '平台设置',   '系统'),
+    ('alarms',           '报警管理',   '运营'),
+    ('alarm-setting',    '报警设置',   '运营'),
+    ('attendance',       '考勤统计',   '运营'),
+    ('recharges',        '充值管理',   '运营'),
+    ('reports',          '报表统计',   '运营'),
+]
+_ALL_MENU_KEYS = [m[0] for m in MENU_PERMISSIONS]
+
+# 菜单 key → 保护该菜单的接口路径前缀(接口层校验用)。只列各菜单独有的写/读接口前缀；
+# 通用接口(如 /api/devices/summary、/api/auth/*)不纳入，避免误伤跨页面公共调用。
+_MENU_API_PREFIX = {
+    'customers':        ['/api/customers'],
+    'org':              ['/api/orgs', '/api/organizations'],
+    'module-auth':      ['/api/modules'],
+    'platform-setting': ['/api/platform-setting'],
+    'role-settings':    ['/api/roles'],
+    'sims':             ['/api/sims', '/api/recharges'],
+    'reports':          ['/api/reports'],
+    'attendance':       ['/api/attendance'],
+    'alarm-setting':    ['/api/alarm-rules', '/api/alarm-setting'],
+    'fence':            ['/api/fences'],
+    'track':            ['/api/track'],
+}
+
+def _ensure_account_permission_table():
+    """建账号权限表(幂等)。account_id 对应 admin_user.id；menu_keys 逗号分隔。"""
+    try:
+        db_exec(
+            "CREATE TABLE IF NOT EXISTS account_permission ("
+            " account_id INTEGER PRIMARY KEY,"
+            " menu_keys  TEXT DEFAULT '',"
+            " updated_at TEXT )")
+    except Exception as e:
+        log.warning("[账号权限] 建表失败: %s", e)
+
+def _get_account_menu_keys(admin_id):
+    """返回该账号的可见菜单 key 列表。未配置(无记录)返回 None(表示全部可见,向后兼容)。"""
+    _ensure_account_permission_table()
+    try:
+        row = db_query_one("SELECT menu_keys FROM account_permission WHERE account_id=?", (admin_id,))
+    except Exception:
+        return None
+    if not row:
+        return None
+    raw = (row.get('menu_keys') or '').strip()
+    if raw == '':
+        return []            # 显式配置为"无任何权限"
+    return [k for k in raw.split(',') if k]
+
+def _admin_is_super(admin_row):
+    """超级管理员判定:username=admin 或 user_type>=9,不受菜单权限限制。"""
+    if not admin_row:
+        return False
+    return (admin_row.get('username') == 'admin') or ((admin_row.get('user_type') or 0) >= 9)
+
+@app.get('/api/account-permissions/accounts')
+def list_admin_accounts():
+    """列出所有管理账号(供账号权限页选择账号)。返回 id/username/realName/isSuper。"""
+    if not _verify_admin_token(request.headers.get('X-Admin-Token', '')):
+        return fail('未授权', 401)
+    rows = db_query("SELECT id, username, real_name, user_type, COALESCE(is_active,1) AS is_active "
+                    "FROM admin_user ORDER BY id")
+    out = []
+    for r in rows:
+        out.append({'id': r['id'], 'username': r['username'],
+                    'realName': r.get('real_name') or '',
+                    'isSuper': _admin_is_super(r),
+                    'isActive': bool(r.get('is_active', 1))})
+    return ok(out)
+
+@app.get('/api/account-permissions/menus')
+def list_menu_permissions():
+    """返回全部可授权菜单项(供权限配置界面渲染勾选树)。"""
+    if not _verify_admin_token(request.headers.get('X-Admin-Token', '')):
+        return fail('未授权', 401)
+    return ok([{'key': k, 'name': n, 'group': g} for (k, n, g) in MENU_PERMISSIONS])
+
+@app.get('/api/account-permissions/<int:account_id>')
+def get_account_permission(account_id):
+    """查某账号的已配置菜单权限。返回 {account_id, menu_keys, is_all}。"""
+    if not _verify_admin_token(request.headers.get('X-Admin-Token', '')):
+        return fail('未授权', 401)
+    keys = _get_account_menu_keys(account_id)
+    return ok({'account_id': account_id,
+               'menu_keys': keys if keys is not None else _ALL_MENU_KEYS,
+               'is_all': keys is None})
+
+@app.put('/api/account-permissions/<int:account_id>')
+def set_account_permission(account_id):
+    """设置某账号的菜单权限。Body: {menu_keys: [...]}。仅超管可配。"""
+    tok = request.headers.get('X-Admin-Token', '')
+    admin_id = _verify_admin_token(tok)
+    if not admin_id:
+        return fail('未授权', 401)
+    me = db_query_one("SELECT username, user_type FROM admin_user WHERE id=?", (admin_id,))
+    if not _admin_is_super(me):
+        return fail('仅超级管理员可配置账号权限', 403)
+    d = request.get_json() or {}
+    keys = d.get('menu_keys', [])
+    if not isinstance(keys, list):
+        return fail('menu_keys 必须是数组', 400)
+    # 只保留合法 key,去重保序
+    valid = [k for k in _ALL_MENU_KEYS if k in set(keys)]
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    _ensure_account_permission_table()
+    exists = db_query_one("SELECT account_id FROM account_permission WHERE account_id=?", (account_id,))
+    if exists:
+        db_exec("UPDATE account_permission SET menu_keys=?, updated_at=? WHERE account_id=?",
+                (','.join(valid), now, account_id))
+    else:
+        db_exec("INSERT INTO account_permission (account_id, menu_keys, updated_at) VALUES (?,?,?)",
+                (account_id, ','.join(valid), now))
+    add_op_log('配置账号权限', f'account_id={account_id} menus={",".join(valid)}')
+    return ok({'account_id': account_id, 'menu_keys': valid})
 
 
 # ── 全局异常/错误处理 ──────────────────────────────────────────────────────────

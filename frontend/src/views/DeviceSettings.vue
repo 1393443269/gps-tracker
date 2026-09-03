@@ -40,6 +40,7 @@
         </template>
       </el-dropdown>
 
+      <el-button :icon="Upload" @click="openImport">批量导入</el-button>
       <el-button :icon="Download" @click="exportAll" :loading="exporting">导出</el-button>
 
       <div style="flex:1;"></div>
@@ -62,7 +63,7 @@
       @selection-change="onSelectionChange">
       <el-table-column type="selection" width="45" />
       <el-table-column type="index" label="#" width="50" />
-      <el-table-column prop="name"           label="姓名"       width="120" />
+      <el-table-column prop="name"           label="设备名称"   width="120" />
       <el-table-column label="设备号" width="160">
         <template #default="{ row }"><span>{{ row.terminal_id || row.phone }}</span></template>
       </el-table-column>
@@ -143,12 +144,47 @@
           :disabled="!cmdText.trim()">发送</el-button>
       </template>
     </el-dialog>
+
+    <!-- 批量导入弹窗 -->
+    <el-dialog v-model="importVisible" title="批量导入设备" width="560px">
+      <div style="font-size:13px;color:#606266;line-height:1.9;margin-bottom:12px;">
+        <p style="margin:0 0 6px;">1. 下载模板,按列填写(<b>设备号与 IMEI 至少填一个</b>,两号相同的设备两列填一样即可,其余选填)。</p>
+        <p style="margin:0 0 6px;">2. 支持 <b>.xlsx</b> 和 <b>.csv</b> 格式。已存在的设备号会自动跳过。</p>
+        <el-button size="small" :icon="Download" @click="downloadTemplate">下载导入模板</el-button>
+      </div>
+      <el-upload drag :auto-upload="false" :show-file-list="false" accept=".xlsx,.csv"
+        :on-change="onFilePicked">
+        <el-icon class="el-icon--upload"><Upload /></el-icon>
+        <div class="el-upload__text">把文件拖到这里,或<em>点击选择文件</em></div>
+      </el-upload>
+      <div v-if="importPreview.length" style="margin-top:12px;font-size:13px;">
+        已解析 <b>{{ importPreview.length }}</b> 条记录,点「开始导入」提交。
+      </div>
+      <div v-if="importResult" style="margin-top:12px;">
+        <el-alert :closable="false"
+          :type="importResult.failed ? 'warning' : 'success'"
+          :title="`导入完成:成功 ${importResult.created} 台,跳过 ${importResult.skipped} 台,失败 ${importResult.failed} 台`" />
+        <el-table v-if="importResultRows.length" :data="importResultRows" size="small" border
+          max-height="220" style="margin-top:10px;">
+          <el-table-column prop="row" label="行" width="60" />
+          <el-table-column prop="phone" label="设备号/IMEI" min-width="140" />
+          <el-table-column prop="statusText" label="结果" width="80" />
+          <el-table-column prop="reason" label="说明" min-width="120" />
+        </el-table>
+      </div>
+      <template #footer>
+        <el-button @click="importVisible = false">关闭</el-button>
+        <el-button type="primary" :disabled="!importPreview.length" :loading="importing"
+          @click="submitImport">开始导入</el-button>
+      </template>
+    </el-dialog>
   </el-card>
 </template>
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import { Search, Minus, Link, ArrowDown, Download } from '@element-plus/icons-vue'
+import { Search, Minus, Link, ArrowDown, Download, Upload } from '@element-plus/icons-vue'
+import * as XLSX from 'xlsx' 
 import { deviceApi, customerApi, portalApi, isAdmin } from '@/api'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -159,6 +195,87 @@ const pageSize    = ref(20)
 const total       = ref(0)
 const bindFilter  = ref(null)
 const exporting   = ref(false)
+
+// ── 批量导入 ──────────────────────────────────────────────
+const importVisible = ref(false)
+const importing     = ref(false)
+const importPreview = ref([])
+const importResult  = ref(null)
+const importResultRows = ref([])
+const HEADER_MAP = {
+  '设备号': 'deviceNo', 'deviceNo': 'deviceNo', 'terminalId': 'deviceNo',
+  'IMEI': 'imei', 'imei': 'imei',
+  'IMEI/设备号': 'deviceNo', 'phone': 'deviceNo',
+  '名称': 'name', 'name': 'name',
+  '位置/车牌': 'plateNo', '位置': 'plateNo', '车牌': 'plateNo', 'plateNo': 'plateNo',
+  '型号': 'terminalModel', 'terminalModel': 'terminalModel',
+  '备注': 'remark', 'remark': 'remark',
+}
+function openImport() {
+  importPreview.value = []
+  importResult.value  = null
+  importResultRows.value = []
+  importVisible.value = true
+}
+function downloadTemplate() {
+  const ws = XLSX.utils.aoa_to_sheet([
+    ['设备号', 'IMEI', '名称', '位置/车牌', '型号', '备注'],
+    ['11526090071', '864924089464826', '示例设备A', '沪A12345', 'LT115', '设备号与IMEI至少填一个'],
+    ['867940074800516', '867940074800516', '示例设备B', '', 'G618G', '两号相同也可'],
+  ])
+  ws['!cols'] = [{ wch: 18 }, { wch: 18 }, { wch: 14 }, { wch: 14 }, { wch: 12 }, { wch: 22 }]
+  const wb = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(wb, ws, '设备导入')
+  XLSX.writeFile(wb, '设备批量导入模板.xlsx')
+}
+function onFilePicked(file) {
+  importResult.value = null
+  importResultRows.value = []
+  const reader = new FileReader()
+  reader.onload = (e) => {
+    try {
+      const wb = XLSX.read(e.target.result, { type: 'array' })
+      const ws = wb.Sheets[wb.SheetNames[0]]
+      const raw = XLSX.utils.sheet_to_json(ws, { defval: '' })
+      const rows = []
+      for (const r of raw) {
+        const obj = {}
+        for (const k in r) {
+          const field = HEADER_MAP[String(k).trim()]
+          if (field) obj[field] = String(r[k]).trim()
+        }
+        if (obj.deviceNo || obj.imei) rows.push(obj)
+      }
+      if (!rows.length) {
+        ElMessage.warning('未解析到有效数据,请确认表头含「设备号」或「IMEI」且有内容')
+        importPreview.value = []
+        return
+      }
+      importPreview.value = rows
+      ElMessage.success(`已解析 ${rows.length} 条记录`)
+    } catch (err) {
+      ElMessage.error('文件解析失败,请确认格式为 .xlsx 或 .csv')
+      importPreview.value = []
+    }
+  }
+  reader.readAsArrayBuffer(file.raw)
+}
+async function submitImport() {
+  if (!importPreview.value.length) return
+  importing.value = true
+  try {
+    const res = isAdmin() ? await deviceApi.batchImport(importPreview.value) : await portalApi.batchImport(importPreview.value)
+    importResult.value = res.data
+    const STAT = { created: '成功', skipped: '跳过', failed: '失败' }
+    importResultRows.value = (res.data.details || []).map(d => ({
+      ...d, statusText: STAT[d.status] || d.status,
+    }))
+    importPreview.value = []
+    loadData(1)
+  } catch {} finally {
+    importing.value = false
+  }
+}
 
 // 三种查询条件
 const queryCustomerId   = ref(null)   // ① 账户（含子账户）

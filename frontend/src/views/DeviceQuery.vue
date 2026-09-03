@@ -230,10 +230,16 @@
         （设备号 {{ zlDev?.phone }}）
         <el-tag v-if="zlDev?.status===1" size="small" type="success" style="margin-left:6px;">在线</el-tag>
         <el-tag v-else size="small" type="info" style="margin-left:6px;">离线</el-tag>
+        <el-tag size="small" :type="isG618 ? 'warning' : 'primary'" style="margin-left:6px;">
+          型号 {{ zlDev?.terminal_model || '未知' }}
+        </el-tag>
       </div>
+      <el-alert v-if="isG618" type="warning" :closable="false" show-icon style="margin-bottom:10px;"
+        title="G618 为低功耗短连接设备，指令将排入队列，在设备下次上线时自动下发执行，可能有延迟。" />
       <el-alert type="info" :closable="false" show-icon style="margin-bottom:10px;"
         title="设备需在线才能接收指令；离线设备将返回“设备不在线”。" />
-      <el-tabs v-model="zlTab">
+      <!-- ===== 天禧设备指令（terminal_model 不含 G618 时显示） ===== -->
+      <el-tabs v-model="zlTab" v-if="!isG618">
         <!-- 网络配置 -->
         <el-tab-pane label="网络配置" name="net">
           <div class="zl-card">
@@ -362,6 +368,103 @@
             </div>
             <el-button type="primary" size="small" :loading="zlBusy==='text'"
               :disabled="!zlCustomText" @click="sendCustomZhiling()">发送</el-button>
+          </div>
+        </el-tab-pane>
+      </el-tabs>
+
+      <!-- ===== G618 设备指令（terminal_model 含 G618 时显示） ===== -->
+      <el-tabs v-model="zlTabG" v-if="isG618">
+        <!-- 上报与连接 -->
+        <el-tab-pane label="上报与连接" name="g_report">
+          <div class="zl-card">
+            <div class="zl-title">设置上报频率 <span class="zl-cmd">set_freq</span></div>
+            <el-form :inline="true" size="small">
+              <el-form-item label="间隔(分钟)"><el-input v-model="zfg.set_freq.interval" placeholder="默认10" style="width:110px" /></el-form-item>
+              <el-form-item><el-button type="primary" :loading="zlBusy==='set_freq'" @click="sendG618('set_freq', { interval: zfg.set_freq.interval }, ['interval'])">下发</el-button></el-form-item>
+            </el-form>
+          </div>
+          <div class="zl-card">
+            <div class="zl-title">长短连接切换 <span class="zl-cmd">long_connection</span></div>
+            <el-form :inline="true" size="small">
+              <el-form-item label="长连接">
+                <el-radio-group v-model="zfg.long_connection.on">
+                  <el-radio-button :value="true">开启</el-radio-button>
+                  <el-radio-button :value="false">关闭</el-radio-button>
+                </el-radio-group>
+              </el-form-item>
+              <el-form-item><el-button type="primary" :loading="zlBusy==='long_connection'" @click="sendG618('long_connection', { on: zfg.long_connection.on }, [])">下发</el-button></el-form-item>
+            </el-form>
+          </div>
+          <div class="zl-card">
+            <div class="zl-title">休眠开关 <span class="zl-cmd">sleep</span></div>
+            <el-form :inline="true" size="small">
+              <el-form-item label="休眠">
+                <el-radio-group v-model="zfg.sleep.on">
+                  <el-radio-button :value="true">开启</el-radio-button>
+                  <el-radio-button :value="false">关闭</el-radio-button>
+                </el-radio-group>
+              </el-form-item>
+              <el-form-item><el-button type="primary" :loading="zlBusy==='sleep'" @click="sendG618('sleep', { on: zfg.sleep.on }, [])">下发</el-button></el-form-item>
+            </el-form>
+          </div>
+        </el-tab-pane>
+
+        <!-- 开关设置 -->
+        <el-tab-pane label="开关设置" name="g_switch">
+          <div class="zl-card" v-for="sw in g618Switches" :key="sw.cmd">
+            <div class="zl-title">{{ sw.label }} <span class="zl-cmd">{{ sw.cmd }}</span></div>
+            <el-form :inline="true" size="small">
+              <el-form-item label="状态">
+                <el-radio-group v-model="zfg[sw.cmd].on">
+                  <el-radio-button :value="true">开启</el-radio-button>
+                  <el-radio-button :value="false">关闭</el-radio-button>
+                </el-radio-group>
+              </el-form-item>
+              <el-form-item><el-button type="primary" :loading="zlBusy===sw.cmd" @click="sendG618(sw.cmd, { on: zfg[sw.cmd].on }, [])">下发</el-button></el-form-item>
+            </el-form>
+          </div>
+        </el-tab-pane>
+
+        <!-- 定位 -->
+        <el-tab-pane label="定位" name="g_loc">
+          <div class="zl-card">
+            <div class="zl-title">定位优先级 <span class="zl-cmd">set_loc_priority</span></div>
+            <div style="color:#909399;font-size:12px;margin-bottom:8px;">按优先级从高到低选择定位方式（1=GPS,2=WiFi,3=BLE蓝牙）。</div>
+            <el-form :inline="true" size="small">
+              <el-form-item label="第1优先">
+                <el-select v-model="zfg.set_loc_priority.p1" style="width:110px"><el-option v-for="o in locOptions" :key="o.value" :label="o.label" :value="o.value" /></el-select>
+              </el-form-item>
+              <el-form-item label="第2优先">
+                <el-select v-model="zfg.set_loc_priority.p2" style="width:110px"><el-option v-for="o in locOptions" :key="o.value" :label="o.label" :value="o.value" /></el-select>
+              </el-form-item>
+              <el-form-item label="第3优先">
+                <el-select v-model="zfg.set_loc_priority.p3" style="width:110px"><el-option v-for="o in locOptions" :key="o.value" :label="o.label" :value="o.value" /></el-select>
+              </el-form-item>
+              <el-form-item><el-button type="primary" :loading="zlBusy==='set_loc_priority'" @click="sendLocPriority()">下发</el-button></el-form-item>
+            </el-form>
+          </div>
+        </el-tab-pane>
+
+        <!-- 系统【谨慎】 -->
+        <el-tab-pane label="系统【谨慎】" name="g_sys">
+          <div class="zl-card">
+            <div class="zl-title">重启设备 <span class="zl-cmd">reboot</span></div>
+            <el-button type="danger" size="small" :loading="zlBusy==='reboot'" @click="sendG618('reboot', {}, [])">下发</el-button>
+          </div>
+          <div class="zl-card">
+            <div class="zl-title">关机 <span class="zl-cmd">shutdown</span></div>
+            <el-button type="danger" size="small" :loading="zlBusy==='shutdown'" @click="sendG618('shutdown', {}, [])">下发</el-button>
+          </div>
+          <div class="zl-card">
+            <div class="zl-title">修改服务器IP <span class="zl-cmd">set_server_ip</span></div>
+            <div style="color:#f56c6c;font-weight:600;font-size:12px;margin-bottom:8px;">
+              ⚠ 高危操作：改错会导致设备失联，无法再连回平台，请务必确认 IP/端口正确！
+            </div>
+            <el-form :inline="true" size="small">
+              <el-form-item label="IP"><el-input v-model="zfg.set_server_ip.ip" placeholder="如 47.100.1.1" style="width:170px" /></el-form-item>
+              <el-form-item label="端口"><el-input v-model="zfg.set_server_ip.port" placeholder="端口" style="width:100px" /></el-form-item>
+              <el-form-item><el-button type="danger" :loading="zlBusy==='set_server_ip'" @click="sendG618('set_server_ip', { ip: zfg.set_server_ip.ip, port: zfg.set_server_ip.port }, ['ip','port'])">下发</el-button></el-form-item>
+            </el-form>
           </div>
         </el-tab-pane>
       </el-tabs>
@@ -752,7 +855,7 @@ async function sendZhiling(cmd, form, required) {
   }
   zlBusy.value = cmd
   try {
-    await commandApi.zhiling({ phone: zlDev.value.phone, cmd, ...form })
+    await (isAdmin() ? commandApi.zhiling : portalApi.zhiling)({ phone: zlDev.value.phone, cmd, ...form })
     ElMessage.success('指令已下发')
   } catch (e) {
     ElMessage.error(e.response?.data?.msg || '指令下发失败')
@@ -770,8 +873,78 @@ async function sendSosNumbers() {
   if (arr.length > 5) { ElMessage.warning('SOS号码最多5个'); return }
   zlBusy.value = 'set_sos_numbers'
   try {
-    await commandApi.zhiling({ phone: zlDev.value.phone, cmd:'set_sos_numbers', numbers: arr })
+    await (isAdmin() ? commandApi.zhiling : portalApi.zhiling)({ phone: zlDev.value.phone, cmd:'set_sos_numbers', numbers: arr })
     ElMessage.success('指令已下发')
+  } catch (e) {
+    ElMessage.error(e.response?.data?.msg || '指令下发失败')
+  } finally {
+    zlBusy.value = ''
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// G618 设备指令面板（管理端 /api/commands/g618g）—— 按 terminal_model 自动切换
+// ══════════════════════════════════════════════════════════════════════════════
+const isG618 = computed(() => (zlDev.value?.terminal_model || '').toUpperCase().includes('G618'))
+const zlTabG = ref('g_report')
+
+// G618 开关类指令（都是 on 布尔）
+const g618Switches = [
+  { cmd: 'ble_broadcast',   label: '蓝牙广播开关' },
+  { cmd: 'fall_alarm',      label: '跌落报警开关' },
+  { cmd: 'button_shutdown', label: '按键关机开关' },
+  { cmd: 'sos_button',      label: 'SOS按键开关' },
+  { cmd: 'charge_power',    label: '充电供电开关' },
+]
+
+// 定位方式代码：1=GPS, 2=WiFi, 3=BLE（严格对应后端 build_set_loc_priority）
+const locOptions = [
+  { value: 1, label: 'GPS' },
+  { value: 2, label: 'WiFi' },
+  { value: 3, label: 'BLE蓝牙' },
+]
+
+const zfg = ref({
+  set_freq:         { interval: '10' },
+  long_connection:  { on: true },
+  sleep:            { on: false },
+  ble_broadcast:    { on: true },
+  fall_alarm:       { on: true },
+  button_shutdown:  { on: true },
+  sos_button:       { on: true },
+  charge_power:     { on: true },
+  set_loc_priority: { p1: 1, p2: 2, p3: 3 },
+  set_server_ip:    { ip: '', port: '' },
+})
+
+// G618 通用下发：cmd=命令名, form=参数对象, required=必填参数名数组
+async function sendG618(cmd, form, required) {
+  if (!zlDev.value?.phone) { ElMessage.warning('未选择设备'); return }
+  for (const k of required) {
+    if (form[k] === '' || form[k] === null || form[k] === undefined) {
+      ElMessage.warning(`请填写参数：${k}`); return
+    }
+  }
+  zlBusy.value = cmd
+  try {
+    await (isAdmin() ? commandApi.g618 : portalApi.g618)({ phone: zlDev.value.phone, cmd, ...form })
+    ElMessage.success('指令已下发（G618为短连接设备，将在设备下次上线时执行）')
+  } catch (e) {
+    ElMessage.error(e.response?.data?.msg || '指令下发失败')
+  } finally {
+    zlBusy.value = ''
+  }
+}
+
+// 定位优先级：三个下拉转成 priorities 数组
+async function sendLocPriority() {
+  const f = zfg.value.set_loc_priority
+  const priorities = [f.p1, f.p2, f.p3].map(Number).filter(x => x >= 1 && x <= 3)
+  if (!priorities.length) { ElMessage.warning('请至少选择一种定位方式'); return }
+  zlBusy.value = 'set_loc_priority'
+  try {
+    await commandApi.g618({ phone: zlDev.value.phone, cmd: 'set_loc_priority', priorities })
+    ElMessage.success('指令已下发（G618为短连接设备，将在设备下次上线时执行）')
   } catch (e) {
     ElMessage.error(e.response?.data?.msg || '指令下发失败')
   } finally {

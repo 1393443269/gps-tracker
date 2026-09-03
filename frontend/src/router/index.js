@@ -11,6 +11,15 @@ const authGuard = (to, from, next) => {
   // roles: ['admin']    → 仅管理员
   // roles: ['customer'] → 仅客户
   // 不设 roles          → 两者均可访问
+  // 账号菜单权限:非超管账号,访问未授权菜单页时重定向到概览
+  try {
+    const isSuper = localStorage.getItem('is_super') === '1'
+    const mk = JSON.parse(localStorage.getItem('menu_keys') || 'null')
+    const pageKey = (to.path || '').replace(/^\//, '')
+    if (hasAdmin && !isSuper && Array.isArray(mk) && pageKey && pageKey !== 'dashboard') {
+      if (!mk.includes(pageKey)) { next('/dashboard'); return }
+    }
+  } catch (e) {}
   const roles = to.meta.roles
   if (roles) {
     if (roles.includes('admin') && !hasAdmin)    { next('/dashboard'); return }
@@ -53,6 +62,7 @@ const routes = [
       { path: 'org',             component: () => import('@/views/OrgManage.vue'),       meta: { title: '组织管理',  roles: ['admin'] } },
       { path: 'module-auth',     component: () => import('@/views/ModuleAuth.vue'),      meta: { title: '模块授权',  roles: ['admin'] } },
       { path: 'platform-setting',component: () => import('@/views/PlatformSetting.vue'),meta: { title: '平台设置' } },
+      { path: 'account-permission',component: () => import('@/views/AccountPermission.vue'),meta: { title: '账号权限', roles: ['admin'] } },
       { path: 'sims',            component: () => import('@/views/SimCard.vue'),         meta: { title: 'SIM卡管理' } },
       { path: 'recharges',       component: () => import('@/views/Recharge.vue'),        meta: { title: '充值管理' } },
     ]

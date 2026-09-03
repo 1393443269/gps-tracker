@@ -17,45 +17,45 @@
         router
       >
         <div class="menu-group-label">监控</div>
-        <el-menu-item index="/bigscreen">
+        <el-menu-item v-if="canShow('bigscreen')" index="/bigscreen">
           <el-icon><Monitor /></el-icon><span>大屏展示</span>
         </el-menu-item>
-        <el-menu-item index="/dashboard">
+        <el-menu-item v-if="canShow('dashboard')" index="/dashboard">
           <el-icon><DataBoard /></el-icon><span>系统概览</span>
         </el-menu-item>
-        <el-menu-item index="/map">
+        <el-menu-item v-if="canShow('map')" index="/map">
           <el-icon><MapLocation /></el-icon><span>实时地图</span>
         </el-menu-item>
-        <el-menu-item index="/track">
+        <el-menu-item v-if="canShow('track')" index="/track">
           <el-icon><Aim /></el-icon><span>轨迹回放</span>
         </el-menu-item>
-        <el-menu-item index="/fence">
+        <el-menu-item v-if="canShow('fence')" index="/fence">
           <el-icon><Position /></el-icon><span>电子围栏</span>
         </el-menu-item>
-        <el-menu-item index="/health">
+        <el-menu-item v-if="canShow('health')" index="/health">
           <el-icon><FirstAidKit /></el-icon><span>健康数据</span>
         </el-menu-item>
-        <el-menu-item index="/query">
+        <el-menu-item v-if="canShow('query')" index="/query">
           <el-icon><Search /></el-icon><span>设备查询</span>
         </el-menu-item>
 
         <div class="menu-group-label">管理</div>
-        <el-menu-item index="/device-info">
+        <el-menu-item v-if="canShow('device-info')" index="/device-info">
           <el-icon><Cellphone /></el-icon>
           <span>设备信息</span>
         </el-menu-item>
-        <el-menu-item index="/device-settings">
+        <el-menu-item v-if="canShow('device-settings')" index="/device-settings">
           <el-icon><Setting /></el-icon>
           <span>设备设置</span>
         </el-menu-item>
-        <el-menu-item index="/role-settings">
+        <el-menu-item v-if="canShow('role-settings')" index="/role-settings">
           <el-icon><UserFilled /></el-icon>
           <span>角色设置</span>
         </el-menu-item>
-        <el-menu-item index="/sims">
+        <el-menu-item v-if="canShow('sims')" index="/sims">
           <el-icon><Coin /></el-icon><span>SIM卡管理</span>
         </el-menu-item>
-        <el-menu-item index="/customers">
+        <el-menu-item v-if="canShow('customers')" index="/customers">
           <el-icon><User /></el-icon>
           <span>客户管理</span>
         </el-menu-item>
@@ -69,13 +69,17 @@
           <el-icon><Operation /></el-icon>
           <span>模块授权</span>
         </el-menu-item>
-        <el-menu-item index="/platform-setting">
+        <el-menu-item v-if="isAdmin && _isSuper" index="/account-permission">
+          <el-icon><Lock /></el-icon>
+          <span>账号权限</span>
+        </el-menu-item>
+        <el-menu-item v-if="canShow('platform-setting')" index="/platform-setting">
           <el-icon><Tools /></el-icon>
           <span>平台设置</span>
         </el-menu-item>
 
         <div class="menu-group-label">运营</div>
-        <el-menu-item index="/alarms">
+        <el-menu-item v-if="canShow('alarms')" index="/alarms">
           <el-icon><Bell /></el-icon>
           <span>报警管理</span>
           <el-badge v-if="alarmCount > 0" :value="alarmCount" class="alarm-badge" />
@@ -83,13 +87,13 @@
         <el-menu-item v-if="isAdmin" index="/alarm-setting">
           <el-icon><SetUp /></el-icon><span>报警设置</span>
         </el-menu-item>
-        <el-menu-item index="/attendance">
+        <el-menu-item v-if="canShow('attendance')" index="/attendance">
           <el-icon><Calendar /></el-icon><span>考勤统计</span>
         </el-menu-item>
-        <el-menu-item index="/recharges">
+        <el-menu-item v-if="canShow('recharges')" index="/recharges">
           <el-icon><WalletFilled /></el-icon><span>充值管理</span>
         </el-menu-item>
-        <el-menu-item index="/reports">
+        <el-menu-item v-if="canShow('reports')" index="/reports">
           <el-icon><TrendCharts /></el-icon><span>报表统计</span>
         </el-menu-item>
       </el-menu>
@@ -153,7 +157,7 @@ import {
   Cellphone, Coin, User, Setting, UserFilled,
   Bell, WalletFilled, TrendCharts, Monitor,
   OfficeBuilding, Operation, ArrowDown,
-  Tools, SetUp, Calendar, FirstAidKit
+  Tools, SetUp, Calendar, FirstAidKit, Lock
 } from '@element-plus/icons-vue'
 
 const route       = useRoute()
@@ -178,6 +182,20 @@ async function loadPlatform() {
 }
 
 const isAdmin = computed(() => checkAdmin())
+
+// 账号菜单权限:超管或未配置(null)=全部可见;否则按下发的 menu_keys 显隐。
+// 客户端(非admin)不走此逻辑,维持原有 isAdmin 分流。
+const _menuKeys = computed(() => {
+  try { return JSON.parse(localStorage.getItem('menu_keys') || 'null') } catch { return null }
+})
+const _isSuper = computed(() => localStorage.getItem('is_super') === '1')
+function canShow(key) {
+  if (!isAdmin.value) return true       // 客户端不受此限制
+  if (_isSuper.value) return true
+  const mk = _menuKeys.value
+  if (!Array.isArray(mk)) return true   // 未配置=全部可见(向后兼容)
+  return mk.includes(key)
+}
 
 const displayName = computed(() => {
   if (isAdmin.value) return localStorage.getItem('admin_username') || '管理员'

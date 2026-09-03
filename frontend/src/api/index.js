@@ -57,6 +57,13 @@ http.interceptors.response.use(
   }
 )
 
+export const permApi = {
+  accounts: ()               => http.get('/account-permissions/accounts'),
+  menus:    ()               => http.get('/account-permissions/menus'),
+  get:      (id)             => http.get(`/account-permissions/${id}`),
+  set:      (id, menu_keys)  => http.put(`/account-permissions/${id}`, { menu_keys }),
+}
+
 export const authApi = {
   login:          (data) => http.post('/auth/login', data),
   changePassword: (data) => http.post('/auth/change_password', data),
@@ -142,6 +149,7 @@ export const commandApi = {
   history:  (params)        => http.get('/command-history', { params }),
   addHistory: (data)        => http.post('/command-history', data),
   zhiling:  (data)          => http.post('/commands/zhiling', data),
+  g618:     (data)          => http.post('/commands/g618g', data),
 }
 
 // ── SIM 卡 ────────────────────────────────────────────────────────────────────
@@ -201,6 +209,7 @@ export const portalApi = {
   me:             ()              => portalHttp.get('/me'),
   // 设备
   deviceList:     (params)        => portalHttp.get('/device_list', { params }),
+  batchImport:    (rows)          => portalHttp.post('/devices/import', { rows }),
   devices:        ()              => portalHttp.get('/devices'),
   updateDevice:   (phone, data)   => portalHttp.put(`/devices/${phone}/update`, data),
   summary:        ()              => portalHttp.get('/summary'),
@@ -213,6 +222,8 @@ export const portalApi = {
   handleAlarm:    (id, data)      => portalHttp.put(`/alarms/${id}/handle`, data),
   // 指令
   sendCommand:    (data)          => portalHttp.post('/commands/text', data),
+  zhiling:        (data)          => portalHttp.post('/commands/zhiling', data),
+  g618:           (data)          => portalHttp.post('/commands/g618g', data),
   batchCommand:   (phones, text)  => portalHttp.post('/commands/batch_text', { phones, text }),
   cmdHistory:     (params)        => portalHttp.get('/commands/history', { params }),
   // 电子围栏

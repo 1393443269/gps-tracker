@@ -65,6 +65,13 @@
               <el-option label="行政区" value="administrative" />
             </el-select>
           </div>
+          <!-- 账号围栏查看(仅管理员):选账号后查看该账号及下级私建的围栏 -->
+          <div v-if="isAdmin()" style="display:flex;gap:6px;margin-bottom:8px;">
+            <el-select v-model="fenceAccountId" size="small" style="flex:1;" clearable filterable
+              placeholder="按账号查看围栏(默认全局围栏)" @change="loadFences">
+              <el-option v-for="c in accountOptions" :key="c.id" :label="c.name" :value="c.id" />
+            </el-select>
+          </div>
 
           <!-- 批量删除 / 全显切换 -->
           <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap;">
@@ -375,7 +382,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Location, Warning, Setting, View, Hide } from '@element-plus/icons-vue'
 import * as maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
-import { fenceApi, markApi, riskApi, deviceApi, portalApi, isAdmin } from '@/api'
+import { fenceApi, markApi, riskApi, deviceApi, portalApi, customerApi, isAdmin } from '@/api'
 import { TDT_MAP_STYLE, circleToPolygon } from '@/utils/mapStyle'
 
 // ── 状态 ─────────────────────────────────────────────────────────────────────
@@ -390,6 +397,8 @@ const pickingLocation = ref(false)       // 圆形围栏地图选点模式
 const fences          = ref([])
 const fenceSearch     = ref('')
 const fenceTypeFilter = ref('')
+const fenceAccountId  = ref(null)
+const accountOptions  = ref([])
 const selectedFenceIds= ref([])
 const createVisible   = ref(false)
 const form = ref({ name:'', fence_type:'circle', lat:39.9042, lng:116.4074, radius:2000, color:'#409EFF', adcode:'', provinceCode:'', cityCode:'', alarm_enter:true, alarm_exit:true, alarm_dwell:0, speed_limit:0, valid_start:'', valid_end:'' })
@@ -725,7 +734,7 @@ async function finishPolygon() {
 // ── 数据加载 ─────────────────────────────────────────────────────────────────
 async function loadFences() {
   const res = isAdmin()
-    ? await fenceApi.list({ name: fenceSearch.value, fence_type: fenceTypeFilter.value })
+    ? await fenceApi.list({ name: fenceSearch.value, fence_type: fenceTypeFilter.value, customer_id: fenceAccountId.value || undefined })
     : await portalApi.fences({ name: fenceSearch.value, fence_type: fenceTypeFilter.value })
   const newFences = res.data || []
   // 只对本次新增的围栏默认设为可见，已有围栏的显隐状态保持不变
@@ -1207,6 +1216,13 @@ function onDrawModeChange() {
 
 // ── 生命周期 ──────────────────────────────────────────────────────────────────
 onMounted(async () => {
+  // 管理员:加载账号列表供"按账号查看围栏"下拉使用
+  if (isAdmin()) {
+    try {
+      const r = await customerApi.listAll()
+      accountOptions.value = r.data?.records || r.data || []
+    } catch (e) { accountOptions.value = [] }
+  }
   await new Promise(r => setTimeout(r, 300))
 
   map = new maplibregl.Map({

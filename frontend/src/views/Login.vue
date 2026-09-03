@@ -68,6 +68,8 @@ async function doLogin() {
         localStorage.setItem('admin_token',    res.data.token)
         localStorage.setItem('admin_username', res.data.username)
         localStorage.setItem('user_role',      'admin')
+        localStorage.setItem('menu_keys', JSON.stringify(res.data.menuKeys || null))
+        localStorage.setItem('is_super',  res.data.isSuper ? '1' : '0')
         router.push('/dashboard')
         return
       }
