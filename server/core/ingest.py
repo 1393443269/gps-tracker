@@ -147,7 +147,9 @@ def _do_db_write(rows, dev_snapshot):
                         # last_seen 与 last_location_time 一并刷成本次定位时间(d[4])：定位也是一次上报，
                         # 通信活性时间戳同步前移，离线扫描据此判定(见 _offline_scan_once)。
                         # 定位即"活着"的强信号:presence_state 复位 online、清 offline_reason
-                        # (休眠/离线设备一旦重新上报即自动恢复在线)。仅对 status!=2(非报警态)复位。
+                        # (休眠/离线设备一旦重新上报即自动恢复在线)。status 仍取本批快照 d[5]:
+                        # 若该批是报警定位(status=2),presence_state 虽置 online,但前端按 status=2
+                        # 优先显示"报警",不影响呈现。
                         conn.executemany(
                             "UPDATE device SET last_lat=?,last_lng=?,last_speed=?,"
                             "last_location_time=?,status=?,updated_at=?,last_seen=?,"
@@ -522,20 +524,32 @@ _OFFLINE_DYN_MAX_SEC     = int(os.environ.get('OFFLINE_DYN_MAX_SEC', '10800'))  
 # ── 四态判定(在线/休眠/离线/停用):休眠识别 + 失联原因推断 ─────────────────────────
 # G618 休眠窗口:超过离线阈值、但未超「休眠最长时限」且设备健康(电量非低)时,判"休眠"而非离线。
 # 休眠也有上限——超过则复核为失联,避免"永久休眠"变相成僵尸在线。
-_SLEEP_MAX_SEC          = int(os.environ.get('SLEEP_MAX_SEC', '10800'))  # 休眠最长时限,默认 3 小时
+# 注意:休眠上限必须严格 > 离线动态阈值上限(_OFFLINE_DYN_MAX_SEC),否则当某设备的动态离线阈值
+# 被夹到上限时,休眠窗口 [_cut(SLEEP_MAX), _cut(thr)) 会塌缩为空,长上报间隔的 G618 永远进不了休眠。
+# 默认 6 小时,明显大于离线动态上限默认 3 小时。
+_SLEEP_MAX_SEC          = int(os.environ.get('SLEEP_MAX_SEC', '21600'))  # 休眠最长时限,默认 6 小时
 _SLEEP_LOW_BAT_PCT      = int(os.environ.get('SLEEP_LOW_BAT_PCT', '15')) # 低于此电量不认为在健康休眠
+
+# 迁移推断的时间窗:只有「失联前最近这段时间内」下发过改IP才算迁移证据,
+# 避免设备数月前改过一次IP、今天因没电离线也被误标"已迁移"。
+_MIGRATE_LOOKBACK_SEC = int(os.environ.get('MIGRATE_LOOKBACK_SEC', '86400'))  # 默认 24 小时
 
 def _infer_offline_reason(phone, last_bat):
     """置离线时联查已有数据推断失联原因(第二期)。只读,不改任何状态。
     返回枚举:'migrated'/'battery_drain'/'net_lost'/'unknown'。
     (充电关机 charge_off、主动/低电关机由 0x21 关机报文分支即时判定,不在超时兜底里推断。)
-    依据优先级:下发过改IP(强证据) > 电量耗尽 > 电量健康(疑似断网) > 未知。"""
+    依据优先级:近期下发过改IP(强证据) > 电量耗尽 > 电量健康(疑似断网) > 未知。"""
     try:
-        # ① 迁移:失联前平台下发过改 IP 类指令(command_history 里含 IP/set_server_ip/域名设置)
+        # ① 迁移:失联前「近期」下发过改 IP/服务器地址类指令才算证据。
+        #   匹配收紧到明确的改IP指令特征:天禧文本指令 '*IP,'(设服务器IP)、
+        #   G618 的 set_server_ip 命令名;去掉过宽的 '%C3%'/'%IP%' 子串匹配(易误命中)。
+        #   加 created_at 时间窗,只看失联前 _MIGRATE_LOOKBACK_SEC 内的指令。
+        _since = (datetime.now() - timedelta(seconds=_MIGRATE_LOOKBACK_SEC)).strftime('%Y-%m-%d %H:%M:%S')
+        # G618 改IP存命令名 'set_server_ip';天禧存 'set_ip *IP,1.2.3.4,port#'。
         row = db_query_one(
-            "SELECT COUNT(*) AS n FROM command_history WHERE phone=? "
-            "AND (command LIKE '%IP%' OR command LIKE '%set_server%' OR command LIKE '%域名%' "
-            "OR command LIKE '%C3%')", (phone,))
+            "SELECT COUNT(*) AS n FROM command_history WHERE phone=? AND created_at >= ? "
+            "AND (command LIKE '%set_server_ip%' OR command LIKE '%set_ip%' OR command LIKE '%*IP,%')",
+            (phone, _since))
         if row and (row.get('n') or 0) > 0:
             return 'migrated'
     except Exception:
