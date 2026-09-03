@@ -641,9 +641,13 @@ async function openDeviceCard(phone, ll) {
   const base = rec ? rec.properties : { phone }
   if (!popup) popup = new maplibregl.Popup({ closeButton: true, maxWidth: '340px' })
   popup.setLngLat(ll).setHTML(popupHtml(base)).addTo(map)
-  // 异步回填设备档案(JOIN 客户,带型号/联系方式/电量/最后通信)
+  // 异步回填设备档案(JOIN 客户,带型号/联系方式/电量/信号/定位方式/地址/最后通信)。
+  // 按身份分流:管理端走 /devices/with_customer,客户端走 /customer/device_list
+  // (两接口字段别名一致:real_name/contact_phone/last_signal/last_loc_type/last_address...)。
   try {
-    const res = await deviceApi.withCustomer({ imei: phone, size: 1 })
+    const res = isAdmin()
+      ? await deviceApi.withCustomer({ imei: phone, size: 1 })
+      : await portalApi.deviceList({ imei: phone, size: 1 })
     const d = (res.data?.records || [])[0]
     if (d && popup && popup.isOpen()) {
       // 字段名对齐 withCustomer 后端别名:real_name(姓名)/contact_phone(联系方式)/
