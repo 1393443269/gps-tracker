@@ -1183,6 +1183,20 @@ def handle_location(sock, phone, serial, body):
         except Exception as e:
             log.warning("[808] 电量落库失败 phone=%s err=%s", canonical, e)
 
+    # 信号强度(0x30)+定位方式(GPS)+逆地理地址:供设备卡片显示,与 G618 路径对齐。
+    _sig808 = loc.get('signal')
+    if _sig808 is not None:
+        # 808 的 0x30 是无线信号强度值。天禧按 0-100 上报则直接用;若是 0-31 CSQ 则换算。
+        _sigpct = _sig808 if _sig808 > 31 else round(_sig808 / 31 * 100) if _sig808 >= 0 else None
+        if _sigpct is not None:
+            db_exec("UPDATE device SET last_signal=? WHERE phone=?",
+                    (max(0, min(100, _sigpct)), canonical))
+    # 808 位置基本信息即 GPS 定位 → last_loc_type=0(GPS);并逆地理编码存地址(限流)
+    _lat808 = loc.get('lat'); _lng808 = loc.get('lng')
+    if _lat808 and _lng808 and not (_lat808 == 0 and _lng808 == 0):
+        db_exec("UPDATE device SET last_loc_type=0 WHERE phone=?", (canonical,))
+        _update_address(canonical, _lat808, _lng808)
+
     # 从位置报文附加字段拿到设备真实 IMEI(0xF6)/ICCID(0xF1)：设备注册头里的 phone 可能只是
     # 终端ID(非IMEI)，真实身份走位置附加字段上报。只在值有效且与库中不同时更新(避免每帧写库)，
     # 并自动登记/更新 SIM 卡表(iccid 唯一，存在则仅关联设备，不覆盖人工维护的运营商/套餐等)。

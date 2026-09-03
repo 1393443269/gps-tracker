@@ -277,6 +277,8 @@ def parse_location_body(body: bytes):
         battery_data = None    # 0xFB 电池
         iccid_data = None      # 0xF1 ICCID(SIM卡)
         imei_data = None       # 0xF6 IMEI(设备身份)
+        signal_data = None     # 0x30 无线通信网络信号强度
+        gnss_sat = None        # 0x31 GNSS 定位卫星数
         extra_raw = {}         # 所有附加项原始数据
         offset = 28
         while offset + 2 <= len(body):
@@ -306,6 +308,10 @@ def parse_location_body(body: bytes):
                 # 协议: 8字节,第1位nibble为0,后面15位为IMEI的16进制(BCD)数据
                 imei_data = ''.join(f'{b:02x}' for b in item_data)
                 imei_data = imei_data.lstrip('0')[:15] if imei_data else None
+            elif item_id == 0x30 and item_len == 1:  # 无线通信网络信号强度(BYTE)
+                signal_data = item_data[0]
+            elif item_id == 0x31 and item_len == 1:  # GNSS 定位卫星数(BYTE)
+                gnss_sat = item_data[0]
             offset += item_len
 
         return {
@@ -325,6 +331,8 @@ def parse_location_body(body: bytes):
             'battery_data': battery_data,
             'iccid':        iccid_data,
             'imei':         imei_data,
+            'signal':       signal_data,
+            'gnss_sat':     gnss_sat,
             'extra_raw':    extra_raw,
         }
     except Exception:

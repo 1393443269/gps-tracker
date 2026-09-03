@@ -974,7 +974,7 @@ def list_devices():
     total   = db_scalar(f"SELECT COUNT(*) {base} {where}", params)
     records = db_query(
         f"SELECT device.*, r.name AS role_name, r.color AS role_color, "
-        f"r.icon_type AS role_icon, c.name AS customer_name {base} "
+        f"r.icon_type AS role_icon, c.name AS customer_name, c.contact AS real_name {base} "
         f"{where} ORDER BY device.updated_at DESC LIMIT ? OFFSET ?",
         params + [size, offset])
     # auth_code 是设备 JT808 鉴权码(内部凭据),与单设备详情接口一致,列表也不得外泄,

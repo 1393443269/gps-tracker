@@ -147,7 +147,7 @@ const onlineDevices = computed(() => {
   const phones  = new Set(withLoc.map(d => d.phone))
   const noLoc   = allOnlineDevices.value
     .filter(d => !phones.has(String(d.phone)))
-    .map(d => ({ phone: String(d.phone), name: d.name || '', alarm: d.status === 2, hasLoc: false,
+    .map(d => ({ phone: String(d.phone), name: d.real_name || d.phone || '', alarm: d.status === 2, hasLoc: false,
                  roleName: d.role_name, roleColor: d.role_color, roleIcon: d.role_icon }))
   return [...withLoc, ...noLoc]
 })
@@ -161,7 +161,8 @@ function normalizeDevice(d) {
   const hasLoc = !!(d.last_lat && d.last_lng)
   return {
     phone,
-    name:       d.name || '',
+    // 列表显示优先绑定人姓名(real_name),无则回退设备号/IMEI(不再显示自动生成的"型号-后6位")
+    name:       d.real_name || d.phone || d.imei || '',
     status:     d.status,                 // 0 离线 / 1 在线 / 2 报警
     customerId: d.customer_id != null ? String(d.customer_id) : null,
     hasLoc,
