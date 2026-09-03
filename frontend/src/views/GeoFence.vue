@@ -1231,7 +1231,7 @@ onMounted(async () => {
     center: [104.19, 35.86],
     zoom: 5,
   })
-  map.addControl(new maplibregl.NavigationControl(), 'top-left')
+  map.addControl(new maplibregl.NavigationControl(), 'bottom-left')  // 左下角,避免被左上角围栏面板遮挡缩放按钮
 
   map.on('load', async () => {
     // 地图每次重绘时同步更新围栏 canvas（跟随移动/缩放）

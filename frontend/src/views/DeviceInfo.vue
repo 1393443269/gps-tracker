@@ -307,7 +307,9 @@ async function loadData(p = page.value) {
         })
       : await portalApi.deviceList({
           page: p, size: pageSize.value,
-          keyword: queryImei.value.trim() || undefined,
+          customer_id:    queryCustomerId.value ?? undefined,
+          terminal_model: queryModel.value || undefined,
+          imei:           queryImei.value.trim() || undefined,
         })
     list.value  = res.data?.records || []
     total.value = res.data?.total   || 0
@@ -319,23 +321,26 @@ async function loadData(p = page.value) {
 async function loadCustomers() {
   if (customerList.value.length) return
   try {
-    const res = await customerApi.listAll()
-    customerList.value = res.data?.records || []
+    const res = isAdmin() ? await customerApi.listAll() : await portalApi.subCustomers.list({ size: 500 })
+    customerList.value = res.data?.records || res.data || []
     customerTree.value = buildCustomerTree(customerList.value)
   } catch {}
 }
 
 async function loadRoles() {
   try {
-    const res = await roleApi.list()
-    roleList.value = res.data?.records || []
+    const res = isAdmin() ? await roleApi.list() : await portalApi.roles.list()
+    roleList.value = res.data?.records || res.data || []
   } catch {}
 }
 
 async function loadModelOptions() {
   try {
-    const res = await deviceApi.exportAll()
-    const models = (res.data?.records || []).map(r => r.terminal_model).filter(Boolean)
+    const res = isAdmin()
+      ? await deviceApi.exportAll()
+      : await portalApi.deviceList({ page: 1, size: 1000 })
+    const recs = res.data?.records || res.data || []
+    const models = recs.map(r => r.terminal_model).filter(Boolean)
     modelOptions.value = [...new Set(models)].sort()
   } catch {}
 }
