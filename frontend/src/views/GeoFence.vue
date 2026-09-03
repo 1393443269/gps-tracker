@@ -357,12 +357,11 @@
       </div>
       <el-checkbox-group v-else v-model="selectedPhones">
         <div v-for="d in allDevices" :key="d.phone"
-          style="padding:6px 0;border-bottom:1px solid #f5f5f5;display:flex;align-items:center;gap:8px;">
+          style="padding:3px 0;border-bottom:1px solid #f5f5f5;display:flex;align-items:center;gap:8px;">
           <el-checkbox :value="d.phone" style="margin:0;" />
-          <div style="flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.5;">
-            <span style="font-size:13px;font-weight:500;">{{ d.name || '未命名' }}</span>
-            <span style="font-size:11px;color:#909399;">{{ d.phone }}</span>
-          </div>
+          <!-- 单行显示:优先绑定人姓名,无则设备号(省空间、设备多时好找) -->
+          <span style="flex:1;min-width:0;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+                :title="d.real_name || d.phone">{{ d.real_name || d.phone }}</span>
         </div>
       </el-checkbox-group>
       <div style="margin-top:12px;font-size:12px;color:#909399;">
