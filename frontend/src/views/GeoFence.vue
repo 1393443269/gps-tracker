@@ -359,9 +359,9 @@
         <div v-for="d in allDevices" :key="d.phone"
           style="padding:6px 0;border-bottom:1px solid #f5f5f5;display:flex;align-items:center;gap:8px;">
           <el-checkbox :value="d.phone" style="margin:0;" />
-          <div style="flex:1;min-width:0;">
-            <div style="font-size:13px;font-weight:500;">{{ d.name || '未命名' }}</div>
-            <div style="font-size:11px;color:#909399;">{{ d.phone }}</div>
+          <div style="flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.5;">
+            <span style="font-size:13px;font-weight:500;">{{ d.name || '未命名' }}</span>
+            <span style="font-size:11px;color:#909399;">{{ d.phone }}</span>
           </div>
         </div>
       </el-checkbox-group>
