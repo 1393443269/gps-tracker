@@ -144,10 +144,12 @@ def _do_db_write(rows, dev_snapshot):
                                 "speed,direction,alarm_flag,status_flag,mileage,gps_time) "
                                 "VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
                     if dev_snapshot:
+                        # last_seen 与 last_location_time 一并刷成本次定位时间(d[4])：定位也是一次上报，
+                        # 通信活性时间戳同步前移，离线扫描据此判定(见 _offline_scan_once)。
                         conn.executemany(
                             "UPDATE device SET last_lat=?,last_lng=?,last_speed=?,"
-                            "last_location_time=?,status=?,updated_at=? WHERE phone=?",
-                            [(d[1],d[2],d[3],d[4],d[5],d[6],d[0]) for d in dev_snapshot])
+                            "last_location_time=?,status=?,updated_at=?,last_seen=? WHERE phone=?",
+                            [(d[1],d[2],d[3],d[4],d[5],d[6],d[4],d[0]) for d in dev_snapshot])
                     conn.commit()
                 finally:
                     conn.close()
@@ -506,32 +508,72 @@ OFFLINE_TIMEOUT_MIN       = int(os.environ.get('OFFLINE_TIMEOUT_MIN', '15'))
 OFFLINE_TIMEOUT_SLEEP_MIN = int(os.environ.get('OFFLINE_TIMEOUT_SLEEP_MIN', '60'))
 _OFFLINE_SCAN_INTERVAL    = int(os.environ.get('OFFLINE_SCAN_INTERVAL', '120'))  # 扫描周期(秒)
 
+# 动态阈值参数：离线判定时长 = 期望上报间隔 × 倍数 + 固定冗余。
+# 允许设备偶尔漏 1~2 个上报周期(丢包/短暂弱网)不被误判离线；冗余吸收网络/调度抖动。
+_OFFLINE_INTERVAL_FACTOR = float(os.environ.get('OFFLINE_INTERVAL_FACTOR', '3'))   # 容忍漏报周期数
+_OFFLINE_INTERVAL_GRACE  = int(os.environ.get('OFFLINE_INTERVAL_GRACE_SEC', '120'))  # 固定冗余(秒)
+# 动态阈值的安全区间：避免 expected_interval_sec 异常小/大时把阈值算到离谱。
+_OFFLINE_DYN_MIN_SEC     = int(os.environ.get('OFFLINE_DYN_MIN_SEC', '300'))    # 阈值下限 5 分钟
+_OFFLINE_DYN_MAX_SEC     = int(os.environ.get('OFFLINE_DYN_MAX_SEC', '10800'))  # 阈值上限 3 小时
+
 def _offline_scan_once():
-    """把超过静默阈值仍无上报的在线设备置离线。返回置离线的设备数。
-    last_location_time 为 'YYYY-MM-DD HH:MM:SS' 字符串，直接字符串边界比较。"""
+    """把超过静默阈值仍无「任何上报」的在线设备置离线。返回置离线的设备数。
+
+    判定字段用 last_seen(最后一次收到任意报文：注册/鉴权/心跳/定位/G618/MQTT)，
+    而非 last_location_time(仅定位刷新)——否则"发心跳但暂无定位"的设备会被反复误判离线。
+    存量设备 last_seen 可能为空，用 COALESCE(last_seen, last_location_time) 平滑过渡。
+
+    阈值分两档并存：
+      ① 动态档：设备有 expected_interval_sec(>0) 时，阈值 = 间隔×倍数+冗余(再夹到安全区间)，
+         每台设备按自己的真实上报节奏判定，两台节奏差几十倍的设备不再共用一个阈值。
+      ② 静态档：无 expected_interval_sec 的老设备，回退按型号名分档(G618 宽松/其余收紧)，
+         与历史行为保持一致，保证平滑升级。
+    """
     now = datetime.now()
-    cut_normal = (now - timedelta(minutes=OFFLINE_TIMEOUT_MIN)).strftime('%Y-%m-%d %H:%M:%S')
-    cut_sleep  = (now - timedelta(minutes=OFFLINE_TIMEOUT_SLEEP_MIN)).strftime('%Y-%m-%d %H:%M:%S')
     stamp = now.strftime('%Y-%m-%d %H:%M:%S')
-    # G618 类（短连接+休眠）用宽松阈值；其余设备用收紧阈值。仅动 status=1 的在线设备。
-    # last_location_time 为空的设备（从未上报）不动，避免刚建档未通信就被判离线。
-    _cond = ("status=1 AND last_location_time IS NOT NULL AND last_location_time <> '' "
-             "AND ( (UPPER(COALESCE(terminal_model,'')) LIKE '%G618%' AND last_location_time < ?) "
-             "   OR (UPPER(COALESCE(terminal_model,'')) NOT LIKE '%G618%' AND last_location_time < ?) )")
+    def _cut(sec):
+        return (now - timedelta(seconds=sec)).strftime('%Y-%m-%d %H:%M:%S')
+
+    # last_seen 是字符串时间戳，且 SQLite/PG 的时间运算方言不同，故不在 SQL 里做逐行
+    # "now - expected×factor" 减法，而是把候选在线设备读到 Python 侧按各自阈值判定(设备量小，可行)。
+    ts_col = "COALESCE(last_seen, last_location_time)"
+    base_cond = (f"status=1 AND {ts_col} IS NOT NULL AND {ts_col} <> ''")
     total = 0
     try:
-        # db_exec 不返回行数，故先 COUNT 拿到将置离线的数量(仅用于日志)，再 UPDATE。
-        row = db_query_one(f"SELECT COUNT(*) AS n FROM device WHERE {_cond}", (cut_sleep, cut_normal))
-        total = (row.get('n') if row else 0) or 0
-        if total:
-            db_exec(f"UPDATE device SET status=0, offline_time=?, updated_at=? WHERE {_cond}",
-                    (stamp, stamp, cut_sleep, cut_normal))
+        rows = db_query(
+            f"SELECT phone, terminal_model, expected_interval_sec, {ts_col} AS ts "
+            f"FROM device WHERE {base_cond}")
+        offline_phones = []
+        for r in rows:
+            exp = r.get('expected_interval_sec')
+            if exp and exp > 0:
+                # 动态档：间隔×倍数+冗余，夹到安全区间
+                thr = int(exp * _OFFLINE_INTERVAL_FACTOR + _OFFLINE_INTERVAL_GRACE)
+                thr = max(_OFFLINE_DYN_MIN_SEC, min(_OFFLINE_DYN_MAX_SEC, thr))
+            else:
+                # 静态档：按型号名回退(与历史一致)
+                model = (r.get('terminal_model') or '').upper()
+                mins = OFFLINE_TIMEOUT_SLEEP_MIN if 'G618' in model else OFFLINE_TIMEOUT_MIN
+                thr = mins * 60
+            if (r.get('ts') or '') < _cut(thr):
+                offline_phones.append(r['phone'])
+        if offline_phones:
+            # 分批 UPDATE，避免 IN 列表过长；仅动仍为 status=1 的设备(防扫描期间设备刚上线又被误置)
+            for i in range(0, len(offline_phones), 500):
+                chunk = offline_phones[i:i + 500]
+                ph = ','.join(['?'] * len(chunk))
+                db_exec(f"UPDATE device SET status=0, offline_time=?, updated_at=? "
+                        f"WHERE status=1 AND phone IN ({ph})",
+                        (stamp, stamp, *chunk))
+            total = len(offline_phones)
     except Exception as e:
         log.error("[离线扫描] 置离线失败: %s", e)
         return 0
     if total:
-        log.info("[离线扫描] 已将 %d 台超时未上报的设备置离线(持续型阈值%d分/休眠型阈值%d分)",
-                 total, OFFLINE_TIMEOUT_MIN, OFFLINE_TIMEOUT_SLEEP_MIN)
+        log.info("[离线扫描] 已将 %d 台超时未上报的设备置离线(动态档=期望间隔×%.1f+%d秒;"
+                 "静态档=持续型%d分/休眠型%d分)",
+                 total, _OFFLINE_INTERVAL_FACTOR, _OFFLINE_INTERVAL_GRACE,
+                 OFFLINE_TIMEOUT_MIN, OFFLINE_TIMEOUT_SLEEP_MIN)
     return total
 
 
@@ -896,20 +938,24 @@ def handle_register(sock, phone, serial, body):
         # auth_code 持久化在设备侧,若重连时又发注册而平台刷新了 auth_code,设备存的旧码
         # 会与库里对不上,导致后续鉴权永久失败、设备死循环重连。仅原码为空时才补一个。
         auth_code = existing.get('auth_code') or uuid.uuid4().hex[:8].upper()
+        # 注册也是一次通信：刷 last_seen(状态维持原逻辑，待鉴权成功再置在线，避免未鉴权就显示在线)
         db_exec(
             "UPDATE device SET manufacturer=?,terminal_model=?,terminal_id=?,"
-            "plate_no=?,plate_color=?,auth_code=?,updated_at=? WHERE phone=?",
+            "plate_no=?,plate_color=?,auth_code=?,updated_at=?,last_seen=? WHERE phone=?",
             (info.get('manufacturer'), info.get('terminal_model'), info.get('terminal_id'),
-             plate_no_store, info.get('plate_color'), auth_code, now, canonical_phone)
+             plate_no_store, info.get('plate_color'), auth_code, now, now, canonical_phone)
         )
     else:
         auth_code = uuid.uuid4().hex[:8].upper()   # 首次注册才生成新鉴权码
-        # org_id 显式写 1（根组织）；管理员可在设备管理界面手动迁移到子组织
+        # org_id 显式写 1（根组织）；管理员可在设备管理界面手动迁移到子组织。
+        # last_seen 记为本次注册时间；expected_interval_sec 预置 180——JT808 要求心跳间隔<180s
+        # (协议 2.3)，持续上报设备据此推算离线阈值(见 _offline_scan_once)。
         db_exec(
             "INSERT INTO device (phone,manufacturer,terminal_model,terminal_id,"
-            "plate_no,plate_color,auth_code,status,org_id) VALUES (?,?,?,?,?,?,?,0,1)",
+            "plate_no,plate_color,auth_code,status,org_id,last_seen,expected_interval_sec) "
+            "VALUES (?,?,?,?,?,?,?,0,1,?,180)",
             (canonical_phone, info.get('manufacturer'), info.get('terminal_model'),
-             info.get('terminal_id'), plate_no_store, info.get('plate_color'), auth_code)
+             info.get('terminal_id'), plate_no_store, info.get('plate_color'), auth_code, now)
         )
 
     # 关键:按 canonical(device 表主键 = 下发时用的 phone)登记会话,否则用 IMEI 注册的设备
@@ -949,7 +995,7 @@ def handle_auth(sock, phone, serial, body):
         # 先应答设备（不被数据库写锁阻塞，避免高并发下设备超时断连），再异步更新状态
         sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0102, 0))
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        db_exec("UPDATE device SET status=1, online_time=? WHERE phone=?", (now, canonical))
+        db_exec("UPDATE device SET status=1, online_time=?, last_seen=? WHERE phone=?", (now, now, canonical))
         # 按 canonical 登记会话(设备可能只发鉴权不发注册),保证指令下发能按 device 表 phone 命中
         if canonical:
             with sessions_lock:
@@ -974,7 +1020,8 @@ def handle_heartbeat(sock, phone, serial):
     # 先回心跳应答再更新状态，避免应答被数据库写锁阻塞
     sock.sendall(p.build_generic_resp(phone, next_serial(), serial, 0x0002, 0))
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    db_exec("UPDATE device SET status=1, online_time=? WHERE phone=?", (now, canonical))
+    # 心跳只刷通信活性(last_seen)与在线态，不动 last_location_time(前端"最后定位时间"保持真实)
+    db_exec("UPDATE device SET status=1, online_time=?, last_seen=? WHERE phone=?", (now, now, canonical))
     log.debug("[808] 心跳: phone=%s", canonical)
 
 
@@ -1214,11 +1261,14 @@ def handle_g618g_frame(conn, frame, phone_holder):
         # 设备不存在则自动创建
         row = db_query_one("SELECT id FROM device WHERE phone=?", (imei,))
         if not row:
+            # 建档即写 online_time/last_seen/期望上报间隔：G618G 默认 10 分钟一次定位(协议 2.2)，
+            # expected_interval_sec 预置 600，离线阈值据此动态推算(见 _offline_scan_once)。
             db_exec("INSERT INTO device (phone,name,manufacturer,terminal_model,status,"
-                    "org_id,lifecycle,created_at,updated_at) VALUES (?,?,?,?,1,1,1,?,?)",
-                    (imei, 'G618G-'+imei[-6:], 'OFERT', 'G618G', now, now))
+                    "org_id,lifecycle,online_time,last_seen,expected_interval_sec,created_at,updated_at) "
+                    "VALUES (?,?,?,?,1,1,1,?,?,600,?,?)",
+                    (imei, 'G618G-'+imei[-6:], 'OFERT', 'G618G', now, now, now, now))
         else:
-            db_exec("UPDATE device SET status=1,online_time=?,updated_at=? WHERE phone=?", (now, now, imei))
+            db_exec("UPDATE device SET status=1,online_time=?,last_seen=?,updated_at=? WHERE phone=?", (now, now, now, imei))
         # 回复 F1（时间戳用当前秒）
         import time as _t
         conn.sendall(g618.build_login_reply(int(_t.time())))
@@ -1233,6 +1283,8 @@ def handle_g618g_frame(conn, frame, phone_holder):
         conn.sendall(g618.build_heartbeat_reply())
         imei = phone_holder[0]
         if imei:
+            # 心跳即通信活性：无条件刷 last_seen + 置在线(电量可能为空但设备确实活着)
+            db_exec("UPDATE device SET status=1,online_time=?,last_seen=? WHERE phone=?", (now, now, imei))
             # 电量存两处：device.last_battery 存实时值(供列表/详情直接读)，
             # sensor_data 存历史(供以后画电量曲线)。battery_pct 可能为 None(短心跳payload)，判空再存。
             battery_pct = r.get('battery_pct')
@@ -1400,6 +1452,22 @@ def handle_g618g_frame(conn, frame, phone_holder):
                         (did, imei, lat, lng, 0, 0, 0, 0, 5, None, rt),
                         (imei, lat, lng, 0, rt, 1, now)
                     )
+
+    elif typ == 'dev_status':      # 0xE9 设备状态：带真实上报频率(分钟)，回写期望间隔用于动态离线阈值
+        imei = phone_holder[0]
+        if imei:
+            loc_freq = r.get('loc_freq')   # 定位上报频率，单位分钟
+            # 频率合法(1~1440 分钟)才回写：设备实际配置的上报节奏 → expected_interval_sec(秒)，
+            # 离线扫描据此为这台设备算专属阈值(见 _offline_scan_once 动态档)。同时刷 last_seen。
+            if isinstance(loc_freq, int) and 1 <= loc_freq <= 1440:
+                db_exec("UPDATE device SET status=1,online_time=?,last_seen=?,"
+                        "expected_interval_sec=? WHERE phone=?",
+                        (now, now, loc_freq * 60, imei))
+                log.info("[G618G] 设备状态: IMEI=%s 定位上报频率=%d分钟(已更新离线阈值基准)",
+                         imei, loc_freq)
+            else:
+                db_exec("UPDATE device SET status=1,online_time=?,last_seen=? WHERE phone=?",
+                        (now, now, imei))
 
     return typ
 
@@ -1583,9 +1651,12 @@ def _mqtt_on_message(client, userdata, msg):
             # 数据静默丢失。与 G618G 自动建档一致:未知设备自动建档(org_id=1,来源标记 MQTT),
             # 管理员可在设备管理界面迁移组织。broker 已启用密码认证,能连入的即可信来源。
             _now0 = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            # MQTT 设备上报频率未知，expected_interval_sec 预置 300(5 分钟)作宽松兜底；
+            # last_seen 记建档时间(下一行 enqueue_location 会随定位再刷一次)。
             db_exec("INSERT INTO device (phone,name,manufacturer,terminal_model,status,"
-                    "org_id,lifecycle,created_at,updated_at) VALUES (?,?,?,?,1,1,1,?,?)",
-                    (phone, 'MQTT-' + phone[-6:], 'MQTT', 'MQTT', _now0, _now0))
+                    "org_id,lifecycle,last_seen,expected_interval_sec,created_at,updated_at) "
+                    "VALUES (?,?,?,?,1,1,1,?,300,?,?)",
+                    (phone, 'MQTT-' + phone[-6:], 'MQTT', 'MQTT', _now0, _now0, _now0))
             log.info("[MQTT] 未知设备 phone=%s 已自动建档", phone)
             device = db_query_one("SELECT id FROM device WHERE phone=?", (phone,))
             if not device:

@@ -611,7 +611,16 @@ def init_db():
                  "remark TEXT DEFAULT ''",
                  "last_battery INTEGER DEFAULT NULL",       # 最新电量百分比(0-100)，设备心跳带出
                  "last_battery_time TEXT DEFAULT NULL",     # 电量上报时间
-                 "low_bat_mode INTEGER DEFAULT 0"]:         # 0=正常频率, 1=已切低电量频率（防重复下发标志）
+                 "low_bat_mode INTEGER DEFAULT 0",          # 0=正常频率, 1=已切低电量频率（防重复下发标志）
+                 # ── 在线/离线判定专用字段 ──────────────────────────────────────
+                 # last_seen：设备最后一次收到「任何上报」(注册/鉴权/心跳/定位/G618/MQTT)的时间。
+                 #   与 last_location_time(仅定位刷新，前端显示"最后定位时间")分离：判在线看通信活性，
+                 #   显示看最后定位，两者不再互相打架(修复"发心跳但无定位→被误判离线"的闪烁)。
+                 "last_seen TEXT DEFAULT NULL",
+                 # expected_interval_sec：该设备的「期望上报间隔」(秒)，离线阈值 = 本值×倍数+冗余。
+                 #   建档按型号给默认值；G618G 的 0xE9 状态报文带真实频率时会回写更新。
+                 #   NULL/<=0 时离线扫描回退到按型号名的静态阈值。
+                 "expected_interval_sec INTEGER DEFAULT NULL"]:
         try:
             conn.execute(f"ALTER TABLE device ADD COLUMN {_col}")
             conn.commit()
