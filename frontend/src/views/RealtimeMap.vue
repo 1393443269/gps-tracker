@@ -66,7 +66,7 @@
             :key="item.phone"
             class="device-item"
             :class="{ 'no-loc': !item.hasLoc }"
-            @click="item.hasLoc ? flyTo(item.phone) : null"
+            @click="onListItemClick(item)"
           >
             <span class="dot" :style="{ background: dotColor(item) }"></span>
             <span class="devname">{{ item.name || item.phone || '—' }}</span>
@@ -778,6 +778,22 @@ function flyTo(phone) {
   const rec = featureStore[String(phone)]
   if (rec) {
     map.flyTo({ center: [rec.lng, rec.lat], zoom: 15 })
+  }
+}
+
+// 点击左侧列表项:有坐标→飞到该点并弹信息卡片;无坐标→提示暂无定位但仍弹卡片
+function onListItemClick(item) {
+  const rec = featureStore[String(item.phone)]
+  if (rec) {
+    const ll = [rec.lng, rec.lat]
+    map.flyTo({ center: ll, zoom: 15 })
+    // 飞行结束后再开卡片,定位更准
+    map.once('moveend', () => openDeviceCard(item.phone, ll))
+  } else {
+    // 无坐标设备:没有地图点位,提示并在地图中心弹卡片(仍可看档案/进功能页)
+    ElMessage.info('该设备暂无定位坐标')
+    const ctr = map.getCenter()
+    openDeviceCard(item.phone, [ctr.lng, ctr.lat])
   }
 }
 
