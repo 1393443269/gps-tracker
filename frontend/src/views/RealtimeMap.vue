@@ -906,15 +906,8 @@ function connectSocket() {
     })
   })
 
-  socket.on('alarm', (data) => {
-    ElNotification({
-      title:   `⚠ 报警: ${_esc(data.phone || '未知设备')}`,
-      message: `${_esc(data.alarmDesc || '报警')} | ${_esc(data.time || '')}`,
-      dangerouslyUseHTMLString: false,
-      type:    'error',
-      duration: 6000,
-    })
-  })
+  // 报警提示卡已提升到全局布局层(Layout.vue)统一处理,任何页面都能收到,
+  // 此处不再重复弹卡,避免停留在地图页时报警弹两次。地图页仍靠 location_update 渲染点位。
 }
 
 // ── 生命周期 ──────────────────────────────────────────────────────────────────

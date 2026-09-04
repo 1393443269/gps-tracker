@@ -150,7 +150,8 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElNotification } from 'element-plus'
+import { io } from 'socket.io-client'
 import { deviceApi, alarmApi, portalApi, authApi, platformApi, isAdmin as checkAdmin } from '@/api'
 import {
   DataBoard, MapLocation, Aim, Position, Search,
@@ -267,12 +268,52 @@ async function refreshStats() {
   } catch {}
 }
 
+// ── 全局报警实时提示(常驻 WebSocket,任何页面都能收到) ─────────────────────────
+// 原来只有实时地图页监听报警,离开地图页就收不到。此处提到全局布局层:
+// 收到报警 → 右上角弹提示卡(可点跳报警管理)+ 刷新红点数 + 响提示音。
+let alarmSocket = null
+function _beep() {
+  // 用 WebAudio 生成一声短促提示音,无需音频文件
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext
+    if (!Ctx) return
+    const ac = new Ctx()
+    const osc = ac.createOscillator(); const gain = ac.createGain()
+    osc.type = 'sine'; osc.frequency.value = 880
+    gain.gain.setValueAtTime(0.001, ac.currentTime)
+    gain.gain.exponentialRampToValueAtTime(0.3, ac.currentTime + 0.02)
+    gain.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.35)
+    osc.connect(gain); gain.connect(ac.destination)
+    osc.start(); osc.stop(ac.currentTime + 0.36)
+    osc.onended = () => { try { ac.close() } catch {} }
+  } catch {}
+}
+function _esc(s) { return String(s ?? '').replace(/[<>&]/g, m => ({ '<':'&lt;', '>':'&gt;', '&':'&amp;' }[m])) }
+function connectAlarmSocket() {
+  const token = localStorage.getItem('admin_token') || localStorage.getItem('customer_token') || ''
+  alarmSocket = io(window.location.origin, { transports: ['websocket', 'polling'], auth: { token } })
+  alarmSocket.on('alarm', (data) => {
+    ElNotification({
+      title: `⚠ 报警：${_esc(data.phone || '未知设备')}`,
+      message: `${_esc(data.alarmDesc || '报警')}｜${_esc(data.time || '')}（点击查看）`,
+      type: 'error', duration: 8000, position: 'top-right',
+      onClick: () => { router.push('/alarms'); },
+    })
+    _beep()
+    refreshStats()   // 立即刷新顶部/菜单未处理报警数
+  })
+}
+
 onMounted(() => {
   loadPlatform()
   refreshStats()
   timer = setInterval(refreshStats, 30000)
+  connectAlarmSocket()
 })
-onUnmounted(() => clearInterval(timer))
+onUnmounted(() => {
+  clearInterval(timer)
+  if (alarmSocket) { alarmSocket.off(); alarmSocket.disconnect(); alarmSocket = null }
+})
 </script>
 
 <style scoped>
