@@ -36,7 +36,7 @@
       <el-table-column prop="description" label="角色描述" min-width="160" show-overflow-tooltip>
         <template #default="{ row }">{{ row.description || '—' }}</template>
       </el-table-column>
-      <el-table-column prop="created_at" label="创建时间" width="165" />
+      <el-table-column prop="created_at" label="创建时间" min-width="165" />
       <el-table-column label="操作" fixed="right" width="100" align="center">
         <template #default="{ row }">
           <el-button size="small" :icon="EditIcon" circle @click="openEdit(row)" />

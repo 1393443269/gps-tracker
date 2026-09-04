@@ -48,10 +48,10 @@
       @selection-change="onSelectionChange">
       <el-table-column type="selection" width="45" />
       <el-table-column type="index" label="#" width="50" />
-      <el-table-column label="设备号" width="160">
+      <el-table-column label="设备号" min-width="150">
         <template #default="{ row }"><span>{{ row.terminal_id || row.phone }}</span></template>
       </el-table-column>
-      <el-table-column label="IMEI" width="160">
+      <el-table-column label="IMEI" min-width="150">
         <template #default="{ row }">{{ row.imei || row.phone }}</template>
       </el-table-column>
       <el-table-column prop="terminal_model" label="设备型号"   width="110" />
@@ -61,7 +61,7 @@
         </template>
       </el-table-column>
       <!-- 角色名称：带颜色色块，点击可分配 -->
-      <el-table-column label="角色名称" width="150">
+      <el-table-column label="角色名称" min-width="140">
         <template #default="{ row }">
           <el-button v-if="isAdmin()" link type="primary" style="padding:0;height:auto;" @click="openRole(row)">
             <div v-if="row.role_name" style="display:flex;align-items:center;gap:6px;">
@@ -92,7 +92,7 @@
       <el-table-column prop="age"          label="年龄"       width="65" align="center">
         <template #default="{ row }">{{ row.age ?? '—' }}</template>
       </el-table-column>
-      <el-table-column prop="contact_phone" label="联系方式"  width="130" />
+      <el-table-column prop="contact_phone" label="联系方式"  min-width="130" />
       <el-table-column prop="address"      label="联系地址"   min-width="160" show-overflow-tooltip />
       <el-table-column label="备注" width="120" show-overflow-tooltip>
         <template #default="{ row }">{{ row.customer_remark || '—' }}</template>

@@ -142,11 +142,11 @@
         <span style="font-size:13px;color:#909399;">共 {{ alarmTotal }} 条</span>
       </div>
       <el-table :data="alarms" size="small" style="flex:1;" height="100%" stripe border>
-        <el-table-column label="设备号" width="140">
+        <el-table-column label="设备号" min-width="140">
           <template #default="{ row }">{{ row.terminal_id || row.phone }}</template>
         </el-table-column>
-        <el-table-column label="报警类型" prop="alarm_type_name" width="130" />
-        <el-table-column label="报警时间" prop="alarm_time"      width="160" />
+        <el-table-column label="报警类型" prop="alarm_type_name" min-width="130" />
+        <el-table-column label="报警时间" prop="alarm_time"      min-width="160" />
         <el-table-column label="位置" min-width="180">
           <template #default="{ row }">
             <span v-if="row.lat&&row.lng">{{ row.lat?.toFixed(5) }}, {{ row.lng?.toFixed(5) }}</span>
@@ -210,11 +210,11 @@
           <span style="font-size:13px;color:#909399;">共 {{ cmdHisTotal }} 条</span>
         </div>
         <el-table :data="cmdHistory" size="small" style="flex:1;" height="100%" stripe border>
-          <el-table-column label="设备"   prop="phone"       width="140" />
-          <el-table-column label="设备名称" prop="device_name" width="110" />
+          <el-table-column label="设备"   prop="phone"       min-width="140" />
+          <el-table-column label="设备名称" prop="device_name" min-width="110" />
           <el-table-column label="指令"   prop="command"     min-width="160" />
           <el-table-column label="结果"   prop="result"      width="80" />
-          <el-table-column label="时间"   prop="created_at"  width="160" />
+          <el-table-column label="时间"   prop="created_at"  min-width="160" />
         </el-table>
         <el-pagination background layout="prev,pager,next,total"
           :total="cmdHisTotal" :page-size="cmdHisPageSize"

@@ -53,7 +53,7 @@
         </template>
       </el-table-column>
       <el-table-column prop="remark" label="备注" min-width="100" />
-      <el-table-column label="操作" width="230" fixed="right">
+      <el-table-column label="操作" width="200" fixed="right">
         <template #default="{ row }">
           <div style="display:flex;gap:6px;align-items:center;flex-wrap:nowrap;">
             <el-button size="small" @click="openModal(row)">编辑</el-button>
@@ -88,7 +88,7 @@
         </template>
       </el-table-column>
       <el-table-column prop="remark" label="备注" min-width="120" />
-      <el-table-column label="操作" width="230" fixed="right">
+      <el-table-column label="操作" width="200" fixed="right">
         <template #default="{ row }">
           <div style="display:flex;gap:6px;align-items:center;flex-wrap:nowrap;">
             <el-button size="small" @click="openModal(row)">编辑</el-button>

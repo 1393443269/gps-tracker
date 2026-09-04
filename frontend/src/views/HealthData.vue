@@ -19,16 +19,16 @@
 
     <el-table :data="list" v-loading="loading" stripe border size="small">
       <el-table-column type="index" label="#" width="50" />
-      <el-table-column prop="account"      label="归属账号"  width="140">
+      <el-table-column prop="account"      label="归属账号"  min-width="130">
         <template #default="{ row }">{{ row.account || '—' }}</template>
       </el-table-column>
-      <el-table-column prop="device_name"  label="姓名"      width="130">
+      <el-table-column prop="device_name"  label="姓名"      min-width="120">
         <template #default="{ row }">{{ row.device_name || '—' }}</template>
       </el-table-column>
-      <el-table-column label="设备号" width="160">
+      <el-table-column label="设备号" min-width="150">
         <template #default="{ row }">{{ row.terminal_id || row.phone }}</template>
       </el-table-column>
-      <el-table-column label="IMEI" width="160">
+      <el-table-column label="IMEI" min-width="150">
         <template #default="{ row }">{{ row.imei || row.phone }}</template>
       </el-table-column>
       <el-table-column label="体温℃" width="80" align="center">

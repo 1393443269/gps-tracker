@@ -34,22 +34,22 @@
     <el-table ref="tableRef" :data="list" v-loading="loading" stripe border
       @selection-change="onSelectionChange">
       <el-table-column type="selection" width="45" :selectable="row => row.status === 0" />
-      <el-table-column prop="device_name" label="名称" width="150">
+      <el-table-column prop="device_name" label="名称" min-width="140">
         <template #default="{ row }">
-          <span style="white-space:nowrap;">{{ row.device_name || '—' }}</span>
+          <span style="white-space:nowrap;">{{ row.device_name || row.imei || row.phone }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="设备号" width="170">
+      <el-table-column label="设备号" min-width="150">
         <template #default="{ row }">
           <span style="white-space:nowrap;">{{ row.terminal_id || row.phone }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="IMEI" width="170">
+      <el-table-column label="IMEI" min-width="150">
         <template #default="{ row }">
           <span style="white-space:nowrap;">{{ row.imei || row.phone }}</span>
         </template>
       </el-table-column>
-      <el-table-column prop="alarm_desc" label="报警类型" width="160">
+      <el-table-column prop="alarm_desc" label="报警类型" min-width="140">
         <template #default="{ row }">
           <el-tag
             :type="row.alarm_type === 103 ? 'danger'
@@ -59,13 +59,13 @@
           >{{ row.alarm_desc }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="位置" width="220">
+      <el-table-column label="位置" min-width="180">
         <template #default="{ row }">
           <span v-if="row.lat">{{ row.lat.toFixed(5) }}, {{ row.lng.toFixed(5) }}</span>
           <span v-else style="color:#ccc;">—</span>
         </template>
       </el-table-column>
-      <el-table-column prop="alarm_time" label="报警时间" width="170" />
+      <el-table-column prop="alarm_time" label="报警时间" min-width="165" />
       <el-table-column label="状态" width="90">
         <template #default="{ row }">
           <el-tag :type="row.status === 0 ? 'danger' : 'success'" size="small">
@@ -74,7 +74,7 @@
         </template>
       </el-table-column>
       <el-table-column prop="handler"    label="处理人"   width="100" />
-      <el-table-column prop="handle_time" label="处理时间" width="170" />
+      <el-table-column prop="handle_time" label="处理时间" min-width="165" />
       <el-table-column label="操作" fixed="right" width="90">
         <template #default="{ row }">
           <el-button

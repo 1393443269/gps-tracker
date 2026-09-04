@@ -107,7 +107,7 @@
           <el-table-column prop="action"     label="操作类型" width="140" />
           <el-table-column prop="detail"     label="操作详情" min-width="240" />
           <el-table-column prop="ip"         label="IP" width="130" />
-          <el-table-column prop="created_at" label="时间" width="165" />
+          <el-table-column prop="created_at" label="时间" min-width="165" />
         </el-table>
         <el-pagination style="margin-top:14px;justify-content:flex-end;display:flex;"
           :current-page="logPage" :page-size="logSize" :total="logTotal"

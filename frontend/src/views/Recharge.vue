@@ -29,7 +29,7 @@
     </el-row>
 
     <el-table :data="list" border stripe v-loading="loading">
-      <el-table-column prop="iccid"      label="ICCID"     width="200" />
+      <el-table-column prop="iccid"      label="ICCID"     min-width="190" />
       <el-table-column label="充值金额">
         <template #default="{ row }">
           <span style="color:#67c23a;font-weight:600;">¥{{ Number(row.amount).toFixed(2) }}</span>
@@ -38,8 +38,8 @@
       <el-table-column prop="method"     label="支付方式"  width="100" />
       <el-table-column prop="plan"       label="套餐"      width="120" />
       <el-table-column prop="operator"   label="操作员"    width="100" />
-      <el-table-column prop="remark"     label="备注" />
-      <el-table-column prop="created_at" label="时间"      width="160" />
+      <el-table-column prop="remark"     label="备注" min-width="120" show-overflow-tooltip />
+      <el-table-column prop="created_at" label="时间"      min-width="160" />
     </el-table>
 
     <el-pagination

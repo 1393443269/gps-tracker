@@ -12,7 +12,7 @@
       </el-table-column>
       <el-table-column prop="enter_count" label="进入次数" width="100" align="center" />
       <el-table-column prop="exit_count"  label="离开次数" width="100" align="center" />
-      <el-table-column prop="last_time"   label="最近事件" width="165" />
+      <el-table-column prop="last_time"   label="最近事件" min-width="165" />
       <el-table-column label="操作" fixed="right" width="110" align="center">
         <template #default="{ row }">
           <el-button size="small" type="primary" plain @click="openDetail(row)">查看明细</el-button>
