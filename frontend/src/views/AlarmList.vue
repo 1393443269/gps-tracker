@@ -8,6 +8,9 @@
           <el-option label="已处理" :value="1" />
         </el-select>
       </el-form-item>
+      <el-form-item label="名称">
+        <el-input v-model="filterName" placeholder="绑定人/设备名" clearable style="width:160px;" />
+      </el-form-item>
       <el-form-item label="设备号">
         <el-input v-model="filterPhone" placeholder="设备号" clearable style="width:160px;" />
       </el-form-item>
@@ -31,17 +34,22 @@
     <el-table ref="tableRef" :data="list" v-loading="loading" stripe border
       @selection-change="onSelectionChange">
       <el-table-column type="selection" width="45" :selectable="row => row.status === 0" />
-      <el-table-column label="设备号" width="170">
+      <el-table-column prop="real_name" label="名称" min-width="140">
+        <template #default="{ row }">
+          <span style="white-space:nowrap;">{{ row.real_name || row.device_name || row.imei || row.phone }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="设备号" min-width="150">
         <template #default="{ row }">
           <span style="white-space:nowrap;">{{ row.terminal_id || row.phone }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="IMEI" width="170">
+      <el-table-column label="IMEI" min-width="150">
         <template #default="{ row }">
           <span style="white-space:nowrap;">{{ row.imei || row.phone }}</span>
         </template>
       </el-table-column>
-      <el-table-column prop="alarm_desc" label="报警类型" width="160">
+      <el-table-column prop="alarm_desc" label="报警类型" min-width="140">
         <template #default="{ row }">
           <el-tag
             :type="row.alarm_type === 103 ? 'danger'
@@ -51,13 +59,13 @@
           >{{ row.alarm_desc }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="位置" width="220">
+      <el-table-column label="位置" min-width="180">
         <template #default="{ row }">
           <span v-if="row.lat">{{ row.lat.toFixed(5) }}, {{ row.lng.toFixed(5) }}</span>
           <span v-else style="color:#ccc;">—</span>
         </template>
       </el-table-column>
-      <el-table-column prop="alarm_time" label="报警时间" width="170" />
+      <el-table-column prop="alarm_time" label="报警时间" min-width="165" />
       <el-table-column label="状态" width="90">
         <template #default="{ row }">
           <el-tag :type="row.status === 0 ? 'danger' : 'success'" size="small">
@@ -66,7 +74,7 @@
         </template>
       </el-table-column>
       <el-table-column prop="handler"    label="处理人"   width="100" />
-      <el-table-column prop="handle_time" label="处理时间" width="170" />
+      <el-table-column prop="handle_time" label="处理时间" min-width="165" />
       <el-table-column label="操作" fixed="right" width="90">
         <template #default="{ row }">
           <el-button
@@ -119,6 +127,7 @@ const pageSize     = ref(20)
 const total        = ref(0)
 const filterStatus = ref(undefined)
 const filterPhone  = ref('')
+const filterName   = ref('')
 
 const handleVisible = ref(false)
 const handleForm    = reactive({ id: null, handler: '管理员', note: '' })
@@ -143,7 +152,7 @@ async function loadData(p = page.value) {
   loading.value = true
   page.value = p
   try {
-    const params = { page: p, size: pageSize.value, status: filterStatus.value, phone: filterPhone.value || undefined }
+    const params = { page: p, size: pageSize.value, status: filterStatus.value, phone: filterPhone.value || undefined, name: filterName.value || undefined }
     const res = isAdmin() ? await alarmApi.list(params) : await portalApi.alarms(params)
     list.value  = res.data?.records || []
     total.value = res.data?.total   || 0
@@ -155,6 +164,7 @@ async function loadData(p = page.value) {
 function reset() {
   filterStatus.value = undefined
   filterPhone.value  = ''
+  filterName.value   = ''
   loadData(1)
 }
 

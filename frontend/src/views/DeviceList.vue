@@ -50,14 +50,14 @@
     <el-table ref="tableRef" :data="list" v-loading="loading" stripe border size="small"
       @selection-change="handleSelectionChange">
       <el-table-column type="selection" width="45" />
-      <el-table-column label="设备号" width="150">
+      <el-table-column label="设备号" min-width="150">
         <template #default="{ row }">{{ row.terminal_id || row.phone }}</template>
       </el-table-column>
-      <el-table-column label="IMEI" width="150">
+      <el-table-column label="IMEI" min-width="150">
         <template #default="{ row }">{{ row.imei || row.phone }}</template>
       </el-table-column>
-      <el-table-column prop="name"          label="名称"     width="120" />
-      <el-table-column prop="plate_no"      label="位置"     width="120" />
+      <el-table-column prop="name"          label="名称"     min-width="130" />
+      <el-table-column prop="plate_no"      label="位置"     min-width="120" show-overflow-tooltip />
       <el-table-column label="生命周期" width="95">
         <template #default="{ row }">
           <el-tag :type="lcTagType(row.lifecycle)" size="small">{{ lcLabel(row.lifecycle) }}</el-tag>
@@ -77,7 +77,7 @@
           <span v-else>—</span>
         </template>
       </el-table-column>
-      <el-table-column label="最新坐标" width="200">
+      <el-table-column label="最新坐标" min-width="180">
         <template #default="{ row }">
           <span v-if="row.last_lat">{{ Number(row.last_lat).toFixed(5) }}, {{ Number(row.last_lng).toFixed(5) }}</span>
           <span v-else style="color:#ccc">—</span>
@@ -88,8 +88,8 @@
           {{ row.last_speed != null ? (row.last_speed / 10).toFixed(1) + ' km/h' : '—' }}
         </template>
       </el-table-column>
-      <el-table-column prop="last_location_time" label="最新定位" width="165" />
-      <el-table-column label="所属围栏" width="130">
+      <el-table-column prop="last_location_time" label="最新定位" min-width="165" />
+      <el-table-column label="所属围栏" min-width="130">
         <template #default="{ row }">
           <span v-if="deviceFenceNames(row.phone)" style="font-size:12px;color:#409EFF">{{ deviceFenceNames(row.phone) }}</span>
           <span v-else style="color:#ccc;font-size:12px">未分配</span>

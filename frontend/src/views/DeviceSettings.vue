@@ -63,13 +63,13 @@
       @selection-change="onSelectionChange">
       <el-table-column type="selection" width="45" />
       <el-table-column type="index" label="#" width="50" />
-      <el-table-column label="设备号" width="160">
+      <el-table-column label="设备号" min-width="150">
         <template #default="{ row }"><span>{{ row.terminal_id || row.phone }}</span></template>
       </el-table-column>
-      <el-table-column label="IMEI" width="160">
+      <el-table-column label="IMEI" min-width="150">
         <template #default="{ row }">{{ row.imei || row.phone }}</template>
       </el-table-column>
-      <el-table-column prop="account"        label="归属账号"   width="130">
+      <el-table-column prop="account"        label="归属账号"   min-width="130">
         <template #default="{ row }">
           <el-tag v-if="row.account" size="small" type="success">{{ row.account }}</el-tag>
           <span v-else style="color:#ccc;font-size:12px;">—</span>
@@ -83,10 +83,10 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column prop="last_location_time" label="最后通信" width="165">
+      <el-table-column prop="last_location_time" label="最后通信" min-width="165">
         <template #default="{ row }">{{ row.last_location_time || '未通信' }}</template>
       </el-table-column>
-      <el-table-column prop="activated_at" label="激活时间" width="165">
+      <el-table-column prop="activated_at" label="激活时间" min-width="165">
         <template #default="{ row }">{{ row.activated_at || '—' }}</template>
       </el-table-column>
       <el-table-column label="操作" fixed="right" width="120" align="center">

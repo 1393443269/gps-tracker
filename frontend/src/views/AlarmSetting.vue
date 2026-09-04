@@ -21,7 +21,7 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="报警通知" width="150">
+      <el-table-column label="报警通知" min-width="150">
         <template #default="{ row }">
           <el-tag v-if="row.notify_page" size="small" style="margin-right:4px;">页面推送</el-tag>
           <el-tag v-if="row.notify_sms" size="small" type="warning">短信推送</el-tag>
@@ -29,7 +29,7 @@
         </template>
       </el-table-column>
       <el-table-column prop="ring_type" label="响铃类型" width="100" align="center" />
-      <el-table-column prop="created_at" label="创建时间" width="165" />
+      <el-table-column prop="created_at" label="创建时间" min-width="165" />
       <el-table-column label="操作" fixed="right" width="120" align="center">
         <template #default="{ row }">
           <el-button size="small" :icon="EditIcon" circle @click="openEdit(row)" />
