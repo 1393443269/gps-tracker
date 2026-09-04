@@ -48,13 +48,13 @@
     <!-- 表格 -->
     <el-table :data="list" border stripe v-loading="loading" size="small"
       :empty-text="admin ? '暂无 SIM 卡，点右上角「新增 SIM 卡」录入' : '当前账号下暂无 SIM 卡'">
-      <el-table-column label="ICCID" min-width="195">
+      <el-table-column label="ICCID" min-width="175" show-overflow-tooltip>
         <template #default="{ row }"><span v-html="highlight(row.iccid)" /></template>
       </el-table-column>
       <el-table-column prop="msisdn" label="MSISDN(号码)" min-width="130">
         <template #default="{ row }"><span v-if="row.msisdn">{{ row.msisdn }}</span><span v-else style="color:#ccc;font-size:12px;">—</span></template>
       </el-table-column>
-      <el-table-column label="IMEI" min-width="150">
+      <el-table-column label="IMEI" min-width="140" show-overflow-tooltip>
         <template #default="{ row }">{{ row.imei || row.dev_imei || row.device_phone || "—" }}</template>
       </el-table-column>
       <el-table-column label="设备号" min-width="150">

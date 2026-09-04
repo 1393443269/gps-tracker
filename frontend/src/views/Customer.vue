@@ -34,9 +34,9 @@
           <el-tag v-else size="small" type="info">顶级</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="登录账号" width="120">
+      <el-table-column label="登录账号" min-width="150">
         <template #default="{ row }">
-          <el-tag v-if="row.login_name" type="success" size="small">{{ row.login_name }}</el-tag>
+          <el-tag v-if="row.login_name" type="success" size="small" style="max-width:100%;overflow:hidden;text-overflow:ellipsis;">{{ row.login_name }}</el-tag>
           <span v-else style="color:#ccc;font-size:12px;">未设置</span>
         </template>
       </el-table-column>
@@ -69,9 +69,9 @@
       <el-table-column prop="name"    label="客户名称" min-width="130" />
       <el-table-column prop="contact" label="联系人"   width="100" />
       <el-table-column prop="phone"   label="电话"     width="130" />
-      <el-table-column label="登录账号" width="120">
+      <el-table-column label="登录账号" min-width="150">
         <template #default="{ row }">
-          <el-tag v-if="row.login_name" type="success" size="small">{{ row.login_name }}</el-tag>
+          <el-tag v-if="row.login_name" type="success" size="small" style="max-width:100%;overflow:hidden;text-overflow:ellipsis;">{{ row.login_name }}</el-tag>
           <span v-else style="color:#ccc;font-size:12px;">未设置</span>
         </template>
       </el-table-column>

@@ -39,12 +39,12 @@
           <span style="white-space:nowrap;">{{ row.real_name || row.device_name || row.imei || row.phone }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="设备号" min-width="150">
+      <el-table-column label="设备号" min-width="135" show-overflow-tooltip>
         <template #default="{ row }">
           <span style="white-space:nowrap;">{{ row.terminal_id || row.phone }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="IMEI" min-width="150">
+      <el-table-column label="IMEI" min-width="135" show-overflow-tooltip>
         <template #default="{ row }">
           <span style="white-space:nowrap;">{{ row.imei || row.phone }}</span>
         </template>
@@ -73,7 +73,7 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column prop="handler"    label="处理人"   width="100" />
+      <el-table-column prop="handler"    label="处理人"   width="85" show-overflow-tooltip />
       <el-table-column prop="handle_time" label="处理时间" min-width="165" />
       <el-table-column label="操作" fixed="right" width="90">
         <template #default="{ row }">

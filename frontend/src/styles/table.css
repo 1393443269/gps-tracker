@@ -1,0 +1,63 @@
+/* ============================================================================
+ * 全局表格与页面布局统一样式
+ * 目标:解决多个列表页「列总宽超屏、被挤出屏幕、列宽不均、行距过紧」的共性问题。
+ * 一次引入(main.js)全站生效,无需逐页改。页面内如需特例可用局部样式覆盖。
+ * ========================================================================== */
+
+/* ── 1. 主内容区留白收窄 ──────────────────────────────────────────────────
+ * el-main 默认 padding:20px,叠加页面卡片内边距后,横向被吃掉近 80px。
+ * 收窄到 12px,把宽度还给表格,缓解列多页面的横向溢出。 */
+.el-main {
+  padding: 12px !important;
+}
+
+/* ── 2. 表格单元格内边距与行高统一 ────────────────────────────────────────
+ * 统一为紧凑但不逼仄的节奏:纵向 8px 给行「呼吸感」,消除「行距过紧」观感;
+ * 横向 8px 压缩列内空隙,间接为更多列腾出宽度。 */
+.el-table th.el-table__cell,
+.el-table td.el-table__cell {
+  padding: 6px 0 !important;
+}
+.el-table .cell {
+  padding-left: 8px !important;
+  padding-right: 8px !important;
+  line-height: 1.5;
+}
+
+/* ── 3. 表头视觉强化 ──────────────────────────────────────────────────────
+ * 表头浅灰底 + 加重字色,与数据行区分,长表格滚动时列义更清晰。 */
+.el-table th.el-table__cell {
+  background-color: #f5f7fa !important;
+  color: #1d2f45 !important;
+  font-weight: 600;
+}
+
+/* ── 4. 长文本列换行不撑高过多 ────────────────────────────────────────────
+ * Element 默认长内容换行会把行撑得很高,视觉上「乱」。这里限制数据行内容
+ * 最多两行、超出省略号,既不隐藏首要信息也不让某一行异常高。需要单行省略号
+ * 的长字段列(ICCID/IMEI/账号)请在该列加 show-overflow-tooltip,悬停看全文。 */
+.el-table td.el-table__cell .cell {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-all;
+}
+
+/* ── 5. 页面外层卡片留白微调 ──────────────────────────────────────────────
+ * 常见页面用一层白卡片包裹内容,默认 padding 偏大。轻度收窄,与上面留白一致。 */
+.page-card,
+.el-card__body {
+  padding: 14px !important;
+}
+
+/* ── 6. 操作列按钮紧凑化 ──────────────────────────────────────────────────
+ * 操作列常有「编辑/绑定/充值/删除」多个按钮,默认间距会把操作列撑得很宽。
+ * 缩小按钮间距,收窄操作列占用。 */
+.el-table .el-button + .el-button {
+  margin-left: 6px !important;
+}
+.el-table .cell .el-button.is-link,
+.el-table .cell .el-button--small {
+  padding: 4px 6px !important;
+}
