@@ -859,18 +859,6 @@ def _sio_emit(event: str, data: dict, phone: str):
     row = db_query_one("SELECT org_id, customer_id FROM device WHERE phone=?", (phone,))
     org_id = int(row.get('org_id') or 1) if row else 1
     cid    = row.get('customer_id') if row else None
-    # 临时诊断：打印各房间当前在线客户端数，定位"推了但没人收"的问题
-    try:
-        _mgr = socketio.server.manager
-        def _rc(rm):
-            try:
-                return len(set(_mgr.get_participants('/', rm)))
-            except Exception:
-                return -1
-        log.info("[WS诊断] event=%s phone=%s 房间在线: org_%s=%d broadcast=%d",
-                 event, phone, org_id, _rc(f'org_{org_id}'), _rc('broadcast'))
-    except Exception as _e:
-        log.info("[WS诊断] 统计失败: %s", _e)
     socketio.emit(event, data, room=f'org_{org_id}')   # 该组织管理员
     socketio.emit(event, data, room='broadcast')        # 超级管理员
     # 归属客户及其上级客户
@@ -893,12 +881,9 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
     import json as _json
     from datetime import datetime as _dt, time as _time
 
-    log.info("[围栏诊断] 入口 phone=%s lat=%s lng=%s status_flag=%s", phone, lat, lng, status_flag)
-
     # ── P1: GPS 质量过滤 ──────────────────────────────────────────────────────
     # JT/T 808 status_flag bit1: 0=未定位, 1=已定位；(0,0) 坐标也视为无效
     if (lat == 0 and lng == 0) or not (status_flag & 0x02):
-        log.info("[围栏诊断] phone=%s 被P1质量过滤拦截 (lat/lng=0 或 status未定位)", phone)
         return
 
     # 查询该设备关联的所有围栏。
@@ -918,7 +903,6 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
            WHERE fd.phone = ?""",
         (phone,)
     )
-    log.info("[围栏诊断] phone=%s 查到关联围栏数=%d", phone, len(fences or []))
     if not fences:
         return
 
@@ -934,8 +918,6 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
     _dev_row = db_query_one("SELECT expected_interval_sec FROM device WHERE phone=?", (phone,))
     _interval = (_dev_row.get('expected_interval_sec') if _dev_row else None) or 0
     _debounce_n = 1 if _interval >= 120 else FENCE_DEBOUNCE_N
-    if _debounce_n != FENCE_DEBOUNCE_N:
-        log.info("[围栏诊断] phone=%s 低频设备(间隔%ds),防抖阈值降为%d", phone, _interval, _debounce_n)
 
     # 收集需要在锁外执行的告警动作（db_exec/emit 不能在锁内调用，避免死锁）
     _alarm_actions = []   # list of callables
@@ -975,13 +957,8 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
 
             was_inside = fid in prev_inside
 
-            log.info("[围栏诊断] phone=%s 围栏「%s」currently_inside=%s 防抖计数=%d/%d was_inside=%s",
-                     phone, f['name'], currently_inside, count, _debounce_n, was_inside)
-
             # 防抖未达标：保持原确认状态，继续积累
             if count < _debounce_n:
-                log.info("[围栏诊断] phone=%s 围栏「%s」防抖未达标(%d<%d),暂不切换状态",
-                         phone, f['name'], count, _debounce_n)
                 if was_inside:
                     new_inside.add(fid)
                 continue
