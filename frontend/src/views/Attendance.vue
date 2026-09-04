@@ -31,8 +31,8 @@
         <span style="font-size:12px;color:#909399;">共 {{ detailTotal }} 条</span>
       </div>
       <el-table :data="detailList" size="small" border stripe height="360" v-loading="detailLoading">
-        <el-table-column prop="device_name" label="名称" width="130">
-          <template #default="{ row }">{{ row.device_name || '—' }}</template>
+        <el-table-column label="名称" width="130">
+          <template #default="{ row }">{{ row.real_name || row.device_name || '—' }}</template>
         </el-table-column>
         <el-table-column label="设备号" width="160">
           <template #default="{ row }">{{ row.terminal_id || row.phone }}</template>

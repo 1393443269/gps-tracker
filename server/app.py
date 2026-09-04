@@ -1900,11 +1900,14 @@ def attendance_detail():
     conds, params = _org_where(sids, conds, params)   # 组织隔离
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     total   = db_scalar(f"SELECT COUNT(*) FROM attendance_record {where}", params)
-    # JOIN device 带出终端ID/IMEI(供前端"设备号"列显示 terminal_id||phone)。
+    # JOIN device 带出终端ID/IMEI(供前端"设备号"列显示 terminal_id||phone);
+    # 再 JOIN customer 带出绑定人姓名(real_name),名称列优先显示绑定人。
     # where 里的列(fence_id/event_time/org_id)无表歧义,直接沿用。
     records = db_query(
-        f"SELECT attendance_record.*, d.terminal_id, d.imei FROM attendance_record "
-        f"LEFT JOIN device d ON attendance_record.phone = d.phone {where} "
+        f"SELECT attendance_record.*, d.terminal_id, d.imei, c.contact AS real_name "
+        f"FROM attendance_record "
+        f"LEFT JOIN device d ON attendance_record.phone = d.phone "
+        f"LEFT JOIN customer c ON d.customer_id = c.id {where} "
         f"ORDER BY attendance_record.event_time DESC LIMIT ? OFFSET ?",
         params + [size, offset]
     )
