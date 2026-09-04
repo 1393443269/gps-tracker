@@ -357,11 +357,11 @@
       </div>
       <el-checkbox-group v-else v-model="selectedPhones">
         <div v-for="d in allDevices" :key="d.phone"
-          style="padding:3px 0;border-bottom:1px solid #f5f5f5;display:flex;align-items:center;gap:8px;">
-          <el-checkbox :value="d.phone" style="margin:0;" />
-          <!-- 单行显示:优先绑定人姓名(去空白判空),无则设备号/IMEI(省空间、设备多时好找) -->
-          <div style="flex:1;min-width:0;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
-                :title="deviceLabel(d)">{{ deviceLabel(d) }}</div>
+          style="padding:3px 0;border-bottom:1px solid #f5f5f5;">
+          <!-- 选值用 :value(d.phone),显示文字放默认插槽:单行,绑定人姓名优先、无则设备号 -->
+          <el-checkbox :value="d.phone" style="width:100%;margin:0;">
+            <span style="font-size:13px;">{{ deviceLabel(d) }}</span>
+          </el-checkbox>
         </div>
       </el-checkbox-group>
       <div style="margin-top:12px;font-size:12px;color:#909399;">
