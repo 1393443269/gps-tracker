@@ -30,7 +30,7 @@
               }" />
               <div style="flex:1;min-width:0;">
                 <div style="font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                  {{ d.name || d.phone }}
+                  {{ d.real_name || d.name || d.phone }}
                 </div>
                 <div style="font-size:11px;color:#909399;">{{ d.phone }}</div>
               </div>
@@ -57,7 +57,7 @@
             </div>
             <div style="padding:12px;">
               <el-descriptions :column="1" size="small" border>
-                <el-descriptions-item label="设备名称">{{ selected.name || '—' }}</el-descriptions-item>
+                <el-descriptions-item label="名称">{{ selected.real_name || selected.name || '—' }}</el-descriptions-item>
                 <el-descriptions-item label="设备号">{{ selected.terminal_id || selected.phone }}</el-descriptions-item>
                 <el-descriptions-item label="IMEI">{{ selected.imei || selected.phone }}</el-descriptions-item>
                 <el-descriptions-item label="状态">
