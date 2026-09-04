@@ -9,7 +9,7 @@
         </el-select>
       </el-form-item>
       <el-form-item label="名称">
-        <el-input v-model="filterName" placeholder="设备名称" clearable style="width:160px;" />
+        <el-input v-model="filterName" placeholder="绑定人/设备名" clearable style="width:160px;" />
       </el-form-item>
       <el-form-item label="设备号">
         <el-input v-model="filterPhone" placeholder="设备号" clearable style="width:160px;" />
@@ -34,9 +34,9 @@
     <el-table ref="tableRef" :data="list" v-loading="loading" stripe border
       @selection-change="onSelectionChange">
       <el-table-column type="selection" width="45" :selectable="row => row.status === 0" />
-      <el-table-column prop="device_name" label="名称" min-width="140">
+      <el-table-column prop="real_name" label="名称" min-width="140">
         <template #default="{ row }">
-          <span style="white-space:nowrap;">{{ row.device_name || row.imei || row.phone }}</span>
+          <span style="white-space:nowrap;">{{ row.real_name || row.device_name || row.imei || row.phone }}</span>
         </template>
       </el-table-column>
       <el-table-column label="设备号" min-width="150">
