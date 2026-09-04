@@ -926,6 +926,17 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
     now_time  = now_ts.time()
     speed_kmh = speed_raw / 10.0          # 808 协议单位 → km/h
 
+    # ── 动态防抖阈值:按设备上报频率区分 ──────────────────────────────────────
+    # 默认 FENCE_DEBOUNCE_N(=3)对 808 长连接高频设备(几十秒一个点)合理:连续3次
+    # 同状态才确认,可滤掉 GPS 抖动误报。但 G618 等短连接低频设备(默认600秒一个点)
+    # 若也要连续3次,达标要十几分钟且中途不能漂出一次,实际永远确认不了→出入围栏不报警。
+    # 故:上报间隔 >= 阈值的低频设备,防抖降为1(单点即判),让其出入围栏能正常报警。
+    _dev_row = db_query_one("SELECT expected_interval_sec FROM device WHERE phone=?", (phone,))
+    _interval = (_dev_row.get('expected_interval_sec') if _dev_row else None) or 0
+    _debounce_n = 1 if _interval >= 120 else FENCE_DEBOUNCE_N
+    if _debounce_n != FENCE_DEBOUNCE_N:
+        log.info("[围栏诊断] phone=%s 低频设备(间隔%ds),防抖阈值降为%d", phone, _interval, _debounce_n)
+
     # 收集需要在锁外执行的告警动作（db_exec/emit 不能在锁内调用，避免死锁）
     _alarm_actions = []   # list of callables
     _attend_actions = []  # list of (fence_id, fence_name, action)
@@ -965,12 +976,12 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
             was_inside = fid in prev_inside
 
             log.info("[围栏诊断] phone=%s 围栏「%s」currently_inside=%s 防抖计数=%d/%d was_inside=%s",
-                     phone, f['name'], currently_inside, count, FENCE_DEBOUNCE_N, was_inside)
+                     phone, f['name'], currently_inside, count, _debounce_n, was_inside)
 
             # 防抖未达标：保持原确认状态，继续积累
-            if count < FENCE_DEBOUNCE_N:
+            if count < _debounce_n:
                 log.info("[围栏诊断] phone=%s 围栏「%s」防抖未达标(%d<%d),暂不切换状态",
-                         phone, f['name'], count, FENCE_DEBOUNCE_N)
+                         phone, f['name'], count, _debounce_n)
                 if was_inside:
                     new_inside.add(fid)
                 continue
