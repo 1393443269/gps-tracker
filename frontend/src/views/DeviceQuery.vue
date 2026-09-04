@@ -238,6 +238,9 @@
         title="G618 为低功耗短连接设备，指令将排入队列，在设备下次上线时自动下发执行，可能有延迟。" />
       <el-alert type="info" :closable="false" show-icon style="margin-bottom:10px;"
         title="设备需在线才能接收指令；离线设备将返回“设备不在线”。" />
+      <!-- 参数性质说明:上报频率已回填设备真实值;开关类为下发设置,不代表设备当前状态。 -->
+      <el-alert type="warning" :closable="false" style="margin-bottom:10px;"
+        title="说明：「上报频率」已回填设备当前真实值；其余开关(休眠/蓝牙/定位优先级等)为下发设置，代表你要设成的值，非设备当前状态(设备不上报这些参数的当前配置)。" />
       <!-- ===== 天禧设备指令（terminal_model 不含 G618 时显示） ===== -->
       <el-tabs v-model="zlTab" v-if="!isG618">
         <!-- 网络配置 -->
@@ -820,6 +823,19 @@ function openZhiling(dev) {
   zlDev.value = dev
   zlTab.value = 'net'
   zlCustomText.value = ''
+  // 回填设备真实上报频率(平台已知的真值),避免用户误把默认值当设备当前配置:
+  //   G618 用 0xE9 上报的 expected_interval_sec;天禧用位置报文实测的 measured_interval_sec。
+  //   仅频率有真值可回填,其余开关类参数设备不上报当前状态、平台拿不到,保持"下发设置"性质(见界面标注)。
+  const realSec = dev.expected_interval_sec || dev.measured_interval_sec || null
+  if (realSec && realSec > 0) {
+    const mins = Math.max(1, Math.round(realSec / 60))
+    // G618:频率单位为分钟
+    zfg.value.set_freq.interval = String(mins)
+    // 天禧:INTERVAL 是运动/静止/心跳三段秒数,把实测秒数回填到静止段(最能代表常态上报节奏),
+    //   运动段留空由用户按需填,心跳段填实测值兜底。
+    zf.value.set_interval.static_sec = String(realSec)
+    zf.value.set_interval.heartbeat_sec = String(realSec)
+  }
   zhilingVisible.value = true
 }
 

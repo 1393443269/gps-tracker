@@ -4229,6 +4229,7 @@ def portal_device_list():
                  "device.last_battery, device.last_battery_time, "
                  "device.last_seen, device.last_signal, device.last_loc_type, device.last_address, "
                  "device.presence_state, device.offline_reason, "
+                 "device.expected_interval_sec, device.measured_interval_sec, "
                  "c.name AS customer_name, c.login_name AS account, "
                  "c.contact AS real_name, c.phone AS contact_phone, c.avatar AS avatar, c.address AS address, "
                  "r.name AS role_name, r.color AS role_color, r.icon_type AS role_icon, "
