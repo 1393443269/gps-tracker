@@ -893,9 +893,12 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
     import json as _json
     from datetime import datetime as _dt, time as _time
 
+    log.info("[围栏诊断] 入口 phone=%s lat=%s lng=%s status_flag=%s", phone, lat, lng, status_flag)
+
     # ── P1: GPS 质量过滤 ──────────────────────────────────────────────────────
     # JT/T 808 status_flag bit1: 0=未定位, 1=已定位；(0,0) 坐标也视为无效
     if (lat == 0 and lng == 0) or not (status_flag & 0x02):
+        log.info("[围栏诊断] phone=%s 被P1质量过滤拦截 (lat/lng=0 或 status未定位)", phone)
         return
 
     # 查询该设备关联的所有围栏。
@@ -915,6 +918,7 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
            WHERE fd.phone = ?""",
         (phone,)
     )
+    log.info("[围栏诊断] phone=%s 查到关联围栏数=%d", phone, len(fences or []))
     if not fences:
         return
 
@@ -960,8 +964,13 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
 
             was_inside = fid in prev_inside
 
+            log.info("[围栏诊断] phone=%s 围栏「%s」currently_inside=%s 防抖计数=%d/%d was_inside=%s",
+                     phone, f['name'], currently_inside, count, FENCE_DEBOUNCE_N, was_inside)
+
             # 防抖未达标：保持原确认状态，继续积累
             if count < FENCE_DEBOUNCE_N:
+                log.info("[围栏诊断] phone=%s 围栏「%s」防抖未达标(%d<%d),暂不切换状态",
+                         phone, f['name'], count, FENCE_DEBOUNCE_N)
                 if was_inside:
                     new_inside.add(fid)
                 continue
