@@ -8,6 +8,9 @@
           <el-option label="已处理" :value="1" />
         </el-select>
       </el-form-item>
+      <el-form-item label="名称">
+        <el-input v-model="filterName" placeholder="设备名称" clearable style="width:160px;" />
+      </el-form-item>
       <el-form-item label="设备号">
         <el-input v-model="filterPhone" placeholder="设备号" clearable style="width:160px;" />
       </el-form-item>
@@ -31,6 +34,11 @@
     <el-table ref="tableRef" :data="list" v-loading="loading" stripe border
       @selection-change="onSelectionChange">
       <el-table-column type="selection" width="45" :selectable="row => row.status === 0" />
+      <el-table-column prop="device_name" label="名称" width="150">
+        <template #default="{ row }">
+          <span style="white-space:nowrap;">{{ row.device_name || '—' }}</span>
+        </template>
+      </el-table-column>
       <el-table-column label="设备号" width="170">
         <template #default="{ row }">
           <span style="white-space:nowrap;">{{ row.terminal_id || row.phone }}</span>
@@ -119,6 +127,7 @@ const pageSize     = ref(20)
 const total        = ref(0)
 const filterStatus = ref(undefined)
 const filterPhone  = ref('')
+const filterName   = ref('')
 
 const handleVisible = ref(false)
 const handleForm    = reactive({ id: null, handler: '管理员', note: '' })
@@ -143,7 +152,7 @@ async function loadData(p = page.value) {
   loading.value = true
   page.value = p
   try {
-    const params = { page: p, size: pageSize.value, status: filterStatus.value, phone: filterPhone.value || undefined }
+    const params = { page: p, size: pageSize.value, status: filterStatus.value, phone: filterPhone.value || undefined, name: filterName.value || undefined }
     const res = isAdmin() ? await alarmApi.list(params) : await portalApi.alarms(params)
     list.value  = res.data?.records || []
     total.value = res.data?.total   || 0
@@ -155,6 +164,7 @@ async function loadData(p = page.value) {
 function reset() {
   filterStatus.value = undefined
   filterPhone.value  = ''
+  filterName.value   = ''
   loadData(1)
 }
 

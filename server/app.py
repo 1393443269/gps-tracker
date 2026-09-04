@@ -1675,6 +1675,7 @@ def list_alarms():
     page, size = _page_params(20)
     status = request.args.get('status')
     phone  = request.args.get('phone', '').strip()
+    name   = request.args.get('name', '').strip()
     offset = (page - 1) * size
     sids   = _org_scope_ids(request)
 
@@ -1686,6 +1687,8 @@ def list_alarms():
         conds.append("a.status=?"); params.append(_st)
     if phone:
         conds.append("a.phone=?"); params.append(phone)
+    if name:
+        conds.append("d.name LIKE ?"); params.append(f"%{name}%")
 
     # 通过 device.org_id 过滤组织范围
     if sids is None:
@@ -1697,13 +1700,9 @@ def list_alarms():
         conds.append(f"d.org_id IN ({ph})")
         params.extend(sids)
 
-    # 需要 JOIN device 才能按 org_id 过滤
-    if sids is not None:
-        base  = "FROM alarm_record a LEFT JOIN device d ON a.phone=d.phone"
-        sel   = "a.*, d.terminal_id, d.imei"
-    else:
-        base  = "FROM alarm_record a LEFT JOIN device d ON a.phone=d.phone"
-        sel   = "a.*, d.terminal_id, d.imei"
+    # 始终 JOIN device：既用于 org_id 过滤，也用于回填设备名称/终端号/IMEI
+    base  = "FROM alarm_record a LEFT JOIN device d ON a.phone=d.phone"
+    sel   = "a.*, d.name AS device_name, d.terminal_id, d.imei"
 
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     total   = db_scalar(f"SELECT COUNT(*) {base} {where}", params)
@@ -3720,12 +3719,20 @@ def portal_alarms():
         if _st is None:
             return fail('status 参数无效', 400)
         conds.append("alarm_record.status=?"); params.append(_st)
+    _phone = request.args.get('phone', '').strip()
+    if _phone:
+        conds.append("alarm_record.phone=?"); params.append(_phone)
+    _name = request.args.get('name', '').strip()
+    if _name:
+        conds.append("d.name LIKE ?"); params.append(f"%{_name}%")
+    base  = ("FROM alarm_record LEFT JOIN device d "
+             "ON alarm_record.phone = d.phone")
     where  = "WHERE " + " AND ".join(conds)
-    total   = db_scalar(f"SELECT COUNT(*) FROM alarm_record {where}", params)
-    # JOIN device 带出终端ID/IMEI(供前端"设备号"列显示 terminal_id||phone、IMEI列显示真实imei)
+    total   = db_scalar(f"SELECT COUNT(*) {base} {where}", params)
+    # JOIN device 带出名称/终端ID/IMEI(供前端"名称""设备号"列显示、名称查询)
     records = db_query(
-        f"SELECT alarm_record.*, d.terminal_id, d.imei FROM alarm_record "
-        f"LEFT JOIN device d ON alarm_record.phone = d.phone {where} "
+        f"SELECT alarm_record.*, d.name AS device_name, d.terminal_id, d.imei "
+        f"{base} {where} "
         f"ORDER BY alarm_record.alarm_time DESC LIMIT ? OFFSET ?",
         params + [size, offset])
     return ok({'records': records, 'total': total, 'page': page})
