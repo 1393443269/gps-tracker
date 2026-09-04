@@ -1532,6 +1532,13 @@ def handle_g618g_frame(conn, frame, phone_holder):
                 (did, imei, r['lat'], r['lng'], 0, 0, 0, 0, 2, None, gps_time),
                 (imei, r['lat'], r['lng'], 0, gps_time, 1, now)
             )
+            # 电子围栏进出检测：G618 的 GPS 定位(0x03)此前【漏调】check_fence_crossing,
+            # 导致 G618 出/入围栏不产生报警(只有 808 路径调了)。此处补上,与 808 对齐。
+            # status_flag 传 2(bit1=1 已定位;G618 到此已过 valid 校验),speed 传 0。
+            try:
+                check_fence_crossing(imei, r['lat'], r['lng'], did, gps_time, 0, 2)
+            except Exception as _fe:
+                log.warning("[G618G] 围栏检测异常 phone=%s err=%s", imei, _fe)
             # 定位方式=GPS(0);并触发逆地理编码存中文地址(限流,见 _update_address)
             db_exec("UPDATE device SET last_loc_type=0 WHERE phone=?", (imei,))
             _update_address(imei, r['lat'], r['lng'])
