@@ -291,7 +291,9 @@ function _beep() {
 function _esc(s) { return String(s ?? '').replace(/[<>&]/g, m => ({ '<':'&lt;', '>':'&gt;', '&':'&amp;' }[m])) }
 function connectAlarmSocket() {
   const token = localStorage.getItem('admin_token') || localStorage.getItem('customer_token') || ''
-  alarmSocket = io(window.location.origin, { transports: ['websocket', 'polling'], auth: { token } })
+  // forceNew:独立连接,避免与实时地图页共用同一 socket.io 复用连接——否则地图页
+  // 卸载时的 socket.off()/disconnect() 会连带清掉本全局报警监听、拆掉连接,导致收不到报警。
+  alarmSocket = io(window.location.origin, { transports: ['websocket', 'polling'], auth: { token }, forceNew: true })
   alarmSocket.on('alarm', (data) => {
     ElNotification({
       title: `⚠ 报警：${_esc(data.phone || '未知设备')}`,
