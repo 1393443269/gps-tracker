@@ -4,7 +4,7 @@
 
     <el-table :data="list" v-loading="loading" stripe border size="small">
       <el-table-column type="index" label="#" width="50" />
-      <el-table-column prop="fence_name" label="围栏名称" min-width="160" />
+      <el-table-column prop="fence_name" label="围栏名称" width="200" show-overflow-tooltip />
       <el-table-column prop="device_count" label="设备数" width="90" align="center">
         <template #default="{ row }">
           <el-tag size="small" type="primary">{{ row.device_count ?? 0 }}</el-tag>
@@ -12,7 +12,8 @@
       </el-table-column>
       <el-table-column prop="enter_count" label="进入次数" width="100" align="center" />
       <el-table-column prop="exit_count"  label="离开次数" width="100" align="center" />
-      <el-table-column prop="last_time"   label="最近事件" min-width="165" />
+      <el-table-column prop="last_time"   label="最近事件" width="180" />
+      <el-table-column />   <!-- 占位空列,吸收右侧余量,避免固定宽列被拉伸 -->
       <el-table-column label="操作" fixed="right" width="110" align="center">
         <template #default="{ row }">
           <el-button size="small" type="primary" plain @click="openDetail(row)">查看明细</el-button>

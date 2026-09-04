@@ -8,7 +8,7 @@
 
     <el-table :data="list" v-loading="loading" stripe border size="small">
       <el-table-column type="index" label="#" width="50" />
-      <el-table-column prop="name" label="角色名称" min-width="140" />
+      <el-table-column prop="name" label="角色名称" width="160" show-overflow-tooltip />
       <el-table-column label="角色颜色" width="90" align="center">
         <template #default="{ row }">
           <span :style="{
@@ -36,7 +36,7 @@
       <el-table-column prop="description" label="角色描述" min-width="160" show-overflow-tooltip>
         <template #default="{ row }">{{ row.description || '—' }}</template>
       </el-table-column>
-      <el-table-column prop="created_at" label="创建时间" min-width="165" />
+      <el-table-column prop="created_at" label="创建时间" width="170" />
       <el-table-column label="操作" fixed="right" width="100" align="center">
         <template #default="{ row }">
           <el-button size="small" :icon="EditIcon" circle @click="openEdit(row)" />
