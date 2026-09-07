@@ -910,18 +910,15 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
     now_time  = now_ts.time()
     speed_kmh = speed_raw / 10.0          # 808 协议单位 → km/h
 
-    # ── 动态防抖阈值:按设备"实测上报频率"区分,而非配置的期望间隔 ──────────────
-    # 默认 FENCE_DEBOUNCE_N(=3)对高频上报设备合理:连续3次同状态才确认,滤掉GPS抖动。
-    # 但真·低频设备(如 G618 短连接,数分钟才一个点)若也要连续3次,达标要十几分钟且
-    # 中途不能漂出一次,实际永远确认不了→出入围栏不报警,故对其降为1(单点即判)。
-    #
-    # 关键:判据用 measured_interval_sec(实测两次上报真实间隔),不用 expected_interval_sec
-    # (配置字段常年偏大,会把"高频但配置写600秒"的808设备误判为低频→防抖失效→静止
-    #  设备边界抖动反复刷"进入"报警,这是上一版的 bug)。实测间隔缺失时保守用默认防抖。
-    _dev_row = db_query_one(
-        "SELECT measured_interval_sec, expected_interval_sec FROM device WHERE phone=?", (phone,))
+    # ── 动态防抖阈值:短连接/低频设备单点即判,高频长连接设备连续3次滤抖 ────────────
+    # 防抖计数 fence_device_pending 在连接断开时会被清(见 _fence_cleanup),所以短连接
+    # 设备(报一个点即断,如 LT115/G618)每次重连计数都从头开始,永远攒不满3次→若用默认
+    # 防抖3则出入围栏无法确认。故对这类设备降为1(单点即判)。
+    # 高频长连接设备(measured<180s)在持续连接内能攒够3次,保留默认防抖滤GPS抖动。
+    # 注:围栏"进出确认状态"已跨连接保留(见 _fence_cleanup 说明),故降为1不会再导致
+    # 静止设备重复报"进入"——重连后 was_inside 仍为真,只走"持续在内"不重复告警。
+    _dev_row = db_query_one("SELECT measured_interval_sec FROM device WHERE phone=?", (phone,))
     _measured = (_dev_row.get('measured_interval_sec') if _dev_row else None) or 0
-    # 仅当"实测"确实低频(>=180秒/3分钟)才降防抖;实测未知(0)一律用默认防抖,不冒进。
     _debounce_n = 1 if _measured >= 180 else FENCE_DEBOUNCE_N
 
     # 收集需要在锁外执行的告警动作（db_exec/emit 不能在锁内调用，避免死锁）

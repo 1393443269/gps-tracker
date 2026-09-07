@@ -44,17 +44,18 @@ fence_device_dwell_alarmed: dict = {}  # phone → set of fence_id(已触发滞�
 
 
 def _fence_cleanup(phone):
-    """设备下线时清理四个围栏状态字典,防止内存泄漏和 phone 复用时的状态污染。"""
+    """连接断开时的轻量清理。
+
+    重要:绝不清围栏进出状态(fence_device_inside / enter_time / dwell / 报警去重时间戳)。
+    这些是【跨连接的业务状态】,必须保留——否则短连接设备(报完即断、几十秒一轮,如
+    LT115/G618)每次重连都会丢失"已在围栏内"的记忆,把静止设备反复当成"新进入",
+    每轮刷一条进入报警(这是之前刷屏的真因);同时报警60秒去重也会被清而失效。
+
+    连接级临时状态很小,保留不会造成实际内存压力;真正的内存回收由离线扫描/TTL 负责。
+    仅清理 fence_device_pending(防抖计数,连接内累积的中间态,清掉不影响进出判定的正确性)。
+    """
     with _fence_lock:
-        fence_device_inside.pop(phone, None)
         fence_device_pending.pop(phone, None)
-        fence_device_enter_time.pop(phone, None)
-        fence_device_dwell_alarmed.pop(phone, None)
-    # 顺带清理设备ID缓存与报警去重时间戳,防止长期运行内存无界增长
-    _devid_cache.pop(phone, None)
-    with _alarm_last_ts_lock:
-        for _k in [k for k in _alarm_last_ts if k[0] == phone]:
-            _alarm_last_ts.pop(_k, None)
 
 
 def next_serial():
