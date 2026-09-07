@@ -5,6 +5,20 @@
 #   定时执行：crontab -e  →  0 3 * * * /opt/gps-tracker/backup.sh >> /var/log/gps-backup.log 2>&1
 set -euo pipefail
 
+# ── GPS 平台 .env 自动加载(cron 环境不继承交互 shell 变量,必须显式加载)──
+# 根因修复:crontab 直接调用本脚本时没有 POSTGRES_USER/POSTGRES_DB,
+# 导致第 22 行自我保护退出、备份连续失败。此处从 .env 注入这些变量。
+ENV_FILE="$(cd "$(dirname "$0")" && pwd)/.env"
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+else
+    echo "[严重] 未找到 $ENV_FILE,无法注入数据库凭据,中止备份。" >&2
+    exit 1
+fi
+
 BACKUP_DIR=/opt/backups
 KEEP_DAYS=14
 STAMP=$(date +%Y%m%d_%H%M%S)
