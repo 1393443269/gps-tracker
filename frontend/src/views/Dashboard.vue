@@ -17,8 +17,13 @@
         <el-button style="float:right;" type="primary" link @click="$router.push('/alarms')">查看全部</el-button>
       </template>
       <el-table :data="recentAlarms" size="small" stripe>
-        <el-table-column label="设备号" min-width="140">
-          <template #default="{ row }">{{ row.terminal_id || row.phone }}</template>
+        <el-table-column label="名称" min-width="140">
+          <template #default="{ row }">
+            <span style="white-space:nowrap;">{{ row.real_name || row.device_name || row.imei || row.terminal_id || row.phone }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="设备号" min-width="135" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.terminal_id || row.imei || row.phone }}</template>
         </el-table-column>
         <el-table-column prop="alarm_desc" label="报警类型" min-width="140" />
         <el-table-column label="位置" min-width="180">
