@@ -842,6 +842,7 @@ from core.ingest import (
 # ── TCP 连接处理线程 ────────────────────────────────────────────────────────────
 
 import protocol_g618g as g618
+import protocol_jimi as jimi   # 几米 KKS 超长待机(L744/L745)协议:下行指令构造
 import geo_resolve
 
 # TCP 连接处理线程(handle_client/_handle_client_guarded/start_tcp_server +
@@ -2248,6 +2249,92 @@ def g618g_command():
         db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
                 (phone, 'G618G-'+phone[-6:], cmd, 'queued', f'实时下发失败已转待发队列: {e}'))
         log.warning("[指令下发] 实时失败转入队 phone=%s err=%s", phone, e)
+        return ok({'cmd': cmd, 'phone': phone, 'queued': True,
+                   'message': '实时下发失败，已转入待发队列，设备下次上线时自动下发'})
+
+
+# ── L744/L745(几米 KKS 超长待机)下行指令接口 ─────────────────────────────────
+# 几米 KKS 下行统一走 0x80 在线指令包(见 protocol_jimi.build_command):内容为兼容短信的
+# ASCII 指令串(如 "SOS,A,,,158xxxx#")。设备回 0x21 指令回复(由 ingest.handle_jimi_frame 记日志)。
+# ⚠ 除 SOS 有协议文档 V1.2 示例外,其余指令文本模板待真机联调核对——故本接口以「通用文本下发(raw)」
+# 为核心能力(前端给完整指令串,平台只负责封 0x80 帧),另附几个便捷封装,模板可能需按真机订正。
+
+# 便捷指令 → 指令文本串模板。raw 由 body['text'] 直接给出,不走这里。
+_JIMI_CMD_TEXT = {
+    'reboot':       lambda d: 'RESET#',                 # 重启(模板待真机核对)
+    'locate_now':   lambda d: 'CR#',                    # 立即定位一次(模板待真机核对)
+    'query_status': lambda d: 'STATUS#',                # 查询状态(模板待真机核对)
+    'set_freq':     lambda d: 'UPLOAD,%d#' % int(d.get('interval', 3600)),  # 上报间隔秒(模板待真机核对)
+    'sos':          lambda d: 'SOS,A,,,%s#' % str(d.get('number', '')).strip(),  # 设 SOS 号码(V1.2 有示例)
+}
+
+def _build_jimi_payload(cmd, data):
+    """按 cmd 生成 L744 下行帧字节。cmd='raw' 时用 body['text'] 原样封 0x80;否则查模板表。"""
+    if cmd == 'raw':
+        text = str(data.get('text', '')).strip()
+        if not text:
+            raise ValueError("raw 指令需提供 text")
+    else:
+        tmpl = _JIMI_CMD_TEXT.get(cmd)
+        if not tmpl:
+            raise ValueError("不支持的 L744 指令: %s，支持: raw, %s"
+                             % (cmd, ', '.join(_JIMI_CMD_TEXT.keys())))
+        if cmd == 'sos' and not str(data.get('number', '')).strip():
+            raise ValueError("sos 指令需提供 number")
+        text = tmpl(data)
+    return jimi.build_command(text, 0, next_serial() & 0xFFFF)
+
+@app.post('/api/commands/jimi')
+def jimi_command():
+    """L744/L745(几米 KKS)设备下行指令。
+    Body: {"phone": "<IMEI>", "cmd": "<命令名>", ...参数}
+    支持的 cmd:
+      - raw          : 通用文本下发,需 text=完整指令串(如 "SOS,A,,,158xxxx#")——最可靠
+      - reboot       : 重启
+      - locate_now   : 立即定位一次
+      - query_status : 查询状态
+      - set_freq     : 设上报间隔,参数 interval(秒)
+      - sos          : 设 SOS 号码,参数 number
+    注:除 sos/raw 外,便捷指令文本模板待真机联调核对。设备离线则入待发队列,上线自动补发。"""
+    data  = request.get_json() or {}
+    phone = data.get('phone', '')
+    cmd   = data.get('cmd', '')
+    if not phone or not cmd:
+        return fail('phone 和 cmd 不能为空')
+    if not _device_in_scope(phone):
+        return fail('设备不存在或无权限', 403)
+    # 先构造下行帧(离线入队也要用,故提前构造并校验参数合法性)
+    try:
+        payload = _build_jimi_payload(cmd, data)
+    except Exception as e:
+        log.warning("[L744指令] 构造失败 phone=%s cmd=%s err=%s", phone, cmd, e)
+        return fail(f'指令参数错误: {e}')
+
+    _dev_name = 'L744-' + phone[-6:]
+    with sessions_lock:
+        conn = sessions.get(phone)
+    # 设备离线:存入待发队列,下次上线由 _flush_pending_commands 自动补发(超长待机设备平时休眠,属常态)
+    if not conn:
+        db_exec("INSERT INTO pending_command (phone,cmd,payload_hex,status) VALUES (?,?,?,?)",
+                (phone, cmd, payload.hex(), 'pending'))
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, _dev_name, cmd, 'queued', '设备离线，已加入待发队列，上线后自动下发'))
+        add_op_log('L744指令入队', f'phone={phone} cmd={cmd}（设备离线，待上线补发）')
+        return ok({'cmd': cmd, 'phone': phone, 'queued': True,
+                   'message': '设备当前离线，指令已排队，设备下次上线时自动下发'})
+    try:
+        conn.sendall(payload)
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, _dev_name, cmd, 'success', ''))
+        add_op_log('L744指令下发', f'phone={phone} cmd={cmd}')
+        return ok({'cmd': cmd, 'phone': phone, 'queued': False})
+    except Exception as e:
+        # 在线发送失败(连接刚断等):转入待发队列,避免指令丢失
+        db_exec("INSERT INTO pending_command (phone,cmd,payload_hex,status) VALUES (?,?,?,?)",
+                (phone, cmd, payload.hex(), 'pending'))
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, _dev_name, cmd, 'queued', f'实时下发失败已转待发队列: {e}'))
+        log.warning("[L744指令] 实时失败转入队 phone=%s err=%s", phone, e)
         return ok({'cmd': cmd, 'phone': phone, 'queued': True,
                    'message': '实时下发失败，已转入待发队列，设备下次上线时自动下发'})
 

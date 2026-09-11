@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 
 import protocol as p
 import protocol_g618g as g618
+import protocol_jimi as jimi   # 几米 KKS 超长待机(L744/L745)协议解析
 import geo_resolve
 
 from core.db import db_query_one, db_query, db_exec, get_db, _db_lock, DB_BACKEND, DB_PATH
@@ -1686,6 +1687,143 @@ def handle_g618g_frame(conn, frame, phone_holder):
     return typ
 
 
+def handle_jimi_frame(conn, frame, phone_holder):
+    """处理一个几米 KKS(L744/L745 超长待机)上报帧:解析并落库。
+    phone_holder 是 [phone] 单元素列表(可变引用),存本连接绑定的 IMEI。
+    设计与 handle_g618g_frame 对齐:坐标原样入库(不转 GCJ02,由前端统一转换),
+    注册建档→回登录包、心跳回 0x23、定位入队+围栏+WS 推送、报警入库、校时回复。
+    """
+    r = jimi.parse(frame)
+    typ = r.get('type')
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    if typ == 'register':          # 0x01 登录:记录 IMEI、回登录包、登记会话
+        imei = r.get('imei')
+        # IMEI 合法性:15 位数字。并包错位拼出的假注册帧据此拦截,避免幽灵设备灌库。
+        if not (imei and imei.isdigit() and len(imei) == 15):
+            log.warning("[L744] 非法 IMEI 拒绝建档: %r frame=%s", imei, frame[:16].hex())
+            return typ
+        phone_holder[0] = imei
+        with sessions_lock:
+            sessions[imei] = conn
+        row = db_query_one("SELECT id FROM device WHERE phone=?", (imei,))
+        if not row:
+            # 超长待机机型默认定位间隔较长,expected_interval_sec 预置 3600(1 小时),
+            # 离线阈值据此动态推算;真机按现场配置的上报节奏由 dev_status/实测间隔回写修正。
+            db_exec("INSERT INTO device (phone,name,manufacturer,terminal_model,status,"
+                    "org_id,lifecycle,online_time,last_seen,expected_interval_sec,created_at,updated_at) "
+                    "VALUES (?,?,?,?,1,1,1,?,?,3600,?,?)",
+                    (imei, 'L744-'+imei[-6:], '几米物联', 'L744', now, now, now, now))
+        else:
+            db_exec("UPDATE device SET status=1,online_time=?,last_seen=?,updated_at=?,"
+                    "presence_state='online',offline_reason=NULL WHERE phone=?", (now, now, now, imei))
+        conn.sendall(jimi.build_login_reply(r.get('serial', 1)))
+        log.info("[L744] 设备上线 IMEI=%s type_code=0x%04X", imei, r.get('type_code', 0))
+        _flush_pending_commands(conn, imei)
+
+    elif typ == 'heartbeat':       # 0x23 心跳:回 0x23 保活 + 刷在线 + 更新电量/信号
+        conn.sendall(jimi.build_heartbeat_reply_23(r.get('serial', 1)))
+        imei = phone_holder[0]
+        if imei:
+            db_exec("UPDATE device SET status=1,online_time=?,last_seen=?,"
+                    "presence_state='online',offline_reason=NULL WHERE phone=?", (now, now, imei))
+            _sig = r.get('signal')   # 0~4 五级制 → ×25 归一为百分比
+            if _sig is not None:
+                db_exec("UPDATE device SET last_signal=? WHERE phone=?",
+                        (max(0, min(100, _sig * 25)), imei))
+            battery_pct = r.get('battery_pct')
+            if battery_pct is not None:
+                db_exec("UPDATE device SET last_battery=?, last_battery_time=?, updated_at=? WHERE phone=?",
+                        (battery_pct, now, now, imei))
+                insert_sensor_data(imei, 'battery', value=battery_pct, unit='%')
+
+    elif typ == 'time_sync':       # 0x8A 校时请求:回当前 UTC 时间
+        _utc = datetime.utcnow()
+        conn.sendall(jimi.build_time_reply(
+            (_utc.year % 100, _utc.month, _utc.day, _utc.hour, _utc.minute, _utc.second),
+            r.get('serial', 1)))
+
+    elif typ == 'location':        # 0xA0 定位:更新最新位置 + 写轨迹(坐标原样入库)
+        imei = phone_holder[0]
+        if imei and r.get('valid'):
+            _lat = r.get('lat', 0); _lng = r.get('lng', 0)
+            if not (math.isfinite(_lat) and math.isfinite(_lng)):
+                log.warning("[L744] NaN/Inf 坐标丢弃 phone=%s", imei); return typ
+            if not (-90 <= _lat <= 90) or not (-180 <= _lng <= 180):
+                log.warning("[L744] 非法坐标丢弃 phone=%s lat=%s lng=%s", imei, _lat, _lng); return typ
+            dt = r.get('datetime') or {}
+            try:
+                gps_time = '%04d-%02d-%02d %02d:%02d:%02d' % (
+                    dt.get('year', 2000), dt.get('month', 1), dt.get('day', 1),
+                    dt.get('hour', 0), dt.get('minute', 0), dt.get('second', 0))
+            except Exception:
+                gps_time = now
+            speed = min(max(r.get('speed', 0), 0), 5000)
+            direction = int(r.get('course', 0)) % 360
+            did = _get_device_id(imei)
+            enqueue_location(
+                (did, imei, _lat, _lng, 0, speed, direction, 0, 2, None, gps_time),
+                (imei, _lat, _lng, speed, gps_time, 1, now)
+            )
+            try:
+                check_fence_crossing(imei, _lat, _lng, did, gps_time, speed, 2)
+            except Exception as _fe:
+                log.warning("[L744] 围栏检测异常 phone=%s err=%s", imei, _fe)
+            db_exec("UPDATE device SET last_loc_type=0 WHERE phone=?", (imei,))
+            _update_address(imei, _lat, _lng)
+            role_row = db_query_one(
+                "SELECT r.name AS role_name, r.color AS role_color, r.icon_type AS role_icon "
+                "FROM device LEFT JOIN device_role r ON device.role_id = r.id WHERE device.phone=?",
+                (imei,))
+            _sio_emit('location_update', {
+                'phone': imei, 'lat': _lat, 'lng': _lng, 'speed': speed,
+                'direction': direction, 'altitude': 0, 'alarm': False, 'alarmFlag': 0,
+                'time': gps_time,
+                'roleName':  role_row.get('role_name')  if role_row else None,
+                'roleColor': role_row.get('role_color') if role_row else None,
+                'roleIcon':  role_row.get('role_icon')  if role_row else None,
+            }, imei)
+            log.info("[L744] 位置上报并推送 phone=%s lat=%.6f lng=%.6f", imei, _lat, _lng)
+
+    elif typ == 'alarm':           # 0xA4/0xA5 报警:入库 + WS 推送,关机类判离线
+        imei = phone_holder[0]
+        if imei:
+            did = _get_device_id(imei)
+            desc = r.get('alarm_text', '报警')
+            db_exec("INSERT INTO alarm_record (device_id,phone,alarm_type,alarm_desc,alarm_time,status) "
+                    "VALUES (?,?,?,?,?,0)", (did, imei, r.get('alarm_code', 0), desc, now))
+            has_sos = 'SOS' in desc
+            _emit_alarm('alarm', {'phone': imei, 'alarmDesc': desc, 'time': now},
+                        imei, 0 if has_sos else 99)
+            # 关机类报警(关机/低电关机)驱动离线,与 G618G 口径一致
+            if '关机' in desc:
+                _reason = 'battery_drain' if '低电' in desc else 'power_off'
+                db_exec("UPDATE device SET status=0, presence_state='offline', offline_reason=?, "
+                        "offline_time=?, updated_at=? WHERE phone=?", (_reason, now, now, imei))
+                _sio_emit('device_offline', {'phone': imei, 'time': now, 'reason': desc}, imei)
+                log.info("[L744] 收到关机报警(%s)判离线 imei=%s", desc, imei)
+
+    elif typ == 'info':            # 0x94 通用信息包:登记 ICCID
+        imei = phone_holder[0]
+        iccid = r.get('iccid')
+        if imei and iccid:
+            db_exec("UPDATE device SET iccid=? WHERE phone=?", (iccid, imei))
+            try:
+                exist = db_query_one("SELECT id FROM sim_card WHERE iccid=?", (iccid,))
+                if exist:
+                    db_exec("UPDATE sim_card SET device_phone=? WHERE iccid=?", (imei, iccid))
+                else:
+                    db_exec("INSERT INTO sim_card (iccid, device_phone, remark) VALUES (?,?,?)",
+                            (iccid, imei, '设备自动上报'))
+            except Exception as e:
+                log.warning("[L744] SIM卡登记失败 imei=%s iccid=%s err=%s", imei, iccid, e)
+
+    elif typ == 'cmd_ack':         # 0x21 在线指令回复:记调试日志
+        log.info("[L744] 指令回复 phone=%s raw=%s", phone_holder[0], r.get('raw', '')[:40])
+
+    return typ
+
+
 # ── TCP 连接处理线程 ────────────────────────────────────────────────────────────
 
 # 808 TCP 服务监听端口(与 app.py 原定义一致)。start_tcp_server 绑定此端口。
@@ -1699,7 +1837,7 @@ def handle_client(conn, addr):
     log.info("[TCP] 新连接: %s:%d", addr[0], addr[1])
     buf   = bytearray()
     phone = None
-    proto = None   # None=未定, '808', 'g618'
+    proto = None   # None=未定, '808', 'g618', 'jimi'
     conn.settimeout(TCP_CLIENT_TIMEOUT)
 
     try:
@@ -1717,9 +1855,14 @@ def handle_client(conn, addr):
                 log.warning("[TCP] 缓冲区超限(>64KB)，断开连接 addr=%s", addr)
                 break
 
-            # ── 协议识别：首字节 0xBD → G618G；0x7E → JT/T808 ──
+            # ── 协议识别:首字节 0xBD → G618G;0x78/0x79 → 几米KKS(L744/L745);0x7E → JT/T808 ──
             if proto is None and len(buf) >= 1:
-                proto = 'g618' if buf[0] == 0xBD else '808'
+                if buf[0] == 0xBD:
+                    proto = 'g618'
+                elif buf[0] in (0x78, 0x79):
+                    proto = 'jimi'
+                else:
+                    proto = '808'
 
             if proto == 'g618':
                 g_frames, buf = g618.split_frames(bytes(buf))
@@ -1730,6 +1873,18 @@ def handle_client(conn, addr):
                         handle_g618g_frame(conn, gf, ph_holder)
                     except Exception as e:
                         log.error("[G618G] 处理异常: %s", e, exc_info=True)
+                phone = ph_holder[0]
+                continue
+
+            if proto == 'jimi':
+                j_frames, buf = jimi.split_frames(bytes(buf))
+                buf = bytearray(buf)
+                ph_holder = [phone]
+                for jf in j_frames:
+                    try:
+                        handle_jimi_frame(conn, jf, ph_holder)
+                    except Exception as e:
+                        log.error("[L744] 处理异常: %s", e, exc_info=True)
                 phone = ph_holder[0]
                 continue
 
