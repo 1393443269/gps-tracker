@@ -1136,6 +1136,16 @@ def handle_register(sock, phone, serial, body):
         canonical_phone = resolve_phone(phone)
         plate_no_store  = plate_no_raw
 
+    # L744G(几米808)IMEI 补全:这批设备走 808 时终端号字段只 12 位、装不下 15 位 IMEI,
+    # 报文里也不发完整 IMEI(0xF6),平台只收到后 11 位截短号(如 20331208477)。整批设备真实
+    # IMEI 统一以 8681 开头,故对 L744 型号 + 11 位纯数字号,前补 8681 还原为 15 位 IMEI 供显示。
+    # ⚠ 只补到 imei 字段用于显示;主键 phone/canonical 仍用截短号,保证同一设备始终同一条记录、
+    #    会话不断(设备下次仍发截短号)。定位清楚更通用的规律前,仅限 L744/L745 型号。
+    _imei_full = ''
+    _model_reg = (info.get('terminal_model') or '').upper()
+    if ('L744' in _model_reg or 'L745' in _model_reg) and canonical_phone.isdigit() and len(canonical_phone) == 11:
+        _imei_full = '8681' + canonical_phone   # 8681 + 后11位 = 15 位 IMEI
+
     existing = db_query_one("SELECT id, auth_code FROM device WHERE phone=?", (canonical_phone,))
     if existing:
         # 关键:已存在设备保留原 auth_code,不重新生成。真实 808 设备把首次注册拿到的
@@ -1161,6 +1171,14 @@ def handle_register(sock, phone, serial, body):
             (canonical_phone, info.get('manufacturer'), info.get('terminal_model'),
              info.get('terminal_id'), plate_no_store, info.get('plate_color'), auth_code, now)
         )
+
+    # L744G 补全的 15 位 IMEI 写入 imei 字段供显示(幂等:值恒定,重复注册不影响)。
+    # 主键仍是截短号,此处只补显示用的 imei,不动 phone。
+    if _imei_full:
+        try:
+            db_exec("UPDATE device SET imei=? WHERE phone=?", (_imei_full, canonical_phone))
+        except Exception as _e:
+            log.warning("[L744] IMEI 补全写入失败 phone=%s err=%s", canonical_phone, _e)
 
     # 关键:按 canonical(device 表主键 = 下发时用的 phone)登记会话,否则用 IMEI 注册的设备
     # 会话 key 是报文头 BCD 号(≤12位)、而下发查的是 15 位 IMEI,导致"在线却下发不到"。
