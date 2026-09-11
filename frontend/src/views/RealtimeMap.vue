@@ -832,7 +832,7 @@ async function loadInitialPositions() {
         locatedPhones.add(String(d.phone))
         updateFeature({
           phone: d.phone,
-          name:  d.name || '',
+          name:  d.real_name || d.name || '',
           lat:   d.last_lat,
           lng:   d.last_lng,
           speed: d.last_speed != null ? (d.last_speed / 10).toFixed(1) : '0.0',

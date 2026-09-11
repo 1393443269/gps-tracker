@@ -7,7 +7,7 @@
         <el-form label-width="72px">
           <el-form-item label="设备">
             <el-select v-model="selectedPhone" placeholder="选择设备" @change="onDeviceChange" style="width:100%;">
-              <el-option v-for="d in devices" :key="d.phone" :label="`${d.phone}${d.plate_no ? ' '+d.plate_no : ''}`" :value="d.phone" />
+              <el-option v-for="d in devices" :key="d.phone" :label="optLabel(d)" :value="d.phone" />
             </el-select>
           </el-form-item>
           <el-form-item label="开始时间">
@@ -69,6 +69,14 @@ import { TDT_MAP_STYLE } from '@/utils/mapStyle'
 
 const devices       = ref([])
 const selectedPhone = ref('')
+
+// 下拉显示：绑定人姓名/设备名优先，括号带设备号或IMEI 便于区分（避免只显示主键/脏车牌）
+function optLabel(d) {
+  const main = d.real_name || d.name || ''
+  const idno = d.terminal_id || d.imei || d.phone || ''
+  if (main && idno && main !== idno) return `${main}（${idno}）`
+  return main || idno || '未命名设备'
+}
 const startTime     = ref('')
 const endTime       = ref('')
 const speed         = ref(3)

@@ -62,6 +62,7 @@ const routes = [
       { path: 'org',             component: () => import('@/views/OrgManage.vue'),       meta: { title: '组织管理',  roles: ['admin'] } },
       { path: 'module-auth',     component: () => import('@/views/ModuleAuth.vue'),      meta: { title: '模块授权',  roles: ['admin'] } },
       { path: 'platform-setting',component: () => import('@/views/PlatformSetting.vue'),meta: { title: '平台设置' } },
+      { path: 'open-api',        component: () => import('@/views/OpenApi.vue'),        meta: { title: '开放API', roles: ['admin'] } },
       { path: 'account-permission',component: () => import('@/views/AccountPermission.vue'),meta: { title: '账号权限', roles: ['admin'] } },
       { path: 'sims',            component: () => import('@/views/SimCard.vue'),         meta: { title: 'SIM卡管理' } },
       { path: 'recharges',       component: () => import('@/views/Recharge.vue'),        meta: { title: '充值管理' } },

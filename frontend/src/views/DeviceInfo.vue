@@ -33,6 +33,7 @@
       </el-select>
 
       <el-button v-if="isAdmin()" type="primary" @click="openBatchRole" style="margin-left:6px;">批量修改角色</el-button>
+      <el-button type="success" :icon="Upload" @click="openImport">批量导入</el-button>
       <el-button v-if="isAdmin()" :icon="Download" @click="exportAll" :loading="exporting">导出</el-button>
     </div>
 
@@ -99,7 +100,7 @@
       </el-table-column>
       <el-table-column label="操作" fixed="right" width="70" align="center">
         <template #default="{ row }">
-          <el-button v-if="isAdmin()" size="small" :icon="EditIcon" circle title="编辑人员信息"
+          <el-button size="small" :icon="EditIcon" circle title="编辑人员信息"
             @click="openEdit(row)" :disabled="!row.customer_id" />
         </template>
       </el-table-column>
@@ -180,14 +181,66 @@
         <el-button type="primary" @click="submitEdit" :loading="saving">保存</el-button>
       </template>
     </el-dialog>
+
+    <!-- 批量导入弹窗 -->
+    <el-dialog v-model="importVisible" title="批量导入设备" width="720px" @closed="resetImport">
+      <div style="margin-bottom:12px;">
+        <el-button :icon="Download" @click="downloadTemplate">下载模版</el-button>
+        <el-upload
+          style="display:inline-block;margin-left:10px;"
+          :show-file-list="false"
+          :auto-upload="false"
+          accept=".xlsx,.xls"
+          :on-change="onImportFileChange">
+          <el-button type="primary" :icon="Upload">选择 Excel 文件</el-button>
+        </el-upload>
+        <span v-if="importFileName" style="margin-left:10px;color:#606266;font-size:13px;">
+          已选：{{ importFileName }}（解析 {{ importRows.length }} 行）
+        </span>
+      </div>
+
+      <el-alert type="info" :closable="false" style="margin-bottom:12px;"
+        title="模版说明：设备号与 IMEI 至少填一个；填了姓名/性别/年龄/联系方式/联系地址的行，会自动为该设备建立人员档案并绑定。已存在的设备号/IMEI 将跳过。"
+        show-icon />
+
+      <el-table v-if="importRows.length" :data="importRows.slice(0, 200)" height="320" border size="small" stripe>
+        <el-table-column type="index" label="#" width="50" />
+        <el-table-column prop="deviceNo"     label="设备号"    min-width="130" show-overflow-tooltip />
+        <el-table-column prop="imei"         label="IMEI"      min-width="130" show-overflow-tooltip />
+        <el-table-column prop="terminalModel" label="设备型号" width="90" />
+        <el-table-column prop="contact"      label="姓名"      width="80" />
+        <el-table-column prop="gender"       label="性别"      width="55" />
+        <el-table-column prop="age"          label="年龄"      width="55" />
+        <el-table-column prop="contactPhone" label="联系方式"  min-width="115" />
+        <el-table-column prop="address"      label="联系地址"  min-width="130" show-overflow-tooltip />
+        <el-table-column prop="remark"       label="备注"      min-width="90" show-overflow-tooltip />
+      </el-table>
+      <el-empty v-else description="请选择 Excel 文件预览" :image-size="70" />
+      <div v-if="importRows.length > 200" style="color:#909399;font-size:12px;margin-top:6px;">
+        仅预览前 200 行，提交时按全部 {{ importRows.length }} 行导入。
+      </div>
+
+      <!-- 导入结果 -->
+      <el-alert v-if="importResult" :type="importResult.failed ? 'warning' : 'success'"
+        :closable="false" style="margin-top:12px;"
+        :title="`导入完成：新增 ${importResult.created} 台，跳过 ${importResult.skipped} 台，失败 ${importResult.failed} 台`"
+        show-icon />
+
+      <template #footer>
+        <el-button @click="importVisible = false">关闭</el-button>
+        <el-button type="primary" :disabled="!importRows.length" :loading="importing"
+          @click="submitImport">开始导入 {{ importRows.length ? '(' + importRows.length + ')' : '' }}</el-button>
+      </template>
+    </el-dialog>
   </el-card>
 </template>
 
 <script setup>
 import { ref, reactive, onMounted } from 'vue'
-import { Search, Edit as EditIcon, Download, Plus } from '@element-plus/icons-vue'
+import { Search, Edit as EditIcon, Download, Plus, Upload } from '@element-plus/icons-vue'
 import { deviceApi, portalApi, isAdmin, customerApi, roleApi, UPLOAD_AVATAR_URL, uploadHeaders } from '@/api'
 import { ElMessage } from 'element-plus'
+import * as XLSX from 'xlsx'
 
 // 头像相对路径 → 完整可访问地址（后端返回 /uploads/xxx）
 function avatarSrc(url) {
@@ -289,8 +342,28 @@ const roleChoice  = ref(null)
 const editVisible = ref(false)
 const saving      = ref(false)
 const editForm    = reactive({
-  customerId: null, contact: '', gender: '', age: null, phone: '', address: '', remark: '', avatar: ''
+  customerId: null, devicePhone: '', contact: '', gender: '', age: null, phone: '', address: '', remark: '', avatar: ''
 })
+
+// 批量导入弹窗
+const importVisible  = ref(false)
+const importing      = ref(false)
+const importRows     = ref([])
+const importFileName = ref('')
+const importResult   = ref(null)
+
+// 导入模版列：中文表头 → 内部字段名
+const IMPORT_COLS = [
+  { header: '设备号',   key: 'deviceNo' },
+  { header: 'IMEI',     key: 'imei' },
+  { header: '设备型号', key: 'terminalModel' },
+  { header: '姓名',     key: 'contact' },
+  { header: '性别',     key: 'gender' },
+  { header: '年龄',     key: 'age' },
+  { header: '联系方式', key: 'contactPhone' },
+  { header: '联系地址', key: 'address' },
+  { header: '备注',     key: 'remark' },
+]
 
 async function loadData(p = page.value) {
   loading.value = true
@@ -384,6 +457,7 @@ function openEdit(row) {
   if (!row.customer_id) return
   Object.assign(editForm, {
     customerId: row.customer_id,
+    devicePhone: row.phone       || '',
     contact: row.real_name       || '',
     gender:  row.gender          || '',
     age:     row.age             || null,
@@ -398,11 +472,17 @@ function openEdit(row) {
 async function submitEdit() {
   saving.value = true
   try {
-    await customerApi.update(editForm.customerId, {
+    const payload = {
       contact: editForm.contact, gender: editForm.gender, age: editForm.age,
       phone: editForm.phone, address: editForm.address, remark: editForm.remark,
       avatar: editForm.avatar,
-    })
+    }
+    // 管理员按客户id改；客户按设备phone走门户专属接口(只能改自己名下设备的绑定人)
+    if (isAdmin()) {
+      await customerApi.update(editForm.customerId, payload)
+    } else {
+      await portalApi.updateDeviceHolder(editForm.devicePhone, payload)
+    }
     ElMessage.success('保存成功')
     editVisible.value = false
     loadData()
@@ -461,6 +541,90 @@ async function exportAll() {
     ElMessage.success(`已导出 ${rows.length} 台设备`)
   } finally {
     exporting.value = false
+  }
+}
+
+// ── 批量导入 ──
+function openImport() {
+  importResult.value = null
+  importRows.value = []
+  importFileName.value = ''
+  importVisible.value = true
+}
+
+function resetImport() {
+  importRows.value = []
+  importFileName.value = ''
+  importResult.value = null
+}
+
+// 下载 Excel 模版（带表头 + 一行示例）
+function downloadTemplate() {
+  const headers = IMPORT_COLS.map(c => c.header)
+  const sample = ['866000000000001', '860000000000001', 'G618G', '张三', '男', 30, '13800138000', '广东省深圳市南山区', '示例行，可删除']
+  const ws = XLSX.utils.aoa_to_sheet([headers, sample])
+  ws['!cols'] = headers.map(() => ({ wch: 16 }))
+  const wb = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(wb, ws, '设备导入')
+  XLSX.writeFile(wb, `设备导入模版_${new Date().toISOString().slice(0, 10)}.xlsx`)
+}
+
+// 选择文件后解析为 importRows
+function onImportFileChange(file) {
+  const raw = file.raw || file
+  importResult.value = null
+  const reader = new FileReader()
+  reader.onload = (e) => {
+    try {
+      const wb = XLSX.read(e.target.result, { type: 'array' })
+      const ws = wb.Sheets[wb.SheetNames[0]]
+      const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' })
+      if (!aoa.length) { ElMessage.warning('文件内容为空'); return }
+      // 第一行为表头，建立「中文表头 → 列下标」映射
+      const headerRow = aoa[0].map(h => String(h).trim())
+      const idxOf = (h) => headerRow.indexOf(h)
+      const rows = []
+      for (let i = 1; i < aoa.length; i++) {
+        const r = aoa[i]
+        if (!r || r.every(c => String(c).trim() === '')) continue   // 跳过空行
+        const obj = {}
+        IMPORT_COLS.forEach(col => {
+          const ci = idxOf(col.header)
+          obj[col.key] = ci >= 0 ? String(r[ci] ?? '').trim() : ''
+        })
+        rows.push(obj)
+      }
+      if (!rows.length) { ElMessage.warning('没有可导入的数据行'); return }
+      importRows.value = rows
+      importFileName.value = file.name || '已选文件'
+      ElMessage.success(`解析成功，共 ${rows.length} 行`)
+    } catch (err) {
+      ElMessage.error('文件解析失败，请确认是标准 Excel 文件')
+    }
+  }
+  reader.readAsArrayBuffer(raw)
+}
+
+// 提交导入
+async function submitImport() {
+  if (!importRows.value.length) { ElMessage.warning('请先选择并解析文件'); return }
+  importing.value = true
+  try {
+    const res = isAdmin() ? await deviceApi.batchImport(importRows.value)
+                          : await portalApi.batchImport(importRows.value)
+    importResult.value = res.data || res
+    const rst = importResult.value
+    if (rst.failed) {
+      ElMessage.warning(`导入完成，有 ${rst.failed} 台失败`)
+    } else {
+      ElMessage.success(`导入完成，新增 ${rst.created} 台`)
+    }
+    loadData(1)
+    loadModelOptions()
+  } catch (e) {
+    ElMessage.error('导入失败，请重试')
+  } finally {
+    importing.value = false
   }
 }
 

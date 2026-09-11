@@ -346,6 +346,32 @@ def init_db():
         password_hash TEXT NOT NULL,
         created_at    TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
     );
+
+    CREATE TABLE IF NOT EXISTS api_key (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        app_name     TEXT NOT NULL,
+        api_key      TEXT UNIQUE NOT NULL,
+        api_secret   TEXT NOT NULL,
+        customer_id  INTEGER,
+        org_id       INTEGER DEFAULT 1,
+        status       INTEGER DEFAULT 1,
+        remark       TEXT DEFAULT '',
+        last_used_at TEXT,
+        created_at   TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
+    );
+
+    CREATE TABLE IF NOT EXISTS push_config (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        callback_url TEXT NOT NULL,
+        secret       TEXT DEFAULT '',
+        events       TEXT DEFAULT 'location,alarm',
+        org_id       INTEGER DEFAULT 1,
+        enabled      INTEGER DEFAULT 1,
+        remark       TEXT DEFAULT '',
+        last_ok_at   TEXT,
+        last_err     TEXT DEFAULT '',
+        created_at   TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
+    );
     """)
     conn.commit()
 
@@ -1017,9 +1043,12 @@ def create_device():
 
 @app.post('/api/devices/import')
 def import_devices():
-    """批量导入设备。请求体:{"rows":[{deviceNo,imei,name,plateNo,terminalModel,remark}, ...]}
+    """批量导入设备。请求体:{"rows":[{deviceNo,imei,name,plateNo,terminalModel,remark,
+                                       contact,gender,age,contactPhone,address}, ...]}
     规则:设备号(deviceNo)与 IMEI 至少填一个;主键 phone 优先取设备号、没有则用 IMEI;
          库内已存在或本批内重复的跳过;其余建档。兼容旧模板单列 phone(当设备号)。
+    人员信息(姓名/性别/年龄/联系方式/联系地址)若任一非空,则为该设备自动创建一个客户
+         记录承载人员信息并绑定(device.customer_id),与设备信息页「编辑人员信息」口径一致。
     返回:{created, skipped, failed, details:[{row,phone,status,reason}]}
     """
     data = request.get_json() or {}
@@ -1029,6 +1058,7 @@ def import_devices():
     if len(rows) > 5000:
         return fail('单次导入不能超过 5000 条,请分批导入')
 
+    admin_org_id = _admin_org_id()   # 新建设备/客户归属当前管理员组织
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     created = skipped = failed = 0
     details = []
@@ -1062,15 +1092,53 @@ def import_devices():
             skipped += 1
             details.append({'row': rownum, 'phone': phone, 'status': 'skipped', 'reason': '设备号/IMEI 已存在'})
             continue
+
+        # 人员信息:姓名/性别/年龄/联系方式/联系地址任一非空则视为需建客户承载
+        _contact = str(r.get('contact') or r.get('realName') or r.get('holderName') or '').strip()
+        _gender  = str(r.get('gender') or '').strip()
+        _cphone  = str(r.get('contactPhone') or r.get('contact_phone') or '').strip()
+        _address = str(r.get('address') or '').strip()
+        _age_raw = r.get('age')
+        try:
+            _age = int(_age_raw) if (_age_raw not in (None, '', '—')) else None
+        except (ValueError, TypeError):
+            _age = None
+        _has_person = any([_contact, _gender, _cphone, _address, _age is not None])
+        _dev_remark = str(r.get('remark', '') or '')
+
         try:
             db_exec(
                 "INSERT INTO device (phone,name,plate_no,manufacturer,terminal_model,"
                 "terminal_id,imei,plate_color,auth_code,status,org_id,lifecycle,remark,created_at,updated_at)"
-                " VALUES (?,?,?,?,?,?,?,1,'DEFAULT',0,1,0,?,?,?)",
+                " VALUES (?,?,?,?,?,?,?,1,'DEFAULT',0,?,0,?,?,?)",
                 (phone, str(r.get('name', '') or ''), str(r.get('plateNo', '') or ''),
                  str(r.get('manufacturer', '') or ''), str(r.get('terminalModel', '') or ''),
-                 dev_no, imei, str(r.get('remark', '') or ''), now, now)
+                 dev_no, imei, admin_org_id, _dev_remark, now, now)
             )
+            # 有人员信息:建客户并绑定到该设备
+            if _has_person:
+                try:
+                    _cust_name = _contact or str(r.get('name', '') or '') or ('设备' + phone[-6:])
+                    _cid = None
+                    with _db_lock:
+                        _conn = get_db()
+                        try:
+                            _cur = _conn.execute(
+                                "INSERT INTO customer (name,contact,phone,email,status,reg_date,remark,"
+                                "org_id,gender,age,address) VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
+                                (_cust_name, _contact, _cphone, '', '活跃', now, _dev_remark,
+                                 admin_org_id, _gender, _age, _address)
+                            )
+                            _crow = _cur.fetchone()
+                            if _crow is not None:
+                                _cid = dict(_crow).get('id')
+                            _conn.commit()
+                        finally:
+                            _conn.close()
+                    if _cid:
+                        db_exec("UPDATE device SET customer_id=? WHERE phone=?", (_cid, phone))
+                except Exception as _pe:
+                    log.warning('[设备导入] 人员信息落库失败 phone=%s err=%s', phone, _pe)
             created += 1
             details.append({'row': rownum, 'phone': phone, 'status': 'created', 'reason': ''})
         except Exception as e:
@@ -1360,6 +1428,250 @@ def batch_bind_devices():
             [cid, now] + list(ids) + scope_args)
     add_op_log('批量绑定', f'{len(ids)} 台设备绑定/转移至客户 {cust["name"]}')
     return ok({'updated': len(ids)})
+
+
+@app.post('/api/devices/batch_bind_by_imei')
+def batch_bind_devices_by_imei():
+    """按 IMEI+姓名 批量绑定设备到子账号(对齐 aiday 批量绑定)。
+    请求体:{"items":[{"imei":"...","name":"..."}], "create_account":true/false}
+      - create_account=True:为每个姓名自动创建子客户账号(登录名=姓名,随机密码),
+        账号归属当前管理员组织,并绑定设备。
+      - create_account=False:按姓名匹配已存在客户则绑定;匹配不到则该行失败。
+    IMEI 支持匹配 device.imei 或 device.terminal_id 或 device.phone。
+    返回:{bound, failed, details:[{imei,name,status,reason,login_name,password}]}
+    """
+    import secrets
+    data  = request.get_json() or {}
+    items = data.get('items') or []
+    create_account = bool(data.get('create_account'))
+    if not isinstance(items, list) or not items:
+        return fail('绑定数据为空')
+    if len(items) > 2000:
+        return fail('单次绑定不能超过 2000 条,请分批处理')
+
+    admin_org_id = _admin_org_id()
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    def _gen_pw(n=10):
+        alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789'
+        while True:
+            pw = ''.join(secrets.choice(alphabet) for _ in range(n))
+            if (any(ch.isupper() for ch in pw) and any(ch.islower() for ch in pw)
+                    and any(ch.isdigit() for ch in pw)):
+                return pw
+
+    bound = failed = 0
+    details = []
+    for idx, it in enumerate(items):
+        rownum = idx + 1
+        if not isinstance(it, dict):
+            failed += 1
+            details.append({'row': rownum, 'imei': '', 'name': '', 'status': 'failed', 'reason': '行格式错误'})
+            continue
+        imei = str(it.get('imei') or '').strip()
+        name = str(it.get('name') or '').strip()
+        if not imei:
+            failed += 1
+            details.append({'row': rownum, 'imei': imei, 'name': name, 'status': 'failed', 'reason': 'IMEI 不能为空'})
+            continue
+        if not name:
+            failed += 1
+            details.append({'row': rownum, 'imei': imei, 'name': name, 'status': 'failed', 'reason': '姓名不能为空'})
+            continue
+
+        sids = _org_scope_ids(request)
+        if sids is not None:
+            if not sids:
+                return fail('无权限', 403)
+            scope_ph = ','.join('?' * len(sids))
+            dev = db_query_one(
+                f"SELECT id, phone, customer_id FROM device "
+                f"WHERE (imei=? OR terminal_id=? OR phone=?) AND org_id IN ({scope_ph})",
+                [imei, imei, imei] + list(sids))
+        else:
+            dev = db_query_one(
+                "SELECT id, phone, customer_id FROM device WHERE imei=? OR terminal_id=? OR phone=?",
+                (imei, imei, imei))
+        if not dev:
+            failed += 1
+            details.append({'row': rownum, 'imei': imei, 'name': name, 'status': 'failed', 'reason': '设备不存在或无权限'})
+            continue
+
+        login_name_out = ''
+        password_out   = ''
+        try:
+            if create_account:
+                base_login = name
+                login_name = base_login
+                suffix = 1
+                while db_query_one("SELECT id FROM customer WHERE login_name=?", (login_name,)):
+                    suffix += 1
+                    login_name = f"{base_login}{suffix}"
+                raw_pw = _gen_pw()
+                _cid = None
+                with _db_lock:
+                    conn = get_db()
+                    try:
+                        cur = conn.execute(
+                            "INSERT INTO customer (name,contact,phone,email,status,reg_date,remark,"
+                            "org_id,login_name,password_hash) VALUES (?,?,?,?,?,?,?,?,?,?) RETURNING id",
+                            (name, name, '', '', '活跃', now, '批量绑定自动创建',
+                             admin_org_id, login_name, _hash_pw(raw_pw))
+                        )
+                        crow = cur.fetchone()
+                        if crow is not None:
+                            _cid = dict(crow).get('id')
+                        conn.commit()
+                    finally:
+                        conn.close()
+                if not _cid:
+                    failed += 1
+                    details.append({'row': rownum, 'imei': imei, 'name': name, 'status': 'failed', 'reason': '创建账号失败'})
+                    continue
+                db_exec("UPDATE device SET customer_id=?,updated_at=? WHERE id=?", (_cid, now, dev['id']))
+                login_name_out = login_name
+                password_out   = raw_pw
+            else:
+                sids2 = _org_scope_ids(request)
+                if sids2 is not None:
+                    scope_ph = ','.join('?' * len(sids2))
+                    cust = db_query_one(
+                        f"SELECT id FROM customer WHERE name=? AND org_id IN ({scope_ph})",
+                        [name] + list(sids2))
+                else:
+                    cust = db_query_one("SELECT id FROM customer WHERE name=?", (name,))
+                if not cust:
+                    failed += 1
+                    details.append({'row': rownum, 'imei': imei, 'name': name, 'status': 'failed', 'reason': '未找到同名账号(可勾选创建子账号)'})
+                    continue
+                db_exec("UPDATE device SET customer_id=?,updated_at=? WHERE id=?", (cust['id'], now, dev['id']))
+            bound += 1
+            details.append({'row': rownum, 'imei': imei, 'name': name, 'status': 'bound',
+                            'reason': '', 'login_name': login_name_out, 'password': password_out})
+        except Exception as e:
+            failed += 1
+            details.append({'row': rownum, 'imei': imei, 'name': name, 'status': 'failed', 'reason': str(e)[:120]})
+
+    add_op_log('按IMEI批量绑定', f'绑定 {bound} 台,失败 {failed} 台,建账号={create_account}')
+    return ok({'bound': bound, 'failed': failed, 'details': details})
+
+
+@app.post('/api/customer/devices/batch_bind_by_imei')
+def portal_batch_bind_by_imei():
+    """客户端按 IMEI+姓名 批量绑定设备到子账号(严格隔离版)。
+    请求体:{"items":[{"imei","name"}], "create_account":true/false}
+    越权防护:
+      - 设备必须属于当前登录客户及其下级(customer_id IN 子树),否则该行失败;
+      - create_account=True 时,新建子账号 parent_id=当前客户(挂本客户名下作下级),org 跟随客户;
+      - create_account=False 时,按姓名只在本客户子树内匹配已有客户。
+    返回:{bound, failed, details:[{imei,name,status,reason,login_name,password}]}
+    """
+    import secrets
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    data  = request.get_json() or {}
+    items = data.get('items') or []
+    create_account = bool(data.get('create_account'))
+    if not isinstance(items, list) or not items:
+        return fail('绑定数据为空')
+    if len(items) > 2000:
+        return fail('单次绑定不能超过 2000 条,请分批处理')
+
+    _cust = db_query_one("SELECT org_id FROM customer WHERE id=?", (cid,))
+    org_id = (_cust.get('org_id') if _cust else 1) or 1
+    all_cids = _get_all_descendant_cids(cid)
+    cid_ph   = ','.join('?' * len(all_cids))
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    def _gen_pw(n=10):
+        alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789'
+        while True:
+            pw = ''.join(secrets.choice(alphabet) for _ in range(n))
+            if (any(ch.isupper() for ch in pw) and any(ch.islower() for ch in pw)
+                    and any(ch.isdigit() for ch in pw)):
+                return pw
+
+    bound = failed = 0
+    details = []
+    for idx, it in enumerate(items):
+        rownum = idx + 1
+        if not isinstance(it, dict):
+            failed += 1
+            details.append({'row': rownum, 'imei': '', 'name': '', 'status': 'failed', 'reason': '行格式错误'})
+            continue
+        imei = str(it.get('imei') or '').strip()
+        name = str(it.get('name') or '').strip()
+        if not imei:
+            failed += 1
+            details.append({'row': rownum, 'imei': imei, 'name': name, 'status': 'failed', 'reason': 'IMEI 不能为空'})
+            continue
+        if not name:
+            failed += 1
+            details.append({'row': rownum, 'imei': imei, 'name': name, 'status': 'failed', 'reason': '姓名不能为空'})
+            continue
+
+        dev = db_query_one(
+            f"SELECT id, phone, customer_id FROM device "
+            f"WHERE (imei=? OR terminal_id=? OR phone=?) AND customer_id IN ({cid_ph})",
+            [imei, imei, imei] + all_cids)
+        if not dev:
+            failed += 1
+            details.append({'row': rownum, 'imei': imei, 'name': name, 'status': 'failed', 'reason': '设备不存在或不在您名下'})
+            continue
+
+        login_name_out = ''
+        password_out   = ''
+        try:
+            if create_account:
+                base_login = name
+                login_name = base_login
+                suffix = 1
+                while db_query_one("SELECT id FROM customer WHERE login_name=?", (login_name,)):
+                    suffix += 1
+                    login_name = f"{base_login}{suffix}"
+                raw_pw = _gen_pw()
+                _newcid = None
+                with _db_lock:
+                    conn = get_db()
+                    try:
+                        cur = conn.execute(
+                            "INSERT INTO customer (name,contact,phone,email,status,reg_date,remark,"
+                            "org_id,parent_id,login_name,password_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
+                            (name, name, '', '', '活跃', now, '批量绑定自动创建',
+                             org_id, cid, login_name, _hash_pw(raw_pw))
+                        )
+                        crow = cur.fetchone()
+                        if crow is not None:
+                            _newcid = dict(crow).get('id')
+                        conn.commit()
+                    finally:
+                        conn.close()
+                if not _newcid:
+                    failed += 1
+                    details.append({'row': rownum, 'imei': imei, 'name': name, 'status': 'failed', 'reason': '创建账号失败'})
+                    continue
+                db_exec("UPDATE device SET customer_id=?,updated_at=? WHERE id=?", (_newcid, now, dev['id']))
+                login_name_out = login_name
+                password_out   = raw_pw
+            else:
+                cust = db_query_one(
+                    f"SELECT id FROM customer WHERE name=? AND id IN ({cid_ph})",
+                    [name] + all_cids)
+                if not cust:
+                    failed += 1
+                    details.append({'row': rownum, 'imei': imei, 'name': name, 'status': 'failed', 'reason': '未找到您名下的同名账号(可勾选创建子账号)'})
+                    continue
+                db_exec("UPDATE device SET customer_id=?,updated_at=? WHERE id=?", (cust['id'], now, dev['id']))
+            bound += 1
+            details.append({'row': rownum, 'imei': imei, 'name': name, 'status': 'bound',
+                            'reason': '', 'login_name': login_name_out, 'password': password_out})
+        except Exception as e:
+            failed += 1
+            details.append({'row': rownum, 'imei': imei, 'name': name, 'status': 'failed', 'reason': str(e)[:120]})
+
+    add_op_log('客户按IMEI批量绑定', f'客户#{cid} 绑定 {bound} 台,失败 {failed} 台,建账号={create_account}')
+    return ok({'bound': bound, 'failed': failed, 'details': details})
 
 
 @app.put('/api/devices/<int:did>/role')
@@ -3649,7 +3961,8 @@ def portal_devices():
     cid_ph   = ','.join('?' * len(all_cids))
     records  = db_query(
         f"SELECT d.phone, d.name, d.last_lat, d.last_lng, d.last_speed, "
-        f"d.last_location_time, d.status, d.last_battery, d.last_battery_time, "
+        f"d.last_location_time, d.status, d.presence_state, d.offline_reason, "
+        f"d.last_battery, d.last_battery_time, "
         f"d.terminal_id, d.imei, d.terminal_model, c.name AS customer_name "
         f"FROM device d LEFT JOIN customer c ON d.customer_id = c.id "
         f"WHERE d.customer_id IN ({cid_ph})",
@@ -4387,6 +4700,34 @@ def portal_update_device(phone):
 
 # ── 客户门户：处理报警 ────────────────────────────────────────────────────────
 
+@app.put('/api/customer/devices/<path:phone>/holder')
+def portal_update_device_holder(phone):
+    """客户端更新设备「绑定人/人员信息」(姓名/性别/年龄/联系方式/地址/备注/头像)。
+    与管理端设备信息页「编辑人员信息」口径一致,但改动限制在当前客户子树内的设备,
+    且只更新该设备所绑定客户(customer_id)的人员字段,不动登录账号/密码。"""
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    all_cids = _get_all_descendant_cids(cid)
+    cid_ph   = ','.join('?' * len(all_cids))
+    dev = db_query_one(
+        f"SELECT phone, customer_id FROM device WHERE phone=? AND customer_id IN ({cid_ph})",
+        [phone] + all_cids)
+    if not dev:
+        return fail('设备不存在或不在您名下', 404)
+    target_cid = dev.get('customer_id')
+    if not target_cid:
+        return fail('该设备未绑定人员', 400)
+    d = request.get_json() or {}
+    db_exec(
+        "UPDATE customer SET contact=?, gender=?, age=?, phone=?, address=?, remark=?, avatar=? WHERE id=?",
+        (d.get('contact', ''), d.get('gender', ''), d.get('age') or None,
+         d.get('phone', ''), d.get('address', ''), d.get('remark', ''),
+         d.get('avatar', ''), target_cid))
+    add_op_log('客户编辑人员信息', f'客户#{cid} 更新设备 {phone} 绑定人资料')
+    return ok()
+
+
 @app.put('/api/customer/alarms/<int:aid>/handle')
 def portal_handle_alarm(aid):
     cid = _get_portal_customer()
@@ -4411,30 +4752,61 @@ def portal_list_sub_customers():
         return fail('未授权', 401)
     page, size = _page_params(20)
     keyword = request.args.get('keyword', '').strip()
+    parent  = request.args.get('parent_id', '').strip()
     offset  = (page - 1) * size
-    if keyword:
-        kw      = f'%{keyword}%'
-        total   = db_scalar("SELECT COUNT(*) FROM customer WHERE parent_id=? AND id!=? AND (name LIKE ? OR contact LIKE ? OR phone LIKE ?)",
-                            (cid, cid, kw, kw, kw))
-        rows    = db_query("SELECT id,name,contact,phone,email,status,login_name,remark,created_at "
-                           "FROM customer WHERE parent_id=? AND id!=? AND (name LIKE ? OR contact LIKE ? OR phone LIKE ?) "
-                           "ORDER BY id DESC LIMIT ? OFFSET ?",
-                           (cid, cid, kw, kw, kw, size, offset))
-    else:
-        total   = db_scalar("SELECT COUNT(*) FROM customer WHERE parent_id=? AND id!=?", (cid, cid))
-        rows    = db_query("SELECT id,name,contact,phone,email,status,login_name,remark,created_at "
-                           "FROM customer WHERE parent_id=? AND id!=? ORDER BY id DESC LIMIT ? OFFSET ?",
-                           (cid, cid, size, offset))
-    # 批量查设备数（单条 GROUP BY 替代 N 次循环）
-    if rows:
+
+    all_cids = _get_all_descendant_cids(cid)
+
+    def _attach_extra(rows):
+        if not rows:
+            return
         sub_ids = [r['id'] for r in rows]
         ph = ','.join(['?'] * len(sub_ids))
         dc_rows = db_query(
             f"SELECT customer_id, COUNT(*) AS cnt FROM device WHERE customer_id IN ({ph}) GROUP BY customer_id",
             sub_ids)
         dc_map = {row['customer_id']: row['cnt'] for row in dc_rows}
+        ch_rows = db_query(
+            f"SELECT parent_id, COUNT(*) AS cnt FROM customer WHERE parent_id IN ({ph}) GROUP BY parent_id",
+            sub_ids)
+        ch_map = {row['parent_id']: row['cnt'] for row in ch_rows}
         for r in rows:
             r['device_count'] = dc_map.get(r['id'], 0)
+            r['has_children'] = ch_map.get(r['id'], 0) > 0
+
+    if keyword:
+        kw = f'%{keyword}%'
+        scope = [x for x in all_cids if x != cid]
+        if not scope:
+            return ok({'records': [], 'total': 0, 'page': page})
+        ph = ','.join('?' * len(scope))
+        total = db_scalar(
+            f"SELECT COUNT(*) FROM customer WHERE id IN ({ph}) AND (name LIKE ? OR contact LIKE ? OR phone LIKE ?)",
+            scope + [kw, kw, kw])
+        rows = db_query(
+            f"SELECT id,name,contact,phone,email,status,login_name,remark,parent_id,created_at "
+            f"FROM customer WHERE id IN ({ph}) AND (name LIKE ? OR contact LIKE ? OR phone LIKE ?) "
+            f"ORDER BY id DESC LIMIT ? OFFSET ?",
+            scope + [kw, kw, kw, size, offset])
+        _attach_extra(rows)
+        return ok({'records': rows, 'total': total, 'page': page})
+
+    if parent and parent.lower() != 'null':
+        try:
+            pid = int(parent)
+        except ValueError:
+            pid = cid
+        if pid not in all_cids:
+            return fail('无权限', 403)
+    else:
+        pid = cid
+
+    total = db_scalar("SELECT COUNT(*) FROM customer WHERE parent_id=? AND id!=?", (pid, pid))
+    rows  = db_query(
+        "SELECT id,name,contact,phone,email,status,login_name,remark,parent_id,created_at "
+        "FROM customer WHERE parent_id=? AND id!=? ORDER BY id DESC LIMIT ? OFFSET ?",
+        (pid, pid, size, offset))
+    _attach_extra(rows)
     return ok({'records': rows, 'total': total, 'page': page})
 
 
@@ -5578,6 +5950,410 @@ from core.ingest import start_mqtt_subscriber
 
 # ── 前端静态文件托管（生产 build / 演示用） ────────────────────────────────────
 _DIST = os.path.normpath(os.path.join(BASE_DIR, '..', 'frontend', 'dist'))
+
+# ── 开放API与数据推送 管理接口(管理员，走 /api/* 守卫) ────────────────────────
+@app.get('/api/openapi/keys')
+def list_api_keys():
+    rows = db_query("SELECT id, app_name, api_key, api_secret, customer_id, org_id, status, "
+                    "remark, last_used_at, created_at FROM api_key ORDER BY id DESC")
+    return ok({'records': rows, 'total': len(rows)})
+
+@app.post('/api/openapi/keys')
+def create_api_key():
+    import secrets as _secrets
+    d = request.get_json() or {}
+    app_name = (d.get('app_name') or '').strip()
+    if not app_name:
+        return fail('应用名称不能为空', 400)
+    api_key    = 'ak_' + _secrets.token_hex(12)
+    api_secret = _secrets.token_hex(24)
+    customer_id = d.get('customer_id') or None
+    org_id = _admin_org_id()
+    db_exec("INSERT INTO api_key (app_name, api_key, api_secret, customer_id, org_id, status, remark) "
+            "VALUES (?,?,?,?,?,1,?)",
+            (app_name, api_key, api_secret, customer_id, org_id, d.get('remark', '')))
+    add_op_log('开放API', f'创建ApiKey {app_name}')
+    return ok({'api_key': api_key, 'api_secret': api_secret})
+
+@app.put('/api/openapi/keys/<int:kid>')
+def update_api_key(kid):
+    d = request.get_json() or {}
+    row = db_query_one("SELECT id FROM api_key WHERE id=?", (kid,))
+    if not row:
+        return fail('ApiKey 不存在', 404)
+    status = 1 if d.get('status', 1) else 0
+    db_exec("UPDATE api_key SET app_name=COALESCE(?,app_name), status=?, remark=? WHERE id=?",
+            (d.get('app_name'), status, d.get('remark', ''), kid))
+    add_op_log('开放API', f'更新ApiKey id={kid} status={status}')
+    return ok()
+
+@app.delete('/api/openapi/keys/<int:kid>')
+def delete_api_key(kid):
+    db_exec("DELETE FROM api_key WHERE id=?", (kid,))
+    add_op_log('开放API', f'删除ApiKey id={kid}')
+    return ok()
+
+@app.get('/api/openapi/push')
+def list_push_config():
+    rows = db_query("SELECT id, callback_url, secret, events, org_id, enabled, remark, "
+                    "last_ok_at, last_err, created_at FROM push_config ORDER BY id DESC")
+    return ok({'records': rows, 'total': len(rows)})
+
+@app.post('/api/openapi/push')
+def create_push_config():
+    d = request.get_json() or {}
+    url = (d.get('callback_url') or '').strip()
+    if not url.startswith('http'):
+        return fail('回调地址必须以 http(s) 开头', 400)
+    db_exec("INSERT INTO push_config (callback_url, secret, events, org_id, enabled, remark) "
+            "VALUES (?,?,?,?,?,?)",
+            (url, d.get('secret', ''), d.get('events', 'alarm'), _admin_org_id(),
+             1 if d.get('enabled', True) else 0, d.get('remark', '')))
+    add_op_log('数据推送', f'新增回调 {url}')
+    return ok()
+
+@app.put('/api/openapi/push/<int:pid>')
+def update_push_config(pid):
+    d = request.get_json() or {}
+    row = db_query_one("SELECT id FROM push_config WHERE id=?", (pid,))
+    if not row:
+        return fail('推送配置不存在', 404)
+    url = (d.get('callback_url') or '').strip()
+    if url and not url.startswith('http'):
+        return fail('回调地址必须以 http(s) 开头', 400)
+    db_exec("UPDATE push_config SET callback_url=COALESCE(NULLIF(?,''),callback_url), "
+            "secret=?, events=?, enabled=?, remark=? WHERE id=?",
+            (url, d.get('secret', ''), d.get('events', 'alarm'),
+             1 if d.get('enabled', True) else 0, d.get('remark', ''), pid))
+    add_op_log('数据推送', f'更新回调 id={pid}')
+    return ok()
+
+@app.delete('/api/openapi/push/<int:pid>')
+def delete_push_config(pid):
+    db_exec("DELETE FROM push_config WHERE id=?", (pid,))
+    add_op_log('数据推送', f'删除回调 id={pid}')
+    return ok()
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 数据推送：后台线程轮询 alarm_record 增量，把新报警 POST 到 push_config 回调 URL。
+# 采用「轮询增量」而非「事件挂钩」，对现有接入/报警代码零侵入，生产更安全。
+# 回调请求带签名头：X-Push-Timestamp、X-Push-Sign = HMAC-SHA256(secret, timestamp+"\n"+body)
+# push_config.events 逗号分隔控制订阅事件(当前实现 alarm；location 量大默认不推)。
+# 失败重试3次(指数退避)，结果写回 push_config.last_ok_at / last_err。
+# ════════════════════════════════════════════════════════════════════════════
+import threading as _threading_push
+import json as _json_push
+import hmac as _hmac_push
+import hashlib as _hashlib_push
+import urllib.request as _urlreq_push
+import time as _time_push
+
+def _do_push(cfg, payload_bytes):
+    """向单个回调地址 POST 一次，带签名。成功返回 True。"""
+    ts = str(int(_time_push.time()))
+    secret = cfg.get('secret') or ''
+    sign = _hmac_push.new(secret.encode(), (ts + "\n").encode() + payload_bytes,
+                          _hashlib_push.sha256).hexdigest() if secret else ''
+    req = _urlreq_push.Request(cfg['callback_url'], data=payload_bytes, method='POST')
+    req.add_header('Content-Type', 'application/json; charset=utf-8')
+    req.add_header('X-Push-Timestamp', ts)
+    if sign:
+        req.add_header('X-Push-Sign', sign)
+    resp = _urlreq_push.urlopen(req, timeout=10)
+    return 200 <= resp.getcode() < 300
+
+def _push_one(cfg, event, data):
+    """把一条事件推给一个回调(含3次重试)，返回(ok, last_err)。"""
+    payload = _json_push.dumps({'event': event, 'data': data,
+                                'timestamp': int(_time_push.time())},
+                               ensure_ascii=False).encode('utf-8')
+    last_err = ''
+    for attempt in range(3):
+        try:
+            if _do_push(cfg, payload):
+                return True, ''
+            last_err = 'HTTP 非 2xx'
+        except Exception as e:
+            last_err = str(e)[:200]
+        _time_push.sleep(2 ** attempt)   # 1,2,4 秒退避
+    return False, last_err
+
+def _push_alarm_poller():
+    """轮询 alarm_record 增量并推送。每 5 秒一轮。"""
+    log.info("[数据推送] 报警推送线程已启动")
+    # 启动时以当前最大 id 为基线，只推此后产生的新报警(不回灌历史)
+    try:
+        last_id = db_scalar("SELECT COALESCE(MAX(id),0) FROM alarm_record") or 0
+    except Exception:
+        last_id = 0
+    while True:
+        try:
+            _time_push.sleep(5)
+            cfgs = db_query("SELECT * FROM push_config WHERE enabled=1")
+            if not cfgs:
+                # 无配置时也要推进基线，避免开启后灌历史
+                try:
+                    last_id = db_scalar("SELECT COALESCE(MAX(id),0) FROM alarm_record") or last_id
+                except Exception:
+                    pass
+                continue
+            rows = db_query(
+                "SELECT id, phone, alarm_type, alarm_desc, lat, lng, speed, alarm_time "
+                "FROM alarm_record WHERE id > ? ORDER BY id ASC LIMIT 200", (last_id,))
+            if not rows:
+                continue
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            for r in rows:
+                data = {
+                    'phone': r.get('phone'), 'alarmType': r.get('alarm_type'),
+                    'alarmDesc': r.get('alarm_desc'), 'lat': r.get('lat'), 'lng': r.get('lng'),
+                    'speed': r.get('speed'), 'time': r.get('alarm_time'),
+                }
+                for cfg in cfgs:
+                    subs = [s.strip() for s in (cfg.get('events') or 'alarm').split(',')]
+                    if 'alarm' not in subs:
+                        continue
+                    ok_flag, last_err = _push_one(cfg, 'alarm', data)
+                    try:
+                        if ok_flag:
+                            db_exec("UPDATE push_config SET last_ok_at=?, last_err='' WHERE id=?", (now, cfg['id']))
+                        else:
+                            db_exec("UPDATE push_config SET last_err=? WHERE id=?", (last_err, cfg['id']))
+                            log.warning("[数据推送] 回调失败 url=%s err=%s", cfg.get('callback_url'), last_err)
+                    except Exception:
+                        pass
+                last_id = r['id']
+        except Exception as e:
+            log.error("[数据推送] 轮询线程异常: %s", e)
+            _time_push.sleep(3)
+
+def start_push_worker():
+    """启动报警推送后台线程(gunicorn post_fork 调用)。"""
+    t = _threading_push.Thread(target=_push_alarm_poller, daemon=True, name='push-poller')
+    t.start()
+    return t
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 开放 API（/openapi/*）：第三方系统用 ApiKey+Secret 签名调用，独立于管理员 Token。
+# 走 /openapi 前缀，不被 /api/* 的 before_request 守卫拦截，自行做签名鉴权与数据隔离。
+# 签名方式：X-Sign = HMAC-SHA256(secret, api_key + "\n" + timestamp + "\n" + method + "\n" + path)
+#   请求头：X-Api-Key、X-Timestamp（unix 秒）、X-Sign（hex）
+#   时间戳与服务器相差 300 秒内有效，防重放。
+# ════════════════════════════════════════════════════════════════════════════
+import hmac as _hmac_oa
+import hashlib as _hashlib_oa
+
+def _openapi_verify():
+    """校验开放 API 签名。成功返回 api_key 行(dict)，失败返回 (None, 错误响应)。"""
+    api_key   = request.headers.get('X-Api-Key', '').strip()
+    timestamp = request.headers.get('X-Timestamp', '').strip()
+    sign      = request.headers.get('X-Sign', '').strip()
+    if not api_key or not timestamp or not sign:
+        return None, (fail('缺少签名参数(X-Api-Key/X-Timestamp/X-Sign)', 401))
+    try:
+        ts = int(timestamp)
+    except ValueError:
+        return None, (fail('X-Timestamp 非法', 401))
+    import time as _t
+    if abs(_t.time() - ts) > 300:
+        return None, (fail('请求已过期(时间戳超出5分钟)', 401))
+    row = db_query_one("SELECT * FROM api_key WHERE api_key=? AND status=1", (api_key,))
+    if not row:
+        return None, (fail('ApiKey 无效或已停用', 401))
+    raw = api_key + "\n" + timestamp + "\n" + request.method + "\n" + request.path
+    expected = _hmac_oa.new(row['api_secret'].encode(), raw.encode(), _hashlib_oa.sha256).hexdigest()
+    if not _hmac_oa.compare_digest(expected, sign):
+        return None, (fail('签名校验失败', 401))
+    # 更新最后使用时间(异步性不强,直接写)
+    try:
+        db_exec("UPDATE api_key SET last_used_at=? WHERE id=?",
+                (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), row['id']))
+    except Exception:
+        pass
+    return row, None
+
+
+def _openapi_scope_ids(key_row):
+    """返回该 ApiKey 可见的 customer_id 子树(含自身及所有下级)。
+    key_row.customer_id 为空表示绑定到组织级(返回 None 表示按 org 过滤)。"""
+    cid = key_row.get('customer_id')
+    if not cid:
+        return None   # 组织级：用 org_id 过滤
+    # 递归取该客户及其所有下级子账号
+    ids = [cid]
+    frontier = [cid]
+    seen = set(ids)
+    while frontier:
+        ph = ','.join('?' * len(frontier))
+        subs = db_query(f"SELECT id FROM customer WHERE parent_id IN ({ph})", frontier)
+        nxt = [s['id'] for s in subs if s['id'] not in seen]
+        for s in nxt:
+            seen.add(s)
+        ids.extend(nxt)
+        frontier = nxt
+    return ids
+
+
+def _openapi_device_allowed(key_row, phone):
+    """校验 phone 设备是否在该 ApiKey 的可见范围内。返回 device 行或 None。"""
+    scope = _openapi_scope_ids(key_row)
+    if scope is None:
+        # 组织级
+        return db_query_one("SELECT * FROM device WHERE phone=? AND org_id=?",
+                            (phone, key_row.get('org_id') or 1))
+    if not scope:
+        return None
+    ph = ','.join('?' * len(scope))
+    return db_query_one(
+        f"SELECT * FROM device WHERE phone=? AND customer_id IN ({ph})",
+        [phone] + scope)
+
+
+@app.get('/openapi/ping')
+def openapi_ping():
+    """连通性测试(仍需签名)。返回 ApiKey 绑定信息。"""
+    key_row, err = _openapi_verify()
+    if err:
+        return err
+    return ok({'app_name': key_row['app_name'], 'customer_id': key_row.get('customer_id'),
+               'org_id': key_row.get('org_id'), 'server_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+
+
+@app.get('/openapi/devices')
+def openapi_devices():
+    """设备列表(该 ApiKey 范围内)。"""
+    key_row, err = _openapi_verify()
+    if err:
+        return err
+    scope = _openapi_scope_ids(key_row)
+    if scope is None:
+        rows = db_query(
+            "SELECT phone, name, imei, terminal_id, terminal_model, status, "
+            "last_lat, last_lng, last_location_time, presence_state "
+            "FROM device WHERE org_id=? ORDER BY id DESC LIMIT 2000",
+            (key_row.get('org_id') or 1,))
+    elif not scope:
+        rows = []
+    else:
+        ph = ','.join('?' * len(scope))
+        rows = db_query(
+            f"SELECT phone, name, imei, terminal_id, terminal_model, status, "
+            f"last_lat, last_lng, last_location_time, presence_state "
+            f"FROM device WHERE customer_id IN ({ph}) ORDER BY id DESC LIMIT 2000",
+            scope)
+    return ok({'records': rows, 'total': len(rows)})
+
+
+@app.get('/openapi/location/latest')
+def openapi_latest():
+    """单个设备最新位置。参数：phone=设备号/IMEI。"""
+    key_row, err = _openapi_verify()
+    if err:
+        return err
+    phone = request.args.get('phone', '').strip()
+    if not phone:
+        return fail('缺少参数 phone', 400)
+    dev = _openapi_device_allowed(key_row, phone)
+    if not dev:
+        return fail('设备不存在或无权限', 404)
+    return ok({
+        'phone': dev['phone'], 'name': dev.get('name'),
+        'lat': dev.get('last_lat'), 'lng': dev.get('last_lng'),
+        'speed': dev.get('last_speed'), 'gps_time': dev.get('last_location_time'),
+        'status': dev.get('status'), 'presence_state': dev.get('presence_state'),
+        'battery': dev.get('last_battery'), 'signal': dev.get('last_signal'),
+        'address': dev.get('last_address'),
+    })
+
+
+@app.post('/openapi/location/batch')
+def openapi_latest_batch():
+    """批量最新位置。请求体：{"phones":["...","..."]}，最多 500 个。"""
+    key_row, err = _openapi_verify()
+    if err:
+        return err
+    data = request.get_json() or {}
+    phones = data.get('phones') or []
+    if not isinstance(phones, list) or not phones:
+        return fail('phones 不能为空', 400)
+    if len(phones) > 500:
+        return fail('单次最多查询 500 个设备', 400)
+    out = []
+    for phone in phones:
+        dev = _openapi_device_allowed(key_row, str(phone).strip())
+        if dev:
+            out.append({
+                'phone': dev['phone'], 'name': dev.get('name'),
+                'lat': dev.get('last_lat'), 'lng': dev.get('last_lng'),
+                'speed': dev.get('last_speed'), 'gps_time': dev.get('last_location_time'),
+                'status': dev.get('status'), 'presence_state': dev.get('presence_state'),
+            })
+    return ok({'records': out, 'total': len(out)})
+
+
+@app.get('/openapi/location/history')
+def openapi_history():
+    """历史轨迹。参数：phone、start(YYYY-MM-DD)、end、page、size(≤1000)。"""
+    key_row, err = _openapi_verify()
+    if err:
+        return err
+    phone = request.args.get('phone', '').strip()
+    if not phone:
+        return fail('缺少参数 phone', 400)
+    dev = _openapi_device_allowed(key_row, phone)
+    if not dev:
+        return fail('设备不存在或无权限', 404)
+    page, size = _page_params(100, max_size=1000)
+    start = request.args.get('start', '')
+    end   = request.args.get('end', '')
+    offset = (page - 1) * size
+    if start and not _DATE_RE.match(start):
+        return fail('start 日期格式错误，应为 YYYY-MM-DD', 400)
+    if end and not _DATE_RE.match(end):
+        return fail('end 日期格式错误，应为 YYYY-MM-DD', 400)
+    if start and end:
+        total   = db_scalar("SELECT COUNT(*) FROM location_record WHERE phone=? AND gps_time BETWEEN ? AND ?", (phone, start, end))
+        records = db_query("SELECT phone,lat,lng,speed,direction,gps_time FROM location_record WHERE phone=? AND gps_time BETWEEN ? AND ? ORDER BY gps_time ASC LIMIT ? OFFSET ?",
+                           (phone, start, end, size, offset))
+    else:
+        total   = db_scalar("SELECT COUNT(*) FROM location_record WHERE phone=?", (phone,))
+        records = db_query("SELECT phone,lat,lng,speed,direction,gps_time FROM location_record WHERE phone=? ORDER BY gps_time DESC LIMIT ? OFFSET ?",
+                           (phone, size, offset))
+    return ok({'records': records, 'total': total, 'page': page})
+
+
+@app.post('/openapi/command')
+def openapi_command():
+    """下发文本指令。请求体：{"phone":"...","text":"..."}。仅对在线设备生效。"""
+    key_row, err = _openapi_verify()
+    if err:
+        return err
+    data = request.get_json() or {}
+    phone = str(data.get('phone', '')).strip()
+    text  = str(data.get('text', '')).strip()
+    if not phone or not text:
+        return fail('phone 和 text 不能为空', 400)
+    dev = _openapi_device_allowed(key_row, phone)
+    if not dev:
+        return fail('设备不存在或无权限', 404)
+    with sessions_lock:
+        conn = sessions.get(phone)
+    if not conn:
+        return fail(f'设备不在线: {phone}', 404)
+    try:
+        body = bytes([0x01]) + text.encode('gbk', errors='replace')
+        conn.sendall(p.encode_message(0x8300, phone, next_serial(), body))
+        add_op_log('开放API指令', f'app={key_row["app_name"]} phone={phone}')
+        return ok({'sent': True})
+    except Exception as e:
+        log.warning("[开放API] 指令下发失败 phone=%s err=%s", phone, e)
+        return fail('指令下发失败', 500)
+
+
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')

@@ -107,7 +107,7 @@
             <template #default="{ row }">{{ row.terminal_id || row.phone }}</template>
           </el-table-column>
           <el-table-column prop="name"  label="名称" width="120">
-            <template #default="{ row }">{{ row.name || '—' }}</template>
+            <template #default="{ row }">{{ row.real_name || row.name || '—' }}</template>
           </el-table-column>
           <el-table-column label="当前角色" width="110">
             <template #default="{ row }">
@@ -239,7 +239,7 @@ const filteredAssignDevices = computed(() => {
   if (!assignSearch.value) return assignDevices.value
   const q = assignSearch.value.toLowerCase()
   return assignDevices.value.filter(d =>
-    (d.phone || '').includes(q) || (d.name || '').toLowerCase().includes(q)
+    (d.phone || '').includes(q) || (d.name || '').toLowerCase().includes(q) || (d.real_name || '').toLowerCase().includes(q)
   )
 })
 

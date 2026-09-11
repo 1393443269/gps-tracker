@@ -15,8 +15,11 @@ const http = axios.create({
 
 // 自动带上管理员 token；客户身份时补带客户 token（供放开给客户的只读/品牌接口鉴权）
 http.interceptors.request.use(cfg => {
+  const isCustomer = localStorage.getItem('user_role') !== 'admin'
   const token = localStorage.getItem('admin_token')
-  if (token) cfg.headers['X-Admin-Token'] = token
+  // 客户身份不带 admin token：否则残留的 admin token 会被后端优先当成管理员，
+  // 导致客户操作(如平台设置保存)被误判为管理员、写进全站配置污染 admin。
+  if (token && !isCustomer) cfg.headers['X-Admin-Token'] = token
   const ctoken = localStorage.getItem('customer_token')
   if (ctoken) cfg.headers['X-Customer-Token'] = ctoken
   return cfg
@@ -94,11 +97,24 @@ export const deviceApi = {
   bindCustomer:      (id, customerId) => http.post(`/devices/${id}/bind_customer`, { customer_id: customerId }),
   unbindCustomer:    (id)           => http.post(`/devices/${id}/unbind_customer`),
   batchBind:         (ids, customerId) => http.post('/devices/batch_bind', { ids, customer_id: customerId }),
+  batchBindByImei:   (items, createAccount) => http.post('/devices/batch_bind_by_imei', { items, create_account: createAccount }),
   batchUnbind:       (ids)          => http.post('/devices/batch_unbind', { ids }),
   batchCommand:      (phones, text) => http.post('/devices/batch_command', { phones, text }),
   exportAll:         ()             => http.get('/devices/export'),
   setRole:           (id, roleId)   => http.put(`/devices/${id}/role`, { role_id: roleId }),
   batchRole:         (ids, roleId)  => http.post('/devices/batch_role', { ids, role_id: roleId }),
+}
+
+// ── 开放API / 数据推送 管理 ──────────────────────────────────────────────────
+export const openApiAdmin = {
+  listKeys:    ()          => http.get('/openapi/keys'),
+  createKey:   (data)      => http.post('/openapi/keys', data),
+  updateKey:   (id, data)  => http.put(`/openapi/keys/${id}`, data),
+  deleteKey:   (id)        => http.delete(`/openapi/keys/${id}`),
+  listPush:    ()          => http.get('/openapi/push'),
+  createPush:  (data)      => http.post('/openapi/push', data),
+  updatePush:  (id, data)  => http.put(`/openapi/push/${id}`, data),
+  deletePush:  (id)        => http.delete(`/openapi/push/${id}`),
 }
 
 // ── 位置 ─────────────────────────────────────────────────────────────────────
@@ -135,6 +151,7 @@ export const healthApi = {
 }
 
 // ── 平台设置 ──────────────────────────────────────────────────────────────────
+// 隔离靠请求拦截器保证：客户身份不带 admin token → 后端按客户处理，只写 customer_branding。
 export const platformApi = {
   get:    ()          => http.get('/platform-setting'),
   update: (data)      => http.put('/platform-setting', data),
@@ -210,8 +227,10 @@ export const portalApi = {
   // 设备
   deviceList:     (params)        => portalHttp.get('/device_list', { params }),
   batchImport:    (rows)          => portalHttp.post('/devices/import', { rows }),
+  batchBindByImei:(items, createAccount) => portalHttp.post('/devices/batch_bind_by_imei', { items, create_account: createAccount }),
   devices:        ()              => portalHttp.get('/devices'),
   updateDevice:   (phone, data)   => portalHttp.put(`/devices/${phone}/update`, data),
+  updateDeviceHolder: (phone, data) => portalHttp.put(`/devices/${phone}/holder`, data),
   summary:        ()              => portalHttp.get('/summary'),
   reportSummary:  (params)        => portalHttp.get('/report/summary', { params }),
   // 位置

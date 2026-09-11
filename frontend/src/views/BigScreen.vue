@@ -122,7 +122,8 @@ import { deviceApi, alarmApi, reportApi, platformApi, portalApi, isAdmin } from 
 // DataV 的中国 GeoJSON 基于 WGS-84，设备上报也是 WGS-84，直接用原始经纬度即可对齐，
 // 不做坐标转换（此前误加 GCJ 转换反而放大偏移）。
 function _devScatterValue(d) {
-  return [Number(d.last_lng), Number(d.last_lat), d.phone]
+  // 第3位供 tooltip 显示：绑定人姓名优先，其次设备名/设备号（与地图 label 口径一致）
+  return [Number(d.last_lng), Number(d.last_lat), d.real_name || d.name || d.phone]
 }
 
 // ── refs ──────────────────────────────────────────────────────────────────────
@@ -372,7 +373,7 @@ async function buildMap(el, provinceData) {
 
   const scatter = devicePoints.map(d => ({
     value: _devScatterValue(d),
-    label: d.name || d.phone || '',
+    label: d.real_name || d.name || d.phone || '',
     // 报警红优先，否则按角色颜色，无角色回落绿
     itemStyle: { color: d.status === 2 ? '#e04a4a' : (d.role_color || '#1aae5a') },
   }))
@@ -420,7 +421,7 @@ async function buildMap(el, provinceData) {
     // 散点（保留设备名称标注 + 角色颜色）
     const provinceScatter = inProvince.map(d => ({
       value: _devScatterValue(d),
-      label: d.name || d.phone || '',
+      label: d.real_name || d.name || d.phone || '',
       itemStyle: { color: d.status === 2 ? '#e04a4a' : (d.role_color || '#1aae5a') },
     }))
 
@@ -439,7 +440,7 @@ async function backToChina() {
   const maxVal  = Math.max(...mapData.map(d => d.value), 1)
   const scatter = devicePoints.map(d => ({
     value: _devScatterValue(d),
-    label: d.name || d.phone || '',
+    label: d.real_name || d.name || d.phone || '',
     itemStyle: { color: d.status === 2 ? '#e04a4a' : (d.role_color || '#1aae5a') },
   }))
   const scatterSeries = scatter.length ? [{

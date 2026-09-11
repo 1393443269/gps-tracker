@@ -41,6 +41,7 @@
       </el-dropdown>
 
       <el-button :icon="Upload" @click="openImport">批量导入</el-button>
+      <el-button type="success" :icon="Link" @click="openBindByImei">批量绑定</el-button>
       <el-button :icon="Download" @click="exportAll" :loading="exporting">导出</el-button>
 
       <div style="flex:1;"></div>
@@ -177,6 +178,85 @@
           @click="submitImport">开始导入</el-button>
       </template>
     </el-dialog>
+
+    <!-- 按 IMEI + 姓名 批量绑定弹窗 -->
+    <el-dialog v-model="bindImeiVisible" title="批量绑定（按 IMEI + 姓名）" width="680px" @closed="resetBindImei">
+      <el-tabs v-model="bindImeiTab">
+        <el-tab-pane label="手动录入" name="manual">
+          <div style="font-size:13px;color:#909399;margin-bottom:8px;">
+            左右两栏按行一一对应，每行一条。请勿有多余空行或空格。
+          </div>
+          <div style="display:flex;gap:12px;">
+            <div style="flex:1;">
+              <div style="font-size:13px;color:#606266;margin-bottom:4px;">IMEI（每行一个）</div>
+              <el-input v-model="imeiText" type="textarea" :rows="10" placeholder="866000000000001&#10;866000000000002" />
+            </div>
+            <div style="flex:1;">
+              <div style="font-size:13px;color:#606266;margin-bottom:4px;">姓名（每行一个）</div>
+              <el-input v-model="nameText" type="textarea" :rows="10" placeholder="张三&#10;李四" />
+            </div>
+          </div>
+        </el-tab-pane>
+        <el-tab-pane label="Excel 导入" name="excel">
+          <div style="font-size:13px;color:#606266;line-height:1.9;margin-bottom:10px;">
+            模版仅两列：<b>imei</b>、<b>name</b>。已存在设备按 IMEI 匹配绑定。
+            <div style="margin-top:6px;">
+              <el-button size="small" :icon="Download" @click="downloadBindTemplate">下载绑定模版</el-button>
+            </div>
+          </div>
+          <el-upload drag :auto-upload="false" :show-file-list="false" accept=".xlsx,.csv"
+            :on-change="onBindFilePicked">
+            <el-icon class="el-icon--upload"><Upload /></el-icon>
+            <div class="el-upload__text">把文件拖到这里，或<em>点击选择文件</em></div>
+          </el-upload>
+        </el-tab-pane>
+      </el-tabs>
+
+      <div style="margin-top:6px;padding:10px 12px;background:#f5f7fa;border-radius:6px;">
+        <el-switch v-model="createAccount" active-text="创建子账号" inactive-text="绑定已有账号" inline-prompt />
+        <span style="font-size:12px;color:#909399;margin-left:10px;">
+          开启后以「姓名」为用户名自动创建子账号（随机密码，绑定后在结果中显示）；关闭则按姓名匹配已有账号。
+        </span>
+      </div>
+
+      <div v-if="bindImeiParsed.length" style="margin-top:10px;font-size:13px;">
+        已解析 <b>{{ bindImeiParsed.length }}</b> 条：
+        <el-table :data="bindImeiParsed.slice(0, 200)" size="small" border max-height="180" style="margin-top:6px;">
+          <el-table-column type="index" label="#" width="50" />
+          <el-table-column prop="imei" label="IMEI" min-width="160" />
+          <el-table-column prop="name" label="姓名" min-width="120" />
+        </el-table>
+      </div>
+
+      <div v-if="bindImeiResult" style="margin-top:12px;">
+        <el-alert :closable="false" :type="bindImeiResult.failed ? 'warning' : 'success'"
+          :title="`绑定完成：成功 ${bindImeiResult.bound} 台，失败 ${bindImeiResult.failed} 台`" />
+        <el-table v-if="bindImeiResultRows.length" :data="bindImeiResultRows" size="small" border
+          max-height="260" style="margin-top:10px;">
+          <el-table-column prop="imei" label="IMEI" min-width="140" show-overflow-tooltip />
+          <el-table-column prop="name" label="姓名" width="90" />
+          <el-table-column prop="statusText" label="结果" width="70" />
+          <el-table-column prop="login_name" label="登录账号" min-width="100" />
+          <el-table-column prop="password" label="初始密码" min-width="110">
+            <template #default="{ row }">
+              <span v-if="row.password" style="font-family:monospace;color:#e6a23c;">{{ row.password }}</span>
+              <span v-else style="color:#ccc;">—</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="reason" label="说明" min-width="130" show-overflow-tooltip />
+        </el-table>
+        <div v-if="bindImeiResult.bound && createAccount" style="margin-top:6px;font-size:12px;color:#e6a23c;">
+          请及时保存上表中的初始密码，关闭后将无法再次查看。可点「导出结果」备份。
+          <el-button size="small" text type="primary" @click="exportBindResult">导出结果</el-button>
+        </div>
+      </div>
+
+      <template #footer>
+        <el-button @click="bindImeiVisible = false">关闭</el-button>
+        <el-button type="primary" :disabled="!bindImeiParsed.length" :loading="bindImeiSaving"
+          @click="submitBindByImei">开始绑定 {{ bindImeiParsed.length ? '(' + bindImeiParsed.length + ')' : '' }}</el-button>
+      </template>
+    </el-dialog>
   </el-card>
 </template>
 
@@ -274,6 +354,137 @@ async function submitImport() {
   } catch {} finally {
     importing.value = false
   }
+}
+
+// ── 按 IMEI + 姓名 批量绑定 ──────────────────────────────────
+const bindImeiVisible    = ref(false)
+const bindImeiSaving     = ref(false)
+const bindImeiTab        = ref('manual')
+const imeiText           = ref('')
+const nameText           = ref('')
+const createAccount      = ref(true)
+const bindExcelRows      = ref([])   // Excel 解析结果
+const bindImeiResult     = ref(null)
+const bindImeiResultRows = ref([])
+
+// 解析后的待绑定列表：手动 tab 由两栏文本派生，Excel tab 用上传结果
+const bindImeiParsed = computed(() => {
+  if (bindImeiTab.value === 'excel') return bindExcelRows.value
+  const imeis = imeiText.value.split(/\r?\n/).map(s => s.trim())
+  const names = nameText.value.split(/\r?\n/).map(s => s.trim())
+  const n = Math.max(imeis.length, names.length)
+  const out = []
+  for (let i = 0; i < n; i++) {
+    const imei = imeis[i] || ''
+    const name = names[i] || ''
+    if (!imei && !name) continue
+    out.push({ imei, name })
+  }
+  return out
+})
+
+function openBindByImei() {
+  imeiText.value = ''
+  nameText.value = ''
+  bindExcelRows.value = []
+  bindImeiResult.value = null
+  bindImeiResultRows.value = []
+  bindImeiTab.value = 'manual'
+  createAccount.value = true
+  bindImeiVisible.value = true
+}
+
+function resetBindImei() {
+  imeiText.value = ''
+  nameText.value = ''
+  bindExcelRows.value = []
+  bindImeiResult.value = null
+  bindImeiResultRows.value = []
+}
+
+function downloadBindTemplate() {
+  const ws = XLSX.utils.aoa_to_sheet([
+    ['imei', 'name'],
+    ['866000000000001', '张三'],
+    ['866000000000002', '李四'],
+  ])
+  ws['!cols'] = [{ wch: 20 }, { wch: 14 }]
+  const wb = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(wb, ws, '绑定设备')
+  XLSX.writeFile(wb, '绑定设备模版.xlsx')
+}
+
+function onBindFilePicked(file) {
+  bindImeiResult.value = null
+  bindImeiResultRows.value = []
+  const reader = new FileReader()
+  reader.onload = (e) => {
+    try {
+      const wb = XLSX.read(e.target.result, { type: 'array' })
+      const ws = wb.Sheets[wb.SheetNames[0]]
+      const raw = XLSX.utils.sheet_to_json(ws, { defval: '' })
+      const rows = []
+      for (const r of raw) {
+        // 兼容中英文表头：imei/IMEI/设备IMEI，name/姓名/名称
+        const imei = String(r.imei ?? r.IMEI ?? r['设备IMEI'] ?? r['IMEI号'] ?? '').trim()
+        const name = String(r.name ?? r['姓名'] ?? r['名称'] ?? '').trim()
+        if (imei || name) rows.push({ imei, name })
+      }
+      if (!rows.length) {
+        ElMessage.warning('未解析到数据，请确认表头含 imei、name 两列')
+        bindExcelRows.value = []
+        return
+      }
+      bindExcelRows.value = rows
+      ElMessage.success(`已解析 ${rows.length} 条`)
+    } catch {
+      ElMessage.error('文件解析失败，请确认格式为 .xlsx 或 .csv')
+      bindExcelRows.value = []
+    }
+  }
+  reader.readAsArrayBuffer(file.raw)
+}
+
+async function submitBindByImei() {
+  const items = bindImeiParsed.value
+  if (!items.length) { ElMessage.warning('没有可绑定的数据'); return }
+  // 前端先校验：每行 imei 与 name 都要有
+  const bad = items.find(it => !it.imei || !it.name)
+  if (bad) { ElMessage.warning('存在 IMEI 或姓名为空的行，请检查两栏是否一一对应'); return }
+  bindImeiSaving.value = true
+  try {
+    const res = isAdmin() ? await deviceApi.batchBindByImei(items, createAccount.value)
+                          : await portalApi.batchBindByImei(items, createAccount.value)
+    bindImeiResult.value = res.data
+    const STAT = { bound: '成功', failed: '失败' }
+    bindImeiResultRows.value = (res.data.details || []).map(d => ({
+      ...d, statusText: STAT[d.status] || d.status,
+    }))
+    loadData(1)
+    loadCustomers()
+  } catch {} finally {
+    bindImeiSaving.value = false
+  }
+}
+
+// 导出绑定结果（含随机密码）为 CSV，供留存
+function exportBindResult() {
+  const rows = bindImeiResultRows.value
+  if (!rows.length) return
+  const headers = ['IMEI', '姓名', '结果', '登录账号', '初始密码', '说明']
+  const csvCell = (c) => {
+    let s = String(c ?? '')
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s
+    return `"${s.replace(/"/g, '""')}"`
+  }
+  const data = rows.map(r => [r.imei, r.name, r.statusText, r.login_name || '', r.password || '', r.reason || ''])
+  const csv = [headers, ...data].map(row => row.map(csvCell).join(',')).join('\n')
+  const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' })
+  const link = document.createElement('a')
+  link.href = URL.createObjectURL(blob)
+  link.download = `批量绑定结果_${new Date().toISOString().slice(0, 10)}.csv`
+  link.click()
+  URL.revokeObjectURL(link.href)
 }
 
 // 三种查询条件

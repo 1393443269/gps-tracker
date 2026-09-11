@@ -77,6 +77,10 @@
           <el-icon><Tools /></el-icon>
           <span>平台设置</span>
         </el-menu-item>
+        <el-menu-item v-if="isAdmin" index="/open-api">
+          <el-icon><Connection /></el-icon>
+          <span>开放API</span>
+        </el-menu-item>
 
         <div class="menu-group-label">运营</div>
         <el-menu-item v-if="canShow('alarms')" index="/alarms">
@@ -158,7 +162,7 @@ import {
   Cellphone, Coin, User, Setting, UserFilled,
   Bell, WalletFilled, TrendCharts, Monitor,
   OfficeBuilding, Operation, ArrowDown,
-  Tools, SetUp, Calendar, FirstAidKit, Lock
+  Tools, SetUp, Calendar, FirstAidKit, Lock, Connection
 } from '@element-plus/icons-vue'
 
 const route       = useRoute()
@@ -167,7 +171,7 @@ const onlineCount = ref(0)
 const alarmCount  = ref(0)
 
 // 白标：平台标题 / Logo（从平台设置读取）
-const platformTitle = ref('🛰 应急物资管理系统')
+const platformTitle = ref('应急物资管理系统')
 const platformLogo  = ref('')
 
 async function loadPlatform() {

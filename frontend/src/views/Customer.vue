@@ -64,8 +64,15 @@
       </el-table-column>
     </el-table>
 
-    <!-- 客户端：普通列表（只显示自己的下级客户） -->
-    <el-table v-else :data="list" border stripe v-loading="loading">
+    <!-- 客户端：树形列表（懒加载展开所有层级的下级客户） -->
+    <el-table v-else
+      :key="isTreeMode ? 'cust-tree' : 'cust-flat'"
+      :data="list"
+      row-key="id"
+      :lazy="isTreeMode"
+      :load="isTreeMode ? loadChildren : undefined"
+      :tree-props="isTreeMode ? { children: 'children', hasChildren: 'has_children' } : {}"
+      border stripe v-loading="loading">
       <el-table-column prop="name"    label="客户名称" min-width="130" />
       <el-table-column prop="contact" label="联系人"   width="100" />
       <el-table-column prop="phone"   label="电话"     width="130" />
@@ -171,11 +178,10 @@
       <el-checkbox-group v-else v-model="assignedPhones">
         <div v-for="d in allDevices" :key="d.phone"
           style="padding:7px 0;border-bottom:1px solid #f5f5f5;display:flex;align-items:center;gap:8px;">
-          <el-checkbox :value="String(d.phone)" style="margin:0;" />
-          <div style="flex:1;min-width:0;">
-            <div style="font-size:13px;font-weight:500;">{{ d.name || '未命名' }}</div>
-            <div style="font-size:11px;color:#909399;">{{ d.phone }}</div>
-          </div>
+          <el-checkbox :value="String(d.phone)" style="flex:1;min-width:0;margin:0;">
+            <span style="font-size:13px;font-weight:500;">{{ d.real_name || d.name || '未命名' }}</span>
+            <span style="font-size:11px;color:#909399;margin-left:8px;">{{ d.imei || d.terminal_id || d.phone }}</span>
+          </el-checkbox>
           <!-- 管理员模式：标出已分配给其他客户的设备 -->
           <el-tag v-if="admin && d.customer_id && Number(d.customer_id) !== Number(assignTarget?.id)"
             type="warning" size="small">已归属其他客户</el-tag>
@@ -219,8 +225,8 @@ const loading = ref(false)
 const keyword = ref('')
 const statusFilter = ref('')
 
-// 管理员模式：无过滤条件时用树形懒加载，有关键词/状态过滤时退化为平铺搜索
-const isTreeMode = computed(() => admin && !keyword.value && !statusFilter.value)
+// 树形懒加载：无过滤条件时启用（管理员与客户都用）；有关键词/状态过滤时退化为平铺搜索
+const isTreeMode = computed(() => !keyword.value && !statusFilter.value)
 
 const modalVisible = ref(false)
 const defaultForm = () => ({
@@ -270,7 +276,10 @@ async function load() {
 // el-table 树形懒加载：展开一级时拉取其子级
 async function loadChildren(row, _treeNode, resolve) {
   try {
-    const res = await customerApi.list({ parent_id: row.id, size: 100 })
+    // 按身份走对应接口：管理员用 customerApi，客户用 portalApi.subCustomers（否则客户会 401 拿不到下级）
+    const res = isAdmin()
+      ? await customerApi.list({ parent_id: row.id, size: 100 })
+      : await portalApi.subCustomers.list({ parent_id: row.id, size: 100 })
     const rows = res.data?.records || []
     await fillDeviceCount(rows)
     resolve(rows)

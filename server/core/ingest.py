@@ -527,8 +527,35 @@ _OFFLINE_DYN_MAX_SEC     = int(os.environ.get('OFFLINE_DYN_MAX_SEC', '10800'))  
 # 注意:休眠上限必须严格 > 离线动态阈值上限(_OFFLINE_DYN_MAX_SEC),否则当某设备的动态离线阈值
 # 被夹到上限时,休眠窗口 [_cut(SLEEP_MAX), _cut(thr)) 会塌缩为空,长上报间隔的 G618 永远进不了休眠。
 # 默认 6 小时,明显大于离线动态上限默认 3 小时。
-_SLEEP_MAX_SEC          = int(os.environ.get('SLEEP_MAX_SEC', '21600'))  # 休眠最长时限,默认 6 小时
+_SLEEP_MAX_SEC          = int(os.environ.get('SLEEP_MAX_SEC', '10800'))  # 休眠上限兜底(电量未知时),默认 3 小时
 _SLEEP_LOW_BAT_PCT      = int(os.environ.get('SLEEP_LOW_BAT_PCT', '15')) # 低于此电量不认为在健康休眠
+
+# ── 休眠上限按电量分档(平衡方案)────────────────────────────────────────────────
+# 用电量判断"失联的真实性":电量足→大概率正常深度休眠,允许挂久点;电量低→更可能
+# 快没电/已关机,尽快判离线。分档(可用环境变量覆盖):
+#   电量 > 50%      → 休眠上限 3 小时
+#   电量 20% ~ 50%  → 休眠上限 1 小时
+#   电量 <= 20%(_SLEEP_LOW_BAT_PCT 以上但<=20)→ 不给休眠宽容,超上报阈值即判离线(返回0)
+# 电量未知(None)→ 回退默认 _SLEEP_MAX_SEC(兜底,默认已下调为 3 小时)。
+_SLEEP_MAX_HIGH_SEC = int(os.environ.get('SLEEP_MAX_HIGH_SEC', '10800'))  # 电量>50%: 3 小时
+_SLEEP_MAX_MID_SEC  = int(os.environ.get('SLEEP_MAX_MID_SEC',  '3600'))   # 20~50%:  1 小时
+_SLEEP_BAT_HIGH_PCT = int(os.environ.get('SLEEP_BAT_HIGH_PCT', '50'))     # 高电量分界
+_SLEEP_BAT_MID_PCT  = int(os.environ.get('SLEEP_BAT_MID_PCT',  '20'))     # 中电量分界
+
+def _sleep_max_by_bat(bat):
+    """按电量返回允许休眠的最长秒数;返回 0 表示不给休眠宽容(超阈值即判离线)。
+    bat 为 None(电量未知)时回退 _SLEEP_MAX_SEC。"""
+    if bat is None:
+        return _SLEEP_MAX_SEC
+    try:
+        b = float(bat)
+    except (TypeError, ValueError):
+        return _SLEEP_MAX_SEC
+    if b > _SLEEP_BAT_HIGH_PCT:
+        return _SLEEP_MAX_HIGH_SEC
+    if b > _SLEEP_BAT_MID_PCT:
+        return _SLEEP_MAX_MID_SEC
+    return 0   # 低电(<=20%):不给休眠,直接进离线判定
 # 长连接判据:实测上报间隔 < 此值(秒)视为持续型/长连接设备,TCP 断开即判离线(第三期主动探测)。
 # 默认 300 秒——天禧(3分钟)算长连接、G618 短连接(5~10分钟+休眠)不算,断开不误判。
 _LONGCONN_MAX_SEC       = int(os.environ.get('LONGCONN_MAX_SEC', '300'))
@@ -706,9 +733,10 @@ def _offline_scan_once():
             model = (r.get('terminal_model') or '').upper()
             bat   = r.get('last_battery')
             is_g618 = 'G618' in model
-            # 休眠判据:G618 + 未超休眠最长时限 + 电量健康(非低电) → 判休眠,不掉线
-            healthy_bat = (bat is None) or (isinstance(bat, (int, float)) and bat > _SLEEP_LOW_BAT_PCT)
-            if is_g618 and ts >= _cut(_SLEEP_MAX_SEC) and healthy_bat:
+            # 休眠判据:G618 + 电量决定的休眠上限内 → 判休眠,不掉线。
+            # 休眠上限按电量分档(见 _sleep_max_by_bat):电量足挂久点,低电=0 不给休眠→直接离线。
+            _slp_max = _sleep_max_by_bat(bat)
+            if is_g618 and _slp_max > 0 and ts >= _cut(_slp_max):
                 sleep_phones.append(r['phone'])
             else:
                 # 失联:超休眠上限 / 非G618 / 电量已低 → 置离线并推断原因
@@ -735,9 +763,9 @@ def _offline_scan_once():
         return 0
     if sleep_phones or offline_items:
         log.info("[离线扫描] 本轮:休眠 %d 台(G618省电,不掉线);离线 %d 台(失联,附原因)。"
-                 "阈值动态档=期望间隔×%.1f+%d秒,休眠上限%d秒",
+                 "阈值动态档=期望间隔×%.1f+%d秒,休眠上限按电量分档",
                  len(sleep_phones), len(offline_items),
-                 _OFFLINE_INTERVAL_FACTOR, _OFFLINE_INTERVAL_GRACE, _SLEEP_MAX_SEC)
+                 _OFFLINE_INTERVAL_FACTOR, _OFFLINE_INTERVAL_GRACE)
     return len(offline_items)
 
 
