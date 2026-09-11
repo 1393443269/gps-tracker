@@ -419,6 +419,7 @@ def init_db():
     # 说明：设备注册头里的 phone 可能只是终端ID(非IMEI)，真实IMEI/ICCID 走位置附加字段上报。
     for _col in ("ALTER TABLE sim_card ADD COLUMN msisdn TEXT DEFAULT ''",
                  "ALTER TABLE sim_card ADD COLUMN imei TEXT DEFAULT ''",
+                 "ALTER TABLE sim_card ADD COLUMN name TEXT DEFAULT ''",
                  "ALTER TABLE device ADD COLUMN imei TEXT DEFAULT ''",
                  "ALTER TABLE device ADD COLUMN iccid TEXT DEFAULT ''"):
         try:
@@ -2623,9 +2624,9 @@ def create_sim():
         return fail('ICCID 不能为空', 400)
     try:
         db_exec(
-            "INSERT INTO sim_card (iccid,imsi,msisdn,imei,operator,plan,balance,status,device_phone,remark,expire_date,monthly_fee,org_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (iccid, d.get('imsi',''), d.get('msisdn',''), d.get('imei',''),
+            "INSERT INTO sim_card (iccid,imsi,msisdn,imei,name,operator,plan,balance,status,device_phone,remark,expire_date,monthly_fee,org_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (iccid, d.get('imsi',''), d.get('msisdn',''), d.get('imei',''), d.get('name',''),
              d.get('operator','中国移动'), d.get('plan',''),
              float(d.get('balance', 0)), d.get('status','正常'),
              d.get('device_phone',''), d.get('remark',''),
@@ -2643,8 +2644,8 @@ def update_sim(sid):
         return fail('SIM卡不存在或无权限', 403)
     d = request.get_json() or {}
     db_exec(
-        "UPDATE sim_card SET imsi=?,msisdn=?,imei=?,operator=?,plan=?,balance=?,status=?,device_phone=?,remark=?,expire_date=?,monthly_fee=? WHERE id=?",
-        (d.get('imsi',''), d.get('msisdn',''), d.get('imei',''),
+        "UPDATE sim_card SET imsi=?,msisdn=?,imei=?,name=?,operator=?,plan=?,balance=?,status=?,device_phone=?,remark=?,expire_date=?,monthly_fee=? WHERE id=?",
+        (d.get('imsi',''), d.get('msisdn',''), d.get('imei',''), d.get('name',''),
          d.get('operator','中国移动'), d.get('plan',''),
          float(d.get('balance', 0)), d.get('status','正常'),
          d.get('device_phone',''), d.get('remark',''),

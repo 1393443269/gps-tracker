@@ -57,6 +57,9 @@
       <el-table-column label="IMEI" min-width="140" show-overflow-tooltip>
         <template #default="{ row }">{{ row.imei || row.dev_imei || row.device_phone || "—" }}</template>
       </el-table-column>
+      <el-table-column label="名称" min-width="100" show-overflow-tooltip>
+        <template #default="{ row }"><span v-if="row.name">{{ row.name }}</span><span v-else style="color:#ccc;font-size:12px;">—</span></template>
+      </el-table-column>
       <el-table-column label="设备号" min-width="150">
         <template #default="{ row }">
           <span v-if="row.dev_terminal_id || row.device_phone" v-html="highlight(row.dev_terminal_id || row.device_phone)" />
@@ -123,6 +126,9 @@
         </el-form-item>
         <el-form-item label="IMEI">
           <el-input v-model="form.imei" placeholder="设备IMEI(设备上报自动填充)" />
+        </el-form-item>
+        <el-form-item label="名称">
+          <el-input v-model="form.name" placeholder="如 张三、李四(使用人/备注名)" />
         </el-form-item>
         <el-form-item label="运营商">
           <el-select v-model="form.operator" style="width:100%">
@@ -228,7 +234,7 @@ const expiring30 = ref(0)
 // modal
 const modalVisible = ref(false)
 const form = ref({
-  id: null, iccid: '', imsi: '', msisdn: '', imei: '', operator: '中国移动',
+  id: null, iccid: '', imsi: '', msisdn: '', imei: '', name: '', operator: '中国移动',
   plan: '', balance: 0, status: '正常', remark: '',
   expire_date: null, monthly_fee: 0
 })
@@ -327,7 +333,7 @@ async function load() {
 function openModal(row) {
   form.value = row
     ? { ...row, expire_date: row.expire_date || null, monthly_fee: row.monthly_fee || 0 }
-    : { id: null, iccid: '', imsi: '', msisdn: '', imei: '', operator: '中国移动', plan: '', balance: 0,
+    : { id: null, iccid: '', imsi: '', msisdn: '', imei: '', name: '', operator: '中国移动', plan: '', balance: 0,
         status: '正常', remark: '', expire_date: null, monthly_fee: 0 }
   modalVisible.value = true
 }
