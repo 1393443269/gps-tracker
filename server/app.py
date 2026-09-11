@@ -445,6 +445,7 @@ def init_db():
     # 说明：设备注册头里的 phone 可能只是终端ID(非IMEI)，真实IMEI/ICCID 走位置附加字段上报。
     for _col in ("ALTER TABLE sim_card ADD COLUMN msisdn TEXT DEFAULT ''",
                  "ALTER TABLE sim_card ADD COLUMN imei TEXT DEFAULT ''",
+                 "ALTER TABLE sim_card ADD COLUMN name TEXT DEFAULT ''",
                  "ALTER TABLE device ADD COLUMN imei TEXT DEFAULT ''",
                  "ALTER TABLE device ADD COLUMN iccid TEXT DEFAULT ''"):
         try:
@@ -868,6 +869,7 @@ from core.ingest import (
 # ── TCP 连接处理线程 ────────────────────────────────────────────────────────────
 
 import protocol_g618g as g618
+import protocol_jimi as jimi   # 几米 KKS 超长待机(L744/L745)协议:下行指令构造
 import geo_resolve
 
 # TCP 连接处理线程(handle_client/_handle_client_guarded/start_tcp_server +
@@ -2564,6 +2566,106 @@ def g618g_command():
                    'message': '实时下发失败，已转入待发队列，设备下次上线时自动下发'})
 
 
+# ── L744/L745(几米 KKS 超长待机)下行指令接口 ─────────────────────────────────
+# 几米 KKS 下行统一走 0x80 在线指令包(见 protocol_jimi.build_command):内容为兼容短信的
+# ASCII 指令串(如 "SOS,A,,,158xxxx#")。设备回 0x21 指令回复(由 ingest.handle_jimi_frame 记日志)。
+# ⚠ 除 SOS 有协议文档 V1.2 示例外,其余指令文本模板待真机联调核对——故本接口以「通用文本下发(raw)」
+# 为核心能力(前端给完整指令串,平台只负责封 0x80 帧),另附几个便捷封装,模板可能需按真机订正。
+
+# 便捷指令 → 指令文本串模板。raw 由 body['text'] 直接给出,不走这里。
+_JIMI_CMD_TEXT = {
+    # 设服务器地址:SERVER,<链路模式>,<IP/域名>,<端口># —— 真机实测格式(mode 默认 0=IP直连)
+    'set_server':   lambda d: 'SERVER,%d,%s,%d#' % (int(d.get('mode', 0)), str(d.get('ip', '')).strip(), int(d.get('port', 0))),
+    'reboot':       lambda d: 'RESET#',                 # 重启(模板待真机核对)
+    'locate_now':   lambda d: 'CR#',                    # 立即定位一次(模板待真机核对)
+    'query_status': lambda d: 'STATUS#',                # 查询状态(模板待真机核对)
+    'set_freq':     lambda d: 'UPLOAD,%d#' % int(d.get('interval', 3600)),  # 上报间隔秒(模板待真机核对)
+    'sos':          lambda d: 'SOS,A,,,%s#' % str(d.get('number', '')).strip(),  # 设 SOS 号码(V1.2 有示例)
+}
+
+def _build_jimi_payload(cmd, data):
+    """按 cmd 生成 L744 下行帧字节。cmd='raw' 时用 body['text'] 原样封 0x80;否则查模板表。"""
+    if cmd == 'raw':
+        text = str(data.get('text', '')).strip()
+        if not text:
+            raise ValueError("raw 指令需提供 text")
+    else:
+        tmpl = _JIMI_CMD_TEXT.get(cmd)
+        if not tmpl:
+            raise ValueError("不支持的 L744 指令: %s，支持: raw, %s"
+                             % (cmd, ', '.join(_JIMI_CMD_TEXT.keys())))
+        if cmd == 'sos' and not str(data.get('number', '')).strip():
+            raise ValueError("sos 指令需提供 number")
+        if cmd == 'set_server':
+            ip = str(data.get('ip', '')).strip()
+            try:
+                port = int(data.get('port', 0))
+            except (ValueError, TypeError):
+                port = 0
+            # IP 允许 IPv4 或域名;端口 1~65535
+            if not ip:
+                raise ValueError("set_server 指令需提供 ip")
+            if not (1 <= port <= 65535):
+                raise ValueError("set_server 端口需在 1~65535 之间")
+        text = tmpl(data)
+    return jimi.build_command(text, 0, next_serial() & 0xFFFF)
+
+@app.post('/api/commands/jimi')
+def jimi_command():
+    """L744/L745(几米 KKS)设备下行指令。
+    Body: {"phone": "<IMEI>", "cmd": "<命令名>", ...参数}
+    支持的 cmd:
+      - raw          : 通用文本下发,需 text=完整指令串(如 "SOS,A,,,158xxxx#")——最可靠
+      - set_server   : 设服务器地址,参数 ip、port,可选 mode(链路模式,默认0)——真机实测格式
+      - sos          : 设 SOS 号码,参数 number
+      - reboot       : 重启
+      - locate_now   : 立即定位一次
+      - query_status : 查询状态
+      - set_freq     : 设上报间隔,参数 interval(秒)
+    注:set_server/sos/raw 已有实证,其余便捷指令文本模板待真机联调核对。设备离线则入待发队列,上线自动补发。"""
+    data  = request.get_json() or {}
+    phone = data.get('phone', '')
+    cmd   = data.get('cmd', '')
+    if not phone or not cmd:
+        return fail('phone 和 cmd 不能为空')
+    if not _device_in_scope(phone):
+        return fail('设备不存在或无权限', 403)
+    # 先构造下行帧(离线入队也要用,故提前构造并校验参数合法性)
+    try:
+        payload = _build_jimi_payload(cmd, data)
+    except Exception as e:
+        log.warning("[L744指令] 构造失败 phone=%s cmd=%s err=%s", phone, cmd, e)
+        return fail(f'指令参数错误: {e}')
+
+    _dev_name = 'L744-' + phone[-6:]
+    with sessions_lock:
+        conn = sessions.get(phone)
+    # 设备离线:存入待发队列,下次上线由 _flush_pending_commands 自动补发(超长待机设备平时休眠,属常态)
+    if not conn:
+        db_exec("INSERT INTO pending_command (phone,cmd,payload_hex,status) VALUES (?,?,?,?)",
+                (phone, cmd, payload.hex(), 'pending'))
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, _dev_name, cmd, 'queued', '设备离线，已加入待发队列，上线后自动下发'))
+        add_op_log('L744指令入队', f'phone={phone} cmd={cmd}（设备离线，待上线补发）')
+        return ok({'cmd': cmd, 'phone': phone, 'queued': True,
+                   'message': '设备当前离线，指令已排队，设备下次上线时自动下发'})
+    try:
+        conn.sendall(payload)
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, _dev_name, cmd, 'success', ''))
+        add_op_log('L744指令下发', f'phone={phone} cmd={cmd}')
+        return ok({'cmd': cmd, 'phone': phone, 'queued': False})
+    except Exception as e:
+        # 在线发送失败(连接刚断等):转入待发队列,避免指令丢失
+        db_exec("INSERT INTO pending_command (phone,cmd,payload_hex,status) VALUES (?,?,?,?)",
+                (phone, cmd, payload.hex(), 'pending'))
+        db_exec("INSERT INTO command_history (phone,device_name,command,result,response) VALUES (?,?,?,?,?)",
+                (phone, _dev_name, cmd, 'queued', f'实时下发失败已转待发队列: {e}'))
+        log.warning("[L744指令] 实时失败转入队 phone=%s err=%s", phone, e)
+        return ok({'cmd': cmd, 'phone': phone, 'queued': True,
+                   'message': '实时下发失败，已转入待发队列，设备下次上线时自动下发'})
+
+
 # ── 天禧(智令 *XXX#)下行指令接口 ───────────────────────────────────────────────
 # 天禧协议规定：参数设置/查询/控制统一走「0x8300 类型0x01 下发命令字符串」，
 # 不使用标准 808 的 0x8103/0x8105/0x8202。命令字符串按协议用 GBK 编码。
@@ -2834,9 +2936,9 @@ def create_sim():
         return fail('ICCID 不能为空', 400)
     try:
         db_exec(
-            "INSERT INTO sim_card (iccid,imsi,msisdn,imei,operator,plan,balance,status,device_phone,remark,expire_date,monthly_fee,org_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (iccid, d.get('imsi',''), d.get('msisdn',''), d.get('imei',''),
+            "INSERT INTO sim_card (iccid,imsi,msisdn,imei,name,operator,plan,balance,status,device_phone,remark,expire_date,monthly_fee,org_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (iccid, d.get('imsi',''), d.get('msisdn',''), d.get('imei',''), d.get('name',''),
              d.get('operator','中国移动'), d.get('plan',''),
              float(d.get('balance', 0)), d.get('status','正常'),
              d.get('device_phone',''), d.get('remark',''),
@@ -2854,8 +2956,8 @@ def update_sim(sid):
         return fail('SIM卡不存在或无权限', 403)
     d = request.get_json() or {}
     db_exec(
-        "UPDATE sim_card SET imsi=?,msisdn=?,imei=?,operator=?,plan=?,balance=?,status=?,device_phone=?,remark=?,expire_date=?,monthly_fee=? WHERE id=?",
-        (d.get('imsi',''), d.get('msisdn',''), d.get('imei',''),
+        "UPDATE sim_card SET imsi=?,msisdn=?,imei=?,name=?,operator=?,plan=?,balance=?,status=?,device_phone=?,remark=?,expire_date=?,monthly_fee=? WHERE id=?",
+        (d.get('imsi',''), d.get('msisdn',''), d.get('imei',''), d.get('name',''),
          d.get('operator','中国移动'), d.get('plan',''),
          float(d.get('balance', 0)), d.get('status','正常'),
          d.get('device_phone',''), d.get('remark',''),
