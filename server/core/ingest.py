@@ -1975,6 +1975,15 @@ def handle_client(conn, addr):
                 serial = hdr['serial']
                 body   = hdr['body']
 
+                # [L744诊断] 打印这两台 L744 发的所有报文类型+完整hex+body,用于定位电量(电压等级)
+                # 在哪个报文(心跳0x0002/位置0x0200/其他)。截短号前缀 2033120 匹配这两台。定位后移除。
+                try:
+                    if ph and str(ph).startswith('2033120'):
+                        log.info("[L744诊断] 全报文 phone=%s msg_id=0x%04X frame_hex=%s body_hex=%s",
+                                 ph, msg_id, frame.hex(), body.hex())
+                except Exception:
+                    pass
+
                 if ph:
                     phone = ph
                     with sessions_lock:

@@ -930,8 +930,8 @@ onMounted(async () => {
     // 设备加载完后再拼客户树（需要设备的 customer_id 统计数量）
     await loadCustomerTree()
     connectSocket()
-    // 每 15 秒刷新在线设备列表（面板实时显示无坐标设备）
-    onlineTimer = setInterval(loadOnlineDevices, 15000)
+    // 每 10 秒刷新在线设备列表（面板实时显示无坐标设备）
+    onlineTimer = setInterval(loadOnlineDevices, 10000)
   } catch (e) {
     console.warn('[RealtimeMap] 地图初始化失败:', e)
     ElMessage.error('地图加载失败，请刷新页面重试')
