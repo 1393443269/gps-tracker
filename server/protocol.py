@@ -312,6 +312,19 @@ def parse_location_body(body: bytes):
                 signal_data = item_data[0]
             elif item_id == 0x31 and item_len == 1:  # GNSS 定位卫星数(BYTE)
                 gnss_sat = item_data[0]
+            elif item_id == 0xEB and item_len >= 14 and not iccid_data:
+                # L744G(几米808)厂商自定义附加项:结构为 前缀4字节 + ICCID(10字节BCD) + 后缀。
+                # 真机实测 0xeb 值形如 000c00b2 + 8986112434773654243700(ICCID) + 后缀,
+                # ICCID 从偏移4起10字节BCD。仅在 0xF1 未提供 ICCID 时用它兜底。
+                try:
+                    _iccid_bcd = item_data[4:14]
+                    _ic = ''.join(f'{b:02x}' for b in _iccid_bcd)
+                    # ICCID 以 8986 开头(中国运营商 SIM),取纯数字;去掉末尾可能的填充 F
+                    _ic = _ic.rstrip('f').rstrip('F')
+                    if _ic.isdigit() and _ic.startswith('898'):
+                        iccid_data = _ic
+                except Exception:
+                    pass
             offset += item_len
 
         return {
