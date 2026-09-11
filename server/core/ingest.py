@@ -1087,6 +1087,18 @@ def handle_register(sock, phone, serial, body):
         if isinstance(_v, str):
             info[_k] = _v.replace('\x00', '').strip()
 
+    # [L744诊断] 临时日志:打印注册报文体完整 hex 与解析出的各字段,用于定位这批 L744G 的
+    # 真实 15 位 IMEI 到底在注册报文的哪个字段(制造商/型号/终端ID/车牌位),还是只在报文头。
+    # 定位清楚后应移除本段。仅打日志、不改逻辑。
+    try:
+        _model = (info.get('terminal_model') or '')
+        if 'L744' in _model.upper() or 'L745' in _model.upper():
+            log.info("[L744诊断] 注册报文 phone头=%s body_hex=%s 制造商=%r 型号=%r 终端ID=%r 车牌位=%r",
+                     phone, body.hex(), info.get('manufacturer'), info.get('terminal_model'),
+                     info.get('terminal_id'), info.get('plate_no'))
+    except Exception:
+        pass
+
     # 若 plate_no 字段携带了完整 IMEI（15 位纯数字），以 IMEI 作为设备标识
     plate_no_raw = info.get('plate_no', '') or ''
     if len(plate_no_raw) == 15 and plate_no_raw.isdigit():
@@ -1194,6 +1206,18 @@ def handle_location(sock, phone, serial, body):
     if loc is None:
         log.error("[808] 位置解析失败: phone=%s body_len=%d", phone, len(body))
         return
+
+    # [L744诊断] 临时日志:打印位置报文的全部附加信息项(extra_raw)与关键字段,
+    # 用于定位这批 L744G 的真实 IMEI / 电量到底在哪个附加 ID(0xF6/0xFB/自定义)。
+    # 定位清楚后应移除本段。仅打日志、不改逻辑。
+    try:
+        _extra = loc.get('extra_raw') or {}
+        if _extra:
+            log.info("[L744诊断] phone=%s 位置附加项=%s imei附加=%s iccid附加=%s battery=%s signal=%s",
+                     phone, _extra, loc.get('imei'), loc.get('iccid'),
+                     loc.get('battery_data'), loc.get('signal'))
+    except Exception:
+        pass
 
     canonical  = resolve_phone(phone)
     lat        = loc['lat']

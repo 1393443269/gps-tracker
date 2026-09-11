@@ -2261,6 +2261,8 @@ def g618g_command():
 
 # 便捷指令 → 指令文本串模板。raw 由 body['text'] 直接给出,不走这里。
 _JIMI_CMD_TEXT = {
+    # 设服务器地址:SERVER,<链路模式>,<IP/域名>,<端口># —— 真机实测格式(mode 默认 0=IP直连)
+    'set_server':   lambda d: 'SERVER,%d,%s,%d#' % (int(d.get('mode', 0)), str(d.get('ip', '')).strip(), int(d.get('port', 0))),
     'reboot':       lambda d: 'RESET#',                 # 重启(模板待真机核对)
     'locate_now':   lambda d: 'CR#',                    # 立即定位一次(模板待真机核对)
     'query_status': lambda d: 'STATUS#',                # 查询状态(模板待真机核对)
@@ -2281,6 +2283,17 @@ def _build_jimi_payload(cmd, data):
                              % (cmd, ', '.join(_JIMI_CMD_TEXT.keys())))
         if cmd == 'sos' and not str(data.get('number', '')).strip():
             raise ValueError("sos 指令需提供 number")
+        if cmd == 'set_server':
+            ip = str(data.get('ip', '')).strip()
+            try:
+                port = int(data.get('port', 0))
+            except (ValueError, TypeError):
+                port = 0
+            # IP 允许 IPv4 或域名;端口 1~65535
+            if not ip:
+                raise ValueError("set_server 指令需提供 ip")
+            if not (1 <= port <= 65535):
+                raise ValueError("set_server 端口需在 1~65535 之间")
         text = tmpl(data)
     return jimi.build_command(text, 0, next_serial() & 0xFFFF)
 
@@ -2290,12 +2303,13 @@ def jimi_command():
     Body: {"phone": "<IMEI>", "cmd": "<命令名>", ...参数}
     支持的 cmd:
       - raw          : 通用文本下发,需 text=完整指令串(如 "SOS,A,,,158xxxx#")——最可靠
+      - set_server   : 设服务器地址,参数 ip、port,可选 mode(链路模式,默认0)——真机实测格式
+      - sos          : 设 SOS 号码,参数 number
       - reboot       : 重启
       - locate_now   : 立即定位一次
       - query_status : 查询状态
       - set_freq     : 设上报间隔,参数 interval(秒)
-      - sos          : 设 SOS 号码,参数 number
-    注:除 sos/raw 外,便捷指令文本模板待真机联调核对。设备离线则入待发队列,上线自动补发。"""
+    注:set_server/sos/raw 已有实证,其余便捷指令文本模板待真机联调核对。设备离线则入待发队列,上线自动补发。"""
     data  = request.get_json() or {}
     phone = data.get('phone', '')
     cmd   = data.get('cmd', '')
