@@ -246,6 +246,15 @@ def _parse_extra_battery(data: bytes) -> dict:
     return result
 
 
+def _voltage_to_level(mv: int) -> int:
+    """锂电池电压(mV)→电量百分比。L744 KKS 协议附加项 0x002D 专用。
+    线性插值: 3200 mV=0%, 4200 mV=100%，超出范围截断。"""
+    MIN_MV, MAX_MV = 3200, 4200
+    if mv <= MIN_MV: return 0
+    if mv >= MAX_MV: return 100
+    return round((mv - MIN_MV) / (MAX_MV - MIN_MV) * 100)
+
+
 def parse_location_body(body: bytes):
     """
     0x0200 位置信息汇报体
@@ -300,6 +309,9 @@ def parse_location_body(body: bytes):
                 rtk_data = _parse_extra_rtk(item_data)
             elif item_id == 0xFB and item_len >= 2:  # 电池信息
                 battery_data = _parse_extra_battery(item_data)
+            elif item_id == 0x2D and item_len == 2:   # L744 KKS 电池电压 (0x002D, 单位 mV)
+                raw_mv = struct.unpack('>H', item_data)[0]
+                battery_data = {'voltage': raw_mv, 'level': _voltage_to_level(raw_mv)}
             elif item_id == 0xF1 and item_len >= 1:  # ICCID(SIM卡号)
                 # 协议: 0xF1 后为 ICCID 的 ASCII 串(如 f1143839...),去掉补位后即数字串
                 iccid_data = item_data.decode('ascii', errors='replace').replace('\x00', '').strip()
@@ -409,3 +421,5 @@ def build_register_resp(phone: str, serial_out: int, ack_serial: int, result: in
     if result == 0 and auth_code:
         body += auth_code.encode('ascii')
     return encode_message(0x8100, phone, serial_out, body)
+
+
