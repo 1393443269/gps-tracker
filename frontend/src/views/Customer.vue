@@ -179,7 +179,7 @@
         <div v-for="d in allDevices" :key="d.phone"
           style="padding:7px 0;border-bottom:1px solid #f5f5f5;display:flex;align-items:center;gap:8px;">
           <el-checkbox :value="String(d.phone)" style="flex:1;min-width:0;margin:0;">
-            <span style="font-size:13px;font-weight:500;">{{ d.real_name || d.name || '未命名' }}</span>
+            <span style="font-size:13px;font-weight:500;">{{ d.real_name || d.name || d.imei || d.phone || '未命名' }}</span>
             <span style="font-size:11px;color:#909399;margin-left:8px;">{{ d.imei || d.terminal_id || d.phone }}</span>
           </el-checkbox>
           <!-- 管理员模式：标出已分配给其他客户的设备 -->
