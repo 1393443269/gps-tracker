@@ -249,7 +249,7 @@ def _parse_extra_battery(data: bytes) -> dict:
 def _voltage_to_level(mv: int) -> int:
     """锂电池电压(mV)→电量百分比。L744 KKS 协议附加项 0x002D 专用。
     线性插值: 3200 mV=0%, 4200 mV=100%，超出范围截断。"""
-    MIN_MV, MAX_MV = 3200, 4200
+    MIN_MV, MAX_MV = 2900, 4200
     if mv <= MIN_MV: return 0
     if mv >= MAX_MV: return 100
     return round((mv - MIN_MV) / (MAX_MV - MIN_MV) * 100)
@@ -324,17 +324,20 @@ def parse_location_body(body: bytes):
                 signal_data = item_data[0]
             elif item_id == 0x31 and item_len == 1:  # GNSS 定位卫星数(BYTE)
                 gnss_sat = item_data[0]
-            elif item_id == 0xEB and item_len >= 14 and not iccid_data:
-                # L744G(几米808)厂商自定义附加项:结构为 前缀4字节 + ICCID(10字节BCD) + 后缀。
-                # 真机实测 0xeb 值形如 000c00b2 + 8986112434773654243700(ICCID) + 后缀,
-                # ICCID 从偏移4起10字节BCD。仅在 0xF1 未提供 ICCID 时用它兜底。
+            elif item_id == 0xEB and item_len >= 4:
                 try:
-                    _iccid_bcd = item_data[4:14]
-                    _ic = ''.join(f'{b:02x}' for b in _iccid_bcd)
-                    # ICCID 以 8986 开头(中国运营商 SIM),取纯数字;去掉末尾可能的填充 F
-                    _ic = _ic.rstrip('f').rstrip('F')
-                    if _ic.isdigit() and _ic.startswith('898'):
-                        iccid_data = _ic
+                    if not iccid_data:
+                        _pi = item_data.find(b'\x00\x0c\x00\xb2')
+                        if _pi >= 0 and _pi + 14 <= len(item_data):
+                            _ic = ''.join(f'{b:02x}' for b in item_data[_pi+4:_pi+14]).rstrip('fF')
+                            if _ic.isdigit() and _ic.startswith('898'):
+                                iccid_data = _ic
+                    if battery_data is None:
+                        _pv = item_data.find(b'\x00\x04\x00\x2d')
+                        if _pv >= 0 and _pv + 6 <= len(item_data):
+                            _mv = struct.unpack('>H', item_data[_pv+4:_pv+6])[0]
+                            if 2000 <= _mv <= 5000:
+                                battery_data = {'voltage': _mv, 'level': _voltage_to_level(_mv)}
                 except Exception:
                     pass
             offset += item_len
