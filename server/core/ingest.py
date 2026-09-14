@@ -948,7 +948,7 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
     # 静止设备重复报"进入"——重连后 was_inside 仍为真,只走"持续在内"不重复告警。
     _dev_row = db_query_one("SELECT measured_interval_sec, expected_interval_sec FROM device WHERE phone=?", (phone,))
     _measured = ((_dev_row.get('measured_interval_sec') or _dev_row.get('expected_interval_sec')) if _dev_row else None) or 0
-    _debounce_n = 1 if _measured >= 180 else FENCE_DEBOUNCE_N
+    _debounce_n = 2 if _measured >= 180 else FENCE_DEBOUNCE_N
 
     # 收集需要在锁外执行的告警动作（db_exec/emit 不能在锁内调用，避免死锁）
     _alarm_actions = []   # list of callables
