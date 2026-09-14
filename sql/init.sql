@@ -21,6 +21,24 @@ CREATE TABLE IF NOT EXISTS `device` (
   `last_location_time`  DATETIME     DEFAULT NULL COMMENT '最新定位时间',
   `created_at`          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at`          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  -- ── 扩展字段(运行时写入,初始为空) ────────────────────────────────────────
+  `last_seen`           DATETIME     DEFAULT NULL COMMENT '最后一次收到任意报文时间(注册/心跳/定位)',
+  `last_battery`        INT          DEFAULT NULL COMMENT '最新电池电量(%)',
+  `last_battery_time`   DATETIME     DEFAULT NULL COMMENT '最新电量更新时间',
+  `presence_state`      VARCHAR(20)  DEFAULT NULL COMMENT '细粒度在线状态: online/sleeping/offline',
+  `offline_reason`      VARCHAR(50)  DEFAULT NULL COMMENT '离线原因: net_lost/battery_drain/unknown',
+  `expected_interval_sec` INT        DEFAULT NULL COMMENT '期望上报间隔(秒),供动态离线阈值计算',
+  `measured_interval_sec` INT        DEFAULT NULL COMMENT '实测平均上报间隔(秒)',
+  `low_bat_mode`        TINYINT      DEFAULT 0   COMMENT '低电量模式(0=正常,1=低电)',
+  `org_id`              INT          DEFAULT 1   COMMENT '所属组织ID',
+  `lifecycle`           TINYINT      DEFAULT 1   COMMENT '设备生命周期(1=使用中)',
+  `imei`                VARCHAR(20)  DEFAULT NULL COMMENT '设备IMEI(15位)',
+  `iccid`               VARCHAR(30)  DEFAULT NULL COMMENT 'SIM卡ICCID',
+  `last_address`        VARCHAR(200) DEFAULT NULL COMMENT '最新逆地理地址',
+  `last_loc_type`       VARCHAR(20)  DEFAULT NULL COMMENT '最新定位方式(gps/lbs/wifi)',
+  `last_signal`         TINYINT      DEFAULT NULL COMMENT '最新信号强度',
+  `boot_time`           DATETIME     DEFAULT NULL COMMENT '设备最近启动时间',
+  `remark`              VARCHAR(200) DEFAULT NULL COMMENT '备注',
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_phone` (`phone`)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '设备信息';
@@ -65,3 +83,5 @@ CREATE TABLE IF NOT EXISTS `alarm_record` (
   KEY `idx_phone_alarm_time` (`phone`, `alarm_time`),
   KEY `idx_status` (`status`)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '报警记录';
+
+
