@@ -946,8 +946,8 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
     # 高频长连接设备(measured<180s)在持续连接内能攒够3次,保留默认防抖滤GPS抖动。
     # 注:围栏"进出确认状态"已跨连接保留(见 _fence_cleanup 说明),故降为1不会再导致
     # 静止设备重复报"进入"——重连后 was_inside 仍为真,只走"持续在内"不重复告警。
-    _dev_row = db_query_one("SELECT measured_interval_sec FROM device WHERE phone=?", (phone,))
-    _measured = (_dev_row.get('measured_interval_sec') if _dev_row else None) or 0
+    _dev_row = db_query_one("SELECT measured_interval_sec, expected_interval_sec FROM device WHERE phone=?", (phone,))
+    _measured = ((_dev_row.get('measured_interval_sec') or _dev_row.get('expected_interval_sec')) if _dev_row else None) or 0
     _debounce_n = 1 if _measured >= 180 else FENCE_DEBOUNCE_N
 
     # 收集需要在锁外执行的告警动作（db_exec/emit 不能在锁内调用，避免死锁）
