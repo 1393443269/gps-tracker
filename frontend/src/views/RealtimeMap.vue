@@ -601,6 +601,7 @@ function popupHtml(info) {
   const contact = _esc(info.contact || info.contact_phone || '—')
   const addr    = _esc(info.address || '—')                 // 逆地理编码地址(第二步补)
   const bat     = info.last_battery != null ? info.last_battery + '%' : '—'
+  const volt    = info.last_voltage != null ? ' (' + (info.last_voltage/1000).toFixed(2) + 'V)' : ''
   const sig     = _signalText(info.signal)                  // 信号(第二步补)
   const locTime = _esc(info.last_location_time || info.time || '—')
   const comTime = _esc(info.last_seen || info.time || '—')
@@ -621,7 +622,7 @@ function popupHtml(info) {
       <div class="rt-card-name">${name}</div>
       ${alarmTag}
     </div>
-    <div class="rt-card-row"><b>设备IMEI:</b>${imei}　<span class="rt-sig">📶 ${sig}</span>　<span class="rt-bat">🔋 ${bat}</span></div>
+    <div class="rt-card-row"><b>设备IMEI:</b>${imei}　<span class="rt-sig">📶 ${sig}</span>　<span class="rt-bat">🔋 ${bat}${volt}</span></div>
     <div class="rt-card-row"><b>设备型号:</b>${model}</div>
     <div class="rt-card-row"><b>联系方式:</b>${contact}</div>
     <div class="rt-card-row"><b>定位地址:</b>${addr}</div>
@@ -665,6 +666,7 @@ async function openDeviceCard(phone, ll) {
         signal: d.last_signal,           // 信号百分比(第二步补)
         loc_type: d.last_loc_type,       // 定位方式 1基站/2WIFI/3综合/5蓝牙/其余GPS
         last_battery: d.last_battery ?? base.last_battery,
+        last_voltage: d.last_voltage ?? base.last_voltage,
         last_location_time: d.last_location_time,
         last_seen: d.last_seen,
       }

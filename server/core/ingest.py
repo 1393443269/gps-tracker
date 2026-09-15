@@ -41,7 +41,7 @@ from core.state import (
     _fence_cleanup,
 )
 from core.extensions import socketio
-from common.geometry import _is_inside_fence
+from common.geometry import _is_inside_fence, _is_inside_fence_buffered
 
 log = logging.getLogger(__name__)
 
@@ -898,6 +898,29 @@ def _sio_emit(event: str, data: dict, phone: str):
 
 # ── 电子围栏：穿越检测 ────────────────────────────────────────────────────────
 
+def _persist_fence_inside(phone, fence_ids):
+    """覆盖式持久化"该设备当前在哪些围栏内"到 fence_device_state。失败不影响主流程。"""
+    try:
+        db_exec("DELETE FROM fence_device_state WHERE phone=?", (phone,))
+        for _fid in fence_ids:
+            db_exec("INSERT INTO fence_device_state (fence_id, phone) VALUES (?,?)", (_fid, phone))
+    except Exception as _e:
+        log.warning("[围栏] 状态持久化失败 phone=%s err=%s", phone, _e)
+
+
+def _load_fence_state():
+    """进程启动时从 fence_device_state 读回围栏进出确认状态,重建 fence_device_inside 内存字典。"""
+    try:
+        rows = db_query("SELECT phone, fence_id FROM fence_device_state")
+        with _fence_lock:
+            fence_device_inside.clear()
+            for _r in rows or []:
+                fence_device_inside.setdefault(_r['phone'], set()).add(_r['fence_id'])
+        log.info("[围栏] 已从数据库恢复 %d 台设备的围栏进出状态", len(fence_device_inside))
+    except Exception as _e:
+        log.warning("[围栏] 状态恢复失败(不阻断启动): %s", _e)
+
+
 def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, status_flag=0):
     """
     每次收到 0x0200 位置报文后调用。
@@ -975,7 +998,13 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
                     pass  # 时间格式非法则不过滤
 
             # 当前点位是否在围栏内
-            currently_inside = _is_inside_fence(lat, lng, f)
+            was_inside = fid in prev_inside
+            # 回滞:已在围栏内时用"放大30米"的缓冲边界判离开,吸收GPS边界抖动,防静止设备反复误报进入/离开。
+            # 未在围栏内时用原边界判进入,进入灵敏度不变。
+            if was_inside:
+                currently_inside = _is_inside_fence_buffered(lat, lng, f, 30)
+            else:
+                currently_inside = _is_inside_fence(lat, lng, f)
 
             # ── P0: 防抖 - 连续 FENCE_DEBOUNCE_N 次同状态才确认切换 ────────────
             pending = fence_device_pending.setdefault(phone, {})
@@ -986,7 +1015,6 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
                 count = 1
             pending[fid] = (currently_inside, count)
 
-            was_inside = fid in prev_inside
 
             # 防抖未达标：保持原确认状态，继续积累
             if count < _debounce_n:
@@ -1052,6 +1080,7 @@ def check_fence_crossing(phone, lat, lng, device_id, gps_time, speed_raw=0, stat
                     log.info("[围栏] %s 围栏「%s」超速 %.1f>%dkm/h", phone, f['name'], speed_kmh, speed_lim)
 
         fence_device_inside[phone] = new_inside
+        _persist_fence_inside(phone, new_inside)   # 同步持久化,重启后可恢复,防误报"进入"
 
     # ── 锁外执行 DB 写入和 Socket 推送（避免在锁内调用 IO 操作） ──────────────
     for act in _alarm_actions:
@@ -1297,8 +1326,8 @@ def handle_location(sock, phone, serial, body):
     if _bat and _bat.get('level') is not None:
         try:
             _bnow = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            db_exec("UPDATE device SET last_battery=?, last_battery_time=?, updated_at=? WHERE phone=?",
-                    (_bat['level'], _bnow, _bnow, canonical))
+            db_exec("UPDATE device SET last_battery=?, last_battery_time=?, last_voltage=?, updated_at=? WHERE phone=?",
+                    (_bat['level'], _bnow, _bat.get('voltage'), _bnow, canonical))
             insert_sensor_data(canonical, 'battery', value=_bat['level'], unit='%')
         except Exception as e:
             log.warning("[808] 电量落库失败 phone=%s err=%s", canonical, e)

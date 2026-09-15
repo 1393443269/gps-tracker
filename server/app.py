@@ -288,6 +288,15 @@ def init_db():
         PRIMARY KEY (fence_id, phone)
     );
     CREATE INDEX IF NOT EXISTS idx_fence_device_phone ON fence_device(phone);
+    -- 围栏进出确认状态持久化:记录"每台设备当前确认在哪些围栏内"。
+    -- 内存字典 fence_device_inside 是易失的,进程重启即空,会导致在栏内设备下次上报误报"进入"。
+    -- 本表实时同步该状态,进程启动时读回内存,重启不再误报。
+    CREATE TABLE IF NOT EXISTS fence_device_state (
+        fence_id INTEGER NOT NULL,
+        phone    TEXT    NOT NULL,
+        PRIMARY KEY (fence_id, phone)
+    );
+    CREATE INDEX IF NOT EXISTS idx_fence_state_phone ON fence_device_state(phone);
 
     CREATE TABLE IF NOT EXISTS mark_point (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1321,7 +1330,7 @@ def devices_with_customer():
         "       d.status, d.lifecycle, d.activated_at, d.customer_id, d.role_id, "
         "       d.terminal_id, d.imei, "
         # 设备卡片补充:电量/最后通信/信号/定位方式/逆地理地址/呈现态
-        "       d.last_battery, d.last_seen, d.last_signal, d.last_loc_type, "
+        "       d.last_battery, d.last_voltage, d.last_seen, d.last_signal, d.last_loc_type, "
         "       d.last_address, d.presence_state, d.offline_reason, "
         "       r.name as role_name, r.color as role_color, r.icon_type, "
         "       c.contact as real_name, c.gender, c.age, c.avatar, "
@@ -4064,7 +4073,7 @@ def portal_devices():
     records  = db_query(
         f"SELECT d.phone, d.name, d.last_lat, d.last_lng, d.last_speed, "
         f"d.last_location_time, d.status, d.presence_state, d.offline_reason, "
-        f"d.last_battery, d.last_battery_time, "
+        f"d.last_battery, d.last_voltage, d.last_battery_time, "
         f"d.terminal_id, d.imei, d.terminal_model, c.name AS customer_name "
         f"FROM device d LEFT JOIN customer c ON d.customer_id = c.id "
         f"WHERE d.customer_id IN ({cid_ph})",
@@ -4659,7 +4668,7 @@ def portal_device_list():
                  "device.manufacturer, device.terminal_model, device.terminal_id, device.imei, "
                  "device.last_lat, device.last_lng, "
                  "device.last_speed, device.last_location_time, device.online_time, device.status, device.customer_id, "
-                 "device.last_battery, device.last_battery_time, "
+                 "device.last_battery, device.last_voltage, device.last_battery_time, "
                  "device.last_seen, device.last_signal, device.last_loc_type, device.last_address, "
                  "device.presence_state, device.offline_reason, "
                  "device.expected_interval_sec, device.measured_interval_sec, "

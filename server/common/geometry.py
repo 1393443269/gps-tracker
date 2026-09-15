@@ -31,6 +31,48 @@ def _point_in_polygon(lng, lat, coords):
     return inside
 
 
+def _point_to_polygon_dist_m(lat, lng, coords):
+    """点到多边形各边的最短距离(米)。用局部平面近似投影。coords=[[lng,lat],...]"""
+    m_per_lat = 111320.0
+    m_per_lng = 111320.0 * math.cos(math.radians(lat))
+    px, py = lng * m_per_lng, lat * m_per_lat
+    best = float('inf')
+    j = len(coords) - 1
+    for i in range(len(coords)):
+        ax, ay = coords[i][0] * m_per_lng, coords[i][1] * m_per_lat
+        bx, by = coords[j][0] * m_per_lng, coords[j][1] * m_per_lat
+        dx, dy = bx - ax, by - ay
+        l2 = dx*dx + dy*dy
+        t = ((px-ax)*dx + (py-ay)*dy) / l2 if l2 > 0 else 0.0
+        t = max(0.0, min(1.0, t))
+        cx, cy = ax + t*dx, ay + t*dy
+        d = math.hypot(px-cx, py-cy)
+        if d < best:
+            best = d
+        j = i
+    return best
+
+
+def _is_inside_fence_buffered(lat, lng, fence, buffer_m):
+    """带缓冲带的"在内"判定:用于离开回滞。在内、或在外但距边界<=buffer_m 都算在内。"""
+    try:
+        ft = fence['fence_type']
+        if ft == 'circle':
+            return _haversine_m(lat, lng, fence['lat'], fence['lng']) <= (fence['radius'] or 2000) + buffer_m
+        elif ft in ('polygon', 'administrative'):
+            coords = fence['coordinates']
+            if isinstance(coords, str):
+                coords = _json.loads(coords)
+            if not coords:
+                return False
+            if _point_in_polygon(lng, lat, coords):
+                return True
+            return _point_to_polygon_dist_m(lat, lng, coords) <= buffer_m
+    except Exception as e:
+        log.warning("[围栏] 缓冲判定异常 fence_id=%s: %s", (fence or {}).get('id'), e)
+    return False
+
+
 def _is_inside_fence(lat, lng, fence):
     """判断坐标是否在围栏内"""
     try:

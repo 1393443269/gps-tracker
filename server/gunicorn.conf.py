@@ -34,9 +34,10 @@ def post_fork(server, worker):
     import threading
     from app import (init_db, start_batch_writer, start_tcp_server, start_mqtt_subscriber,
                      _setup_pg_partitions, start_partition_maintainer, start_push_worker)
-    from core.ingest import start_location_cleaner, start_offline_scanner
+    from core.ingest import start_location_cleaner, start_offline_scanner, _load_fence_state
 
     init_db()
+    _load_fence_state()   # 从数据库恢复围栏进出状态,重启不再误报"进入"
     _setup_pg_partitions()       # PG：location_record 按月分区初始化（SQLite 跳过）
     start_partition_maintainer() # PG：每日预建分区的维护线程
     start_batch_writer()
