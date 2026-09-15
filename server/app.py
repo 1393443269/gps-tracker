@@ -3678,14 +3678,14 @@ def report_summary():
     # 使用参数化查询，防止日期字段 SQL 注入
     if start_raw:
         alarm_period = db_scalar(
-            "SELECT COUNT(*) FROM alarm_record WHERE date(alarm_time) BETWEEN ? AND ?",
+            "SELECT COUNT(*) FROM alarm_record WHERE substr(alarm_time,1,10) BETWEEN ? AND ?",
             [start_raw, end_raw]
         )
     else:
         from datetime import timedelta
         _start_date = (datetime.now() - timedelta(days=days - 1)).strftime('%Y-%m-%d')
         alarm_period = db_scalar(
-            "SELECT COUNT(*) FROM alarm_record WHERE date(alarm_time) >= ?",
+            "SELECT COUNT(*) FROM alarm_record WHERE substr(alarm_time,1,10) >= ?",
             [_start_date]
         )
 
@@ -3719,16 +3719,16 @@ def report_summary():
     from datetime import timedelta as _trd
     _trend_date = (datetime.now() - _trd(days=trend_days - 1)).strftime('%Y-%m-%d')
     alarm_trend = db_query(
-        "SELECT date(alarm_time) as day, COUNT(*) as cnt FROM alarm_record "
-        "WHERE date(alarm_time) >= ? GROUP BY day ORDER BY day",
+        "SELECT substr(alarm_time,1,10) as day, COUNT(*) as cnt FROM alarm_record "
+        "WHERE substr(alarm_time,1,10) >= ? GROUP BY day ORDER BY day",
         [_trend_date]
     )
     alarm_types = db_query(
         "SELECT alarm_desc, COUNT(*) as cnt FROM alarm_record GROUP BY alarm_desc ORDER BY cnt DESC LIMIT 6"
     )
     loc_trend = db_query(
-        "SELECT date(gps_time) as day, COUNT(*) as cnt FROM location_record "
-        "WHERE date(gps_time) >= ? GROUP BY day ORDER BY day",
+        "SELECT substr(gps_time,1,10) as day, COUNT(*) as cnt FROM location_record "
+        "WHERE substr(gps_time,1,10) >= ? GROUP BY day ORDER BY day",
         [_trend_date]
     )
 
@@ -4540,14 +4540,14 @@ def portal_report_summary():
         alarm_period = 0
     elif start_raw:
         alarm_period = db_scalar(
-            f"SELECT COUNT(*) FROM alarm_record WHERE phone IN ({ph}) AND date(alarm_time) BETWEEN ? AND ?",
+            f"SELECT COUNT(*) FROM alarm_record WHERE phone IN ({ph}) AND substr(alarm_time,1,10) BETWEEN ? AND ?",
             list(phones) + [start_raw, end_raw]
         )
     else:
         from datetime import timedelta
         _start_date = (datetime.now() - timedelta(days=days - 1)).strftime('%Y-%m-%d')
         alarm_period = db_scalar(
-            f"SELECT COUNT(*) FROM alarm_record WHERE phone IN ({ph}) AND date(alarm_time) >= ?",
+            f"SELECT COUNT(*) FROM alarm_record WHERE phone IN ({ph}) AND substr(alarm_time,1,10) >= ?",
             list(phones) + [_start_date]
         )
 
@@ -4596,8 +4596,8 @@ def portal_report_summary():
     _trend_date = (datetime.now() - _trd(days=trend_days - 1)).strftime('%Y-%m-%d')
     if phones:
         alarm_trend = db_query(
-            f"SELECT date(alarm_time) as day, COUNT(*) as cnt FROM alarm_record "
-            f"WHERE phone IN ({ph}) AND date(alarm_time) >= ? GROUP BY day ORDER BY day",
+            f"SELECT substr(alarm_time,1,10) as day, COUNT(*) as cnt FROM alarm_record "
+            f"WHERE phone IN ({ph}) AND substr(alarm_time,1,10) >= ? GROUP BY day ORDER BY day",
             list(phones) + [_trend_date]
         )
         alarm_types = db_query(
@@ -4606,8 +4606,8 @@ def portal_report_summary():
             phones
         )
         loc_trend = db_query(
-            f"SELECT date(gps_time) as day, COUNT(*) as cnt FROM location_record "
-            f"WHERE phone IN ({ph}) AND date(gps_time) >= ? GROUP BY day ORDER BY day",
+            f"SELECT substr(gps_time,1,10) as day, COUNT(*) as cnt FROM location_record "
+            f"WHERE phone IN ({ph}) AND substr(gps_time,1,10) >= ? GROUP BY day ORDER BY day",
             list(phones) + [_trend_date]
         )
     else:
