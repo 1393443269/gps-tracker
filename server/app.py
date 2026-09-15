@@ -3703,14 +3703,14 @@ def report_summary():
     recharge_total = db_scalar("SELECT COALESCE(SUM(amount),0) FROM recharge")
     if start_raw:
         recharge_period = db_scalar(
-            "SELECT COALESCE(SUM(amount),0) FROM recharge WHERE date(created_at) BETWEEN ? AND ?",
+            "SELECT COALESCE(SUM(amount),0) FROM recharge WHERE substr(created_at,1,10) BETWEEN ? AND ?",
             [start_raw, end_raw]
         )
     else:
         from datetime import timedelta as _td
         _rstart_date = (datetime.now() - _td(days=days - 1)).strftime('%Y-%m-%d')
         recharge_period = db_scalar(
-            "SELECT COALESCE(SUM(amount),0) FROM recharge WHERE date(created_at) >= ?",
+            "SELECT COALESCE(SUM(amount),0) FROM recharge WHERE substr(created_at,1,10) >= ?",
             [_rstart_date]
         )
 
@@ -4577,14 +4577,14 @@ def portal_report_summary():
         recharge_total = db_scalar(f"SELECT COALESCE(SUM(amount),0) FROM recharge WHERE sim_id IN ({sp})", sim_ids)
         if start_raw:
             recharge_period = db_scalar(
-                f"SELECT COALESCE(SUM(amount),0) FROM recharge WHERE sim_id IN ({sp}) AND date(created_at) BETWEEN ? AND ?",
+                f"SELECT COALESCE(SUM(amount),0) FROM recharge WHERE sim_id IN ({sp}) AND substr(created_at,1,10) BETWEEN ? AND ?",
                 sim_ids + [start_raw, end_raw]
             )
         else:
             from datetime import timedelta as _td
             _rstart_date = (datetime.now() - _td(days=days - 1)).strftime('%Y-%m-%d')
             recharge_period = db_scalar(
-                f"SELECT COALESCE(SUM(amount),0) FROM recharge WHERE sim_id IN ({sp}) AND date(created_at) >= ?",
+                f"SELECT COALESCE(SUM(amount),0) FROM recharge WHERE sim_id IN ({sp}) AND substr(created_at,1,10) >= ?",
                 sim_ids + [_rstart_date]
             )
     else:
