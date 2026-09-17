@@ -40,6 +40,10 @@
         </el-menu-item>
 
         <div class="menu-group-label">管理</div>
+        <el-menu-item v-if="canShow('customers')" index="/customers">
+          <el-icon><User /></el-icon>
+          <span>客户管理</span>
+        </el-menu-item>
         <el-menu-item v-if="canShow('device-info')" index="/device-info">
           <el-icon><Cellphone /></el-icon>
           <span>设备信息</span>
@@ -48,10 +52,6 @@
           <el-icon><Setting /></el-icon>
           <span>设备设置</span>
         </el-menu-item>
-        <el-menu-item v-if="canShow('scan-import')" index="/scan-import">
-          <el-icon><Postcard /></el-icon>
-          <span>扫码录入</span>
-        </el-menu-item>
         <el-menu-item v-if="canShow('role-settings')" index="/role-settings">
           <el-icon><UserFilled /></el-icon>
           <span>角色设置</span>
@@ -59,9 +59,9 @@
         <el-menu-item v-if="canShow('sims')" index="/sims">
           <el-icon><Coin /></el-icon><span>SIM卡管理</span>
         </el-menu-item>
-        <el-menu-item v-if="canShow('customers')" index="/customers">
-          <el-icon><User /></el-icon>
-          <span>客户管理</span>
+        <el-menu-item v-if="canShow('scan-import')" index="/scan-import">
+          <el-icon><Postcard /></el-icon>
+          <span>扫码录入</span>
         </el-menu-item>
 
         <div class="menu-group-label">系统</div>
