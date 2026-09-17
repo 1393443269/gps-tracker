@@ -47,6 +47,7 @@ const routes = [
       { path: 'devices',         component: () => import('@/views/DeviceList.vue'),      meta: { title: '设备管理' } },
       { path: 'device-info',     component: () => import('@/views/DeviceInfo.vue'),      meta: { title: '设备信息' } },
       { path: 'device-settings', component: () => import('@/views/DeviceSettings.vue'), meta: { title: '设备设置' } },
+      { path: 'scan-import',     component: () => import('@/views/ScanImport.vue'),     meta: { title: '扫码录入' } },
       { path: 'role-settings',   component: () => import('@/views/RoleSettings.vue'),   meta: { title: '角色设置' } },
       { path: 'map',             component: () => import('@/views/RealtimeMap.vue'),     meta: { title: '实时地图' } },
       { path: 'alarms',          component: () => import('@/views/AlarmList.vue'),       meta: { title: '报警管理' } },

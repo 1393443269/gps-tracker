@@ -1160,6 +1160,37 @@ def import_devices():
     return ok({'created': created, 'skipped': skipped, 'failed': failed, 'details': details})
 
 
+@app.get('/api/devices/scan')
+def scan_device():
+    """扫码录入用:按设备号/IMEI 查设备是否已存在及归属。
+    请求参数:code(必填,扫码枪扫到的条码,设备号或 IMEI)
+    返回:{exists, owner, name}
+        exists=False → 库内无此设备(可作为新设备录入)
+        exists=True  → 已存在,owner 为归属客户名(无则空串),name 为设备名
+    org 隔离:仅在当前管理员可见组织范围内查询,越权设备视为不存在。
+    """
+    code = (request.args.get('code') or '').strip()
+    if not code:
+        return fail('条码不能为空')
+    sids = _org_scope_ids(request)
+    # 设备号 / IMEI / 主键 phone 任一命中即视为已存在
+    conds  = ["(d.phone=? OR d.terminal_id=? OR d.imei=?)"]
+    params = [code, code, code]
+    conds, params = _org_where(sids, conds, params, col='d.org_id')
+    where = "WHERE " + " AND ".join(conds)
+    row = db_query_one(
+        "SELECT d.phone, d.name, c.name AS customer_name, c.contact AS contact "
+        "FROM device d LEFT JOIN customer c ON d.customer_id = c.id "
+        + where + " LIMIT 1",
+        params
+    )
+    if not row:
+        return ok({'exists': False, 'owner': '', 'name': ''})
+    row = dict(row)
+    owner = row.get('customer_name') or row.get('contact') or ''
+    return ok({'exists': True, 'owner': owner, 'name': row.get('name') or ''})
+
+
 @app.get('/api/devices/<int:did>')
 def get_device(did):
     sids = _org_scope_ids(request)

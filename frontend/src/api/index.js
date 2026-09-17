@@ -88,6 +88,7 @@ export function uploadHeaders() {
 export const deviceApi = {
   list:              (params)       => http.get('/devices', { params }),
   get:               (id)           => http.get(`/devices/${id}`),
+  scan:              (params)       => http.get('/devices/scan', { params }),
   create:            (data)         => http.post('/devices', data),
   batchImport:       (rows)         => http.post('/devices/import', { rows }),
   update:            (id, data)     => http.put(`/devices/${id}`, data),

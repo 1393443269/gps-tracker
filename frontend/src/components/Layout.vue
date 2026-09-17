@@ -48,6 +48,10 @@
           <el-icon><Setting /></el-icon>
           <span>设备设置</span>
         </el-menu-item>
+        <el-menu-item v-if="canShow('scan-import')" index="/scan-import">
+          <el-icon><Postcard /></el-icon>
+          <span>扫码录入</span>
+        </el-menu-item>
         <el-menu-item v-if="canShow('role-settings')" index="/role-settings">
           <el-icon><UserFilled /></el-icon>
           <span>角色设置</span>
@@ -162,7 +166,7 @@ import {
   Cellphone, Coin, User, Setting, UserFilled,
   Bell, WalletFilled, TrendCharts, Monitor,
   OfficeBuilding, Operation, ArrowDown,
-  Tools, SetUp, Calendar, FirstAidKit, Lock, Connection
+  Tools, SetUp, Calendar, FirstAidKit, Lock, Connection, Postcard
 } from '@element-plus/icons-vue'
 
 const route       = useRoute()
