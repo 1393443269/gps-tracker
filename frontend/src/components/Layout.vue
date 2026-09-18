@@ -101,6 +101,12 @@
         <el-menu-item v-if="canShow('recharges')" index="/recharges">
           <el-icon><WalletFilled /></el-icon><span>充值管理</span>
         </el-menu-item>
+        <el-menu-item v-if="isAdmin" index="/profit-config">
+          <el-icon><Share /></el-icon><span>分润设置</span>
+        </el-menu-item>
+        <el-menu-item v-if="isAdmin" index="/profit-records">
+          <el-icon><Money /></el-icon><span>分润流水</span>
+        </el-menu-item>
         <el-menu-item v-if="canShow('reports')" index="/reports">
           <el-icon><TrendCharts /></el-icon><span>报表统计</span>
         </el-menu-item>

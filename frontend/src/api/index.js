@@ -362,3 +362,12 @@ export const moduleApi = {
   getOrgAuth:  (orgId)      => http.get(`/modules/org/${orgId}/auth`),    // 某组织已授权情况
   saveOrgAuth: (orgId, data)=> http.post(`/modules/org/${orgId}/auth`, data), // 保存授权
 }
+
+// ── 分润 ───────────────────────────────────────────────
+export const profitApi = {
+  configList: ()          => http.get('/profit/config'),
+  saveConfig: (data)      => http.post('/profit/config', data),
+  settle:     (period)    => http.post('/profit/settle', { period }),
+  records:    (params)    => http.get('/profit/records', { params }),
+  markPaid:   (id)        => http.post(`/profit/records/${id}/pay`),
+}

@@ -251,6 +251,35 @@ def init_db():
         created_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
     );
 
+    CREATE TABLE IF NOT EXISTS profit_config (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        customer_id    INTEGER UNIQUE NOT NULL,
+        rate           REAL NOT NULL DEFAULT 0,
+        is_distributor INTEGER NOT NULL DEFAULT 0,
+        is_active      INTEGER NOT NULL DEFAULT 1,
+        remark         TEXT DEFAULT '',
+        updated_at     TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime')),
+        created_at     TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
+    );
+
+    CREATE TABLE IF NOT EXISTS profit_record (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        recharge_id             INTEGER NOT NULL,
+        source_customer_id      INTEGER NOT NULL,
+        beneficiary_customer_id INTEGER NOT NULL,
+        amount                  REAL NOT NULL DEFAULT 0,
+        rate                    REAL NOT NULL DEFAULT 0,
+        profit                  REAL NOT NULL DEFAULT 0,
+        period                  TEXT NOT NULL,
+        status                  TEXT NOT NULL DEFAULT '待结算',
+        remark                  TEXT DEFAULT '',
+        created_at              TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_profit_record_dedup ON profit_record (recharge_id, beneficiary_customer_id, period);
+    CREATE INDEX IF NOT EXISTS ix_profit_record_period ON profit_record (period);
+    CREATE INDEX IF NOT EXISTS ix_recharge_customer ON recharge (customer_id);
+
     CREATE TABLE IF NOT EXISTS customer (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
         name         TEXT NOT NULL,
@@ -414,6 +443,13 @@ def init_db():
     # device 表：加客户归属
     try:
         conn.execute("ALTER TABLE device ADD COLUMN customer_id INTEGER DEFAULT NULL")
+        conn.commit()
+    except Exception:
+        pass
+
+    # recharge 表：加客户归属(分润按客户链结算需要)
+    try:
+        conn.execute("ALTER TABLE recharge ADD COLUMN customer_id INTEGER DEFAULT NULL")
         conn.commit()
     except Exception:
         pass
@@ -3068,9 +3104,10 @@ def create_recharge():
                 (amount, amount, sim_id)
             )
             conn.execute(
-                "INSERT INTO recharge (sim_id,iccid,amount,method,plan,remark,operator,org_id) VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO recharge (sim_id,iccid,amount,method,plan,remark,operator,org_id,customer_id) VALUES (?,?,?,?,?,?,?,?,?)",
                 (sim_id, row['iccid'], amount, d.get('method','支付宝'),
-                 d.get('plan',''), d.get('remark',''), d.get('operator','管理员'), _admin_org_id()))
+                 d.get('plan',''), d.get('remark',''), d.get('operator','管理员'), _admin_org_id(),
+                 (lambda dev: dev['customer_id'] if dev else None)(db_query_one("SELECT customer_id FROM device WHERE iccid=? AND iccid<>'' LIMIT 1", (row['iccid'],)))))
             new_balance_row = conn.execute("SELECT balance FROM sim_card WHERE id=?", (sim_id,)).fetchone()
             conn.commit()
         finally:
@@ -5471,11 +5508,11 @@ def portal_recharge_sim(sid):
     updated = db_query_one("SELECT balance FROM sim_card WHERE id=?", (sid,))
     new_balance = float(updated['balance']) if updated else 0.0
     cust = db_query_one("SELECT name FROM customer WHERE id=?", (cid,))
-    db_exec("INSERT INTO recharge (sim_id, iccid, amount, method, plan, remark, operator) "
-            "VALUES (?,?,?,?,?,?,?)",
+    db_exec("INSERT INTO recharge (sim_id, iccid, amount, method, plan, remark, operator, customer_id) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             (sid, sim['iccid'], amount, d.get('method', '支付宝'),
              d.get('plan', ''), d.get('remark', ''),
-             cust['name'] if cust else '客户'))
+             cust['name'] if cust else '客户', cid))
     return ok({'new_balance': new_balance})
 
 
@@ -5538,11 +5575,11 @@ def portal_create_recharge():
     updated = db_query_one("SELECT balance FROM sim_card WHERE id=?", (sim_id,))
     new_balance = float(updated['balance']) if updated else 0.0
     cust = db_query_one("SELECT name FROM customer WHERE id=?", (cid,))
-    db_exec("INSERT INTO recharge (sim_id, iccid, amount, method, plan, remark, operator) "
-            "VALUES (?,?,?,?,?,?,?)",
+    db_exec("INSERT INTO recharge (sim_id, iccid, amount, method, plan, remark, operator, customer_id) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             (sim_id, sim['iccid'], amount, d.get('method', '支付宝'),
              d.get('plan', ''), d.get('remark', ''),
-             cust['name'] if cust else '客户'))
+             cust['name'] if cust else '客户', cid))
     return ok({'new_balance': new_balance})
 
 
@@ -6684,6 +6721,209 @@ def _handle_405(e):
 
 
 # ── 主入口 ─────────────────────────────────────────────────────────────────────
+
+
+
+# ── 分润(profit sharing · 客户树版)──────────────────────────────────────────
+# 规则:一笔充值(归属客户 X、金额 M)的分润 = 沿 X 的 parent_id 向上的各级上级中,
+#   开了分销开关(is_distributor=1)的客户,各拿 M × 自己比例;
+#   充值客户 X 自己不拿;顶级总代(parent_id 为空)是纯收款方,也不拿。
+# 只记账(写 profit_record),不改任何余额。按月结算,靠唯一索引去重防重复算。
+# 关联不到客户(customer_id 为空)的充值照常存在,但不参与分润,单独计入 unlinked。
+
+def _customer_ancestors(customer_id):
+    """返回客户 customer_id 的各级上级(不含自己),从直接上级到顶级,列表 [{id, parent_id}]。"""
+    rows = db_query(
+        "WITH RECURSIVE up AS ("
+        "  SELECT id, parent_id, 0 AS depth FROM customer WHERE id=? "
+        "  UNION ALL "
+        "  SELECT c.id, c.parent_id, up.depth+1 FROM customer c JOIN up ON c.id = up.parent_id "
+        ") SELECT id, parent_id FROM up WHERE depth > 0 ORDER BY depth",
+        (customer_id,))
+    return rows
+
+
+def _settle_profit(period):
+    """结算指定月份的分润,写入 profit_record。返回 {'period','created','skipped','unlinked'}。"""
+    if not period or len(period) != 7 or period[4] != '-':
+        raise ValueError('period 格式应为 YYYY-MM')
+    recs = db_query(
+        "SELECT id, customer_id, amount FROM recharge WHERE substr(created_at,1,7)=?",
+        (period,))
+    created = 0
+    skipped = 0
+    unlinked = 0
+    with _db_lock:
+        conn = get_db()
+        try:
+            for rc in recs:
+                cid = rc['customer_id']
+                amount = float(rc['amount'] or 0)
+                if not cid or amount <= 0:
+                    unlinked += 1
+                    continue
+                ancestors = _customer_ancestors(cid)
+                if not ancestors:
+                    unlinked += 1
+                    continue
+                top = ancestors[-1]
+                source_id = top['id']
+                for a in ancestors:
+                    if a['id'] == source_id:
+                        continue
+                    cfg = db_query_one(
+                        "SELECT rate, is_distributor FROM profit_config "
+                        "WHERE customer_id=? AND is_active=1", (a['id'],))
+                    if not cfg or not cfg['is_distributor']:
+                        continue
+                    rate = float(cfg['rate'] or 0)
+                    profit = round(amount * rate / 100.0, 2)
+                    if profit <= 0:
+                        continue
+                    cur = conn.execute(
+                        "INSERT INTO profit_record "
+                        "(recharge_id, source_customer_id, beneficiary_customer_id, amount, rate, profit, period, status, created_at) "
+                        "VALUES (?,?,?,?,?,?,?, '待结算', ?) "
+                        "ON CONFLICT (recharge_id, beneficiary_customer_id, period) DO NOTHING",
+                        (rc['id'], source_id, a['id'], amount, rate, profit, period,
+                         datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+                    if getattr(cur, 'rowcount', 0):
+                        created += 1
+                    else:
+                        skipped += 1
+            conn.commit()
+        finally:
+            conn.close()
+    return {'period': period, 'created': created, 'skipped': skipped, 'unlinked': unlinked}
+
+
+@app.post('/api/profit/settle')
+def api_profit_settle():
+    """手动触发某月分润结算。body: {"period":"2026-08"}。不传则默认结算上一个自然月。"""
+    d = request.get_json() or {}
+    period = (d.get('period') or '').strip()
+    if not period:
+        now = datetime.now()
+        y, m = now.year, now.month - 1
+        if m == 0:
+            y, m = y - 1, 12
+        period = f'{y:04d}-{m:02d}'
+    try:
+        res = _settle_profit(period)
+    except ValueError as e:
+        return fail(str(e), 400)
+    add_op_log('分润结算', f'结算 {res["period"]}:新增 {res["created"]} 条,跳过 {res["skipped"]} 条,未关联 {res["unlinked"]} 笔')
+    return ok(res)
+
+
+@app.get('/api/profit/records')
+def api_profit_records():
+    """查分润流水。query: period, status, beneficiary_customer_id, page, page_size。"""
+    conds, params = [], []
+    period = request.args.get('period')
+    if period:
+        conds.append("pr.period=?"); params.append(period)
+    status = request.args.get('status')
+    if status:
+        conds.append("pr.status=?"); params.append(status)
+    bid = request.args.get('beneficiary_customer_id')
+    if bid:
+        conds.append("pr.beneficiary_customer_id=?"); params.append(int(bid))
+    where = ('WHERE ' + ' AND '.join(conds)) if conds else ''
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+        page_size = min(200, max(1, int(request.args.get('page_size', 20))))
+    except ValueError:
+        page, page_size = 1, 20
+    total = db_scalar(f"SELECT COUNT(*) FROM profit_record pr {where}", params)
+    sum_profit = db_scalar(f"SELECT COALESCE(SUM(profit),0) FROM profit_record pr {where}", params)
+    records = db_query(
+        f"SELECT pr.*, "
+        f"  bc.name AS beneficiary_name, sc.name AS source_name "
+        f"FROM profit_record pr "
+        f"LEFT JOIN customer bc ON bc.id=pr.beneficiary_customer_id "
+        f"LEFT JOIN customer sc ON sc.id=pr.source_customer_id "
+        f"{where} ORDER BY pr.period DESC, pr.id DESC LIMIT ? OFFSET ?",
+        params + [page_size, (page - 1) * page_size])
+    return ok({'total': total, 'sum_profit': float(sum_profit or 0),
+               'page': page, 'page_size': page_size, 'records': records})
+
+
+@app.post('/api/profit/records/<int:rid>/pay')
+def api_profit_mark_paid(rid):
+    """标记某条分润记录为已付。"""
+    row = db_query_one("SELECT id, status FROM profit_record WHERE id=?", (rid,))
+    if not row:
+        return fail('记录不存在', 404)
+    db_exec("UPDATE profit_record SET status='已付' WHERE id=?", (rid,))
+    add_op_log('分润', f'分润记录 #{rid} 标记已付')
+    return ok({'id': rid, 'status': '已付'})
+
+
+@app.get('/api/profit/config')
+def api_profit_config_list():
+    """列出所有客户及其分润配置(左连,没配的显示默认值)。"""
+    rows = db_query(
+        "SELECT c.id AS customer_id, c.name, c.parent_id, "
+        "  COALESCE(pc.rate,0) AS rate, "
+        "  COALESCE(pc.is_distributor,0) AS is_distributor, "
+        "  COALESCE(pc.is_active,1) AS is_active "
+        "FROM customer c LEFT JOIN profit_config pc ON pc.customer_id=c.id "
+        "ORDER BY c.id")
+    return ok({'items': rows})
+
+
+@app.post('/api/profit/config')
+def api_profit_config_save():
+    """保存某客户的分润配置。校验 rate 0~100;同链已开分销的 rate 之和不得超 100。"""
+    d = request.get_json() or {}
+    customer_id = d.get('customer_id')
+    if not customer_id:
+        return fail('customer_id 不能为空', 400)
+    try:
+        rate = float(d.get('rate', 0))
+    except (TypeError, ValueError):
+        return fail('rate 必须是数字', 400)
+    is_distributor = 1 if d.get('is_distributor') in (1, '1', True, 'true') else 0
+    is_active = 0 if d.get('is_active') in (0, '0', False, 'false') else 1
+    if rate < 0 or rate > 100:
+        return fail('比例应在 0~100 之间', 400)
+
+    cust = db_query_one("SELECT id FROM customer WHERE id=?", (customer_id,))
+    if not cust:
+        return fail('客户不存在', 404)
+
+    if is_distributor and rate > 0:
+        chain = db_query(
+            "WITH RECURSIVE up AS ("
+            "  SELECT id, parent_id FROM customer WHERE id=? "
+            "  UNION ALL SELECT c.id, c.parent_id FROM customer c JOIN up ON c.id=up.parent_id "
+            "), down AS ("
+            "  SELECT id, parent_id FROM customer WHERE id=? "
+            "  UNION ALL SELECT c.id, c.parent_id FROM customer c JOIN down ON c.parent_id=down.id "
+            "), chain AS ( SELECT id FROM up UNION SELECT id FROM down ) "
+            "SELECT ch.id, COALESCE(pc.rate,0) AS rate, COALESCE(pc.is_distributor,0) AS is_distributor "
+            "FROM chain ch LEFT JOIN profit_config pc ON pc.customer_id=ch.id",
+            (customer_id, customer_id))
+        total = 0.0
+        for c in chain:
+            if c['id'] == int(customer_id):
+                total += rate
+            elif c['is_distributor']:
+                total += float(c['rate'] or 0)
+        if total > 100:
+            return fail(f'同一条分销链上比例之和为 {total:.1f}%,超过 100%(会导致总代倒贴),请调整', 400)
+
+    db_exec(
+        "INSERT INTO profit_config (customer_id, rate, is_distributor, is_active, remark, updated_at) "
+        "VALUES (?,?,?,?,?,?) "
+        "ON CONFLICT (customer_id) DO UPDATE SET rate=EXCLUDED.rate, is_distributor=EXCLUDED.is_distributor, "
+        "  is_active=EXCLUDED.is_active, remark=EXCLUDED.remark, updated_at=EXCLUDED.updated_at",
+        (customer_id, rate, is_distributor, is_active, d.get('remark', ''),
+         datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    add_op_log('分润', f'客户 #{customer_id} 配置:比例 {rate}% 分销 {"开" if is_distributor else "关"}')
+    return ok({'customer_id': customer_id, 'rate': rate, 'is_distributor': is_distributor, 'is_active': is_active})
+
 
 if __name__ == '__main__':
     init_db()

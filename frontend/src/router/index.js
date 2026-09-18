@@ -67,6 +67,8 @@ const routes = [
       { path: 'account-permission',component: () => import('@/views/AccountPermission.vue'),meta: { title: '账号权限', roles: ['admin'] } },
       { path: 'sims',            component: () => import('@/views/SimCard.vue'),         meta: { title: 'SIM卡管理' } },
       { path: 'recharges',       component: () => import('@/views/Recharge.vue'),        meta: { title: '充值管理' } },
+      { path: 'profit-config',   component: () => import('@/views/ProfitConfig.vue'),  meta: { title: '分润设置', roles: ['admin'] } },
+      { path: 'profit-records',  component: () => import('@/views/ProfitRecords.vue'), meta: { title: '分润流水', roles: ['admin'] } },
     ]
   },
 ]
