@@ -6925,6 +6925,38 @@ def api_profit_config_save():
     return ok({'customer_id': customer_id, 'rate': rate, 'is_distributor': is_distributor, 'is_active': is_active})
 
 
+# ── 分润月结定时线程 ──────────────────────────────────────────────────────────
+# 每天检查一次:若今天是每月 1 号,自动结算上一个自然月的分润。
+# 单 worker(workers=1)保证只有一个线程;_settle_profit 的去重索引保证即使
+# 当天多次触发/重启也不会重复记账。供 gunicorn post_fork 调用。
+def _profit_scheduler_loop():
+    import time
+    last_done = None  # 记录已结算的 period,避免同一天重复跑
+    while True:
+        try:
+            now = datetime.now()
+            if now.day == 1:
+                y, m = now.year, now.month - 1
+                if m == 0:
+                    y, m = y - 1, 12
+                period = f'{y:04d}-{m:02d}'
+                if period != last_done:
+                    res = _settle_profit(period)
+                    last_done = period
+                    log.info("[分润月结] 自动结算 %s:新增 %s 条,跳过 %s 条,未关联 %s 笔",
+                             res['period'], res['created'], res['skipped'], res['unlinked'])
+        except Exception as e:
+            log.warning("[分润月结] 自动结算异常: %s", e)
+        time.sleep(6 * 3600)  # 每 6 小时检查一次
+
+
+def start_profit_scheduler():
+    """启动分润月结定时线程(gunicorn post_fork 调用)。"""
+    import threading as _t
+    _t.Thread(target=_profit_scheduler_loop, daemon=True, name='profit-scheduler').start()
+    log.info("[分润月结] 定时线程已启动(每月 1 号自动结算上月)")
+
+
 if __name__ == '__main__':
     init_db()
     _setup_pg_partitions()      # PG：location_record 转分区表 + 预建未来月份（SQLite 跳过）

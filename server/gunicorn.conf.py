@@ -33,7 +33,8 @@ def post_fork(server, worker):
     """
     import threading
     from app import (init_db, start_batch_writer, start_tcp_server, start_mqtt_subscriber,
-                     _setup_pg_partitions, start_partition_maintainer, start_push_worker)
+                     _setup_pg_partitions, start_partition_maintainer, start_push_worker,
+                     start_profit_scheduler)
     from core.ingest import start_location_cleaner, start_offline_scanner, _load_fence_state
 
     init_db()
@@ -43,7 +44,8 @@ def post_fork(server, worker):
     start_batch_writer()
     start_location_cleaner()     # 位置数据保留期清理线程（LOCATION_RETENTION_DAYS，默认 90 天）
     start_offline_scanner()
-    start_push_worker()            # 数据推送:报警增量轮询推送到第三方回调      # 超时未上报设备置离线线程(关机报警之外的失联/关机/迁走兜底)
+    start_push_worker()
+    start_profit_scheduler()      # 分润:每月 1 号自动结算上月            # 数据推送:报警增量轮询推送到第三方回调      # 超时未上报设备置离线线程(关机报警之外的失联/关机/迁走兜底)
 
     threading.Thread(target=start_tcp_server,      daemon=True, name='tcp-808').start()
     threading.Thread(target=start_mqtt_subscriber, daemon=True, name='mqtt-sub').start()
