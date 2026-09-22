@@ -47,12 +47,19 @@
         <template #default="{ row }">
           <el-tag v-if="row.status === '待确认'" type="warning" size="small">待确认</el-tag>
           <el-tag v-else-if="row.status === '已驳回'" type="danger" size="small">已驳回</el-tag>
+          <el-tag v-else-if="row.status === '已冲正'" type="info" size="small">已冲正</el-tag>
+          <el-tag v-else-if="row.status === '冲正流水'" type="info" size="small" effect="plain">冲正流水</el-tag>
           <el-tag v-else type="success" size="small">已确认</el-tag>
         </template>
       </el-table-column>
       <el-table-column prop="operator"   label="操作员"    width="100" />
       <el-table-column prop="remark"     label="备注" min-width="120" show-overflow-tooltip />
       <el-table-column prop="created_at" label="时间"      min-width="160" />
+      <el-table-column v-if="admin" label="操作" width="90" fixed="right">
+        <template #default="{ row }">
+          <el-button v-if="row.status === '已确认'" type="danger" size="small" plain @click="doReverse(row)">冲正</el-button>
+        </template>
+      </el-table-column>
     </el-table>
 
     <el-pagination
@@ -280,6 +287,22 @@ async function doReject(row) {
     ElMessage.success('已驳回')
     openPending()
     load()
+  } catch {}
+}
+
+// 冲正一笔已确认的充值:扣回余额+生成负向流水
+async function doReverse(row) {
+  try {
+    const { value } = await ElMessageBox.prompt(
+      `将冲正这笔 ¥${Number(row.amount).toFixed(2)} 的充值：从该卡余额扣回此金额，并生成一条冲正流水（原记录保留可追溯）。请填写冲正原因：`,
+      '冲正确认',
+      { inputPlaceholder: '如：金额填错/误确认', confirmButtonText: '确认冲正', cancelButtonText: '取消',
+        type: 'warning', inputValidator: (v) => (v && v.trim()) ? true : '请填写冲正原因' }
+    )
+    await rechargeApi.reverse(row.id, { reason: value.trim() })
+    ElMessage.success('已冲正')
+    load()
+    loadSims()
   } catch {}
 }
 

@@ -3326,6 +3326,61 @@ def reject_recharge(rid):
     return ok()
 
 
+@app.post('/api/recharges/<int:rid>/reverse')
+def reverse_recharge(rid):
+    """冲正一笔已确认的充值:从余额扣回该金额,并生成一条负向流水(不删原记录),
+    原单状态置'已冲正'。用于确认错/金额错的纠正,账目完整可追溯。幂等:仅'已确认'可冲正。"""
+    admin = '管理员'
+    d = request.get_json(silent=True) or {}
+    reason = (d.get('reason') or '').strip() or '管理员冲正'
+    with (_db_lock if DB_BACKEND == 'sqlite' else _nullcontext()):
+        conn = get_db()
+        try:
+            rc = conn.execute("SELECT * FROM recharge WHERE id=?", (rid,)).fetchone()
+            if not rc:
+                conn.close()
+                return fail('充值记录不存在', 404)
+            # 组织隔离:普通管理员只能冲正本组织范围内的
+            _sids = _org_scope_ids(request)
+            if _sids is not None and (rc['org_id'] not in _sids):
+                conn.close()
+                return fail('无权操作该充值记录', 403)
+            if rc['status'] != '已确认':
+                conn.close()
+                return fail(f"该记录状态为{rc['status']},只有已确认的充值可冲正", 400)
+            sim_id = rc['sim_id']
+            amount = float(rc['amount'] or 0)
+            # 原子扣回余额(可能扣成负数/欠费,由后续人工或计费处理;这里如实反映账目)
+            conn.execute(
+                "UPDATE sim_card SET balance = ROUND(CAST(balance - ? AS numeric), 2) WHERE id=?",
+                (amount, sim_id)
+            )
+            # 原单标记已冲正
+            conn.execute(
+                "UPDATE recharge SET status='已冲正', reviewed_by=?, "
+                "reviewed_at=strftime('%Y-%m-%d %H:%M:%S','now','localtime') WHERE id=?",
+                (admin, rid)
+            )
+            # 生成一条负向流水(不删原记录,账目可追溯)
+            conn.execute(
+                "INSERT INTO recharge (sim_id,iccid,amount,method,plan,remark,operator,org_id,customer_id,status,reviewed_by,reviewed_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,strftime('%Y-%m-%d %H:%M:%S','now','localtime'))",
+                (sim_id, rc['iccid'], -amount, rc['method'] or '', rc['plan'] or '',
+                 f"冲正原充值#{rid}:{reason}", admin, rc['org_id'], rc['customer_id'],
+                 '冲正流水', admin)
+            )
+            new_balance_row = conn.execute("SELECT balance FROM sim_card WHERE id=?", (sim_id,)).fetchone()
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    new_balance = float(new_balance_row['balance']) if new_balance_row else 0.0
+    add_op_log('充值冲正', f'冲正充值#{rid} ¥{amount:.2f} 原因:{reason}')
+    return ok({'new_balance': new_balance})
+
+
 # ── 客户管理接口 ───────────────────────────────────────────────────────────────
 
 @app.get('/api/customers')

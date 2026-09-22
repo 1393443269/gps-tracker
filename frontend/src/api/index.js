@@ -193,6 +193,7 @@ export const rechargeApi = {
   pending: ()       => http.get('/recharges/pending'),
   confirm: (id)     => http.post(`/recharges/${id}/confirm`),
   reject:  (id)     => http.post(`/recharges/${id}/reject`),
+  reverse: (id, data) => http.post(`/recharges/${id}/reverse`, data),
 }
 
 // ── 客户 ─────────────────────────────────────────────────────────────────────
