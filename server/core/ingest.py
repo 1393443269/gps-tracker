@@ -34,6 +34,7 @@ import core.db as _dbmod
 from core.state import (
     _loc_queue, _dev_latest, _dev_latest_lk,
     _devid_cache, _DEVID_CACHE_TTL,
+    _dev_route_cache, _DEV_ROUTE_TTL,
     sessions, sessions_lock, next_serial,
     fence_device_inside, _fence_lock, FENCE_DEBOUNCE_N,
     fence_device_pending, fence_device_enter_time, fence_device_dwell_alarmed,
@@ -884,16 +885,24 @@ def _sio_emit(event: str, data: dict, phone: str):
     - 客户：只推到设备归属客户及其上级客户的 cust_{id} 房间（严格按 customer 隔离，
       不再按 org 广播，避免同组织其他客户收到不属于自己的设备轨迹）
     """
-    # customer_id 会随绑定变化，实时查库不缓存；org_id 用缓存
-    row = db_query_one("SELECT org_id, customer_id FROM device WHERE phone=?", (phone,))
-    org_id = int(row.get('org_id') or 1) if row else 1
-    cid    = row.get('customer_id') if row else None
+    # 路由信息(org_id + customer_id + 客户上级链)带 30 秒短 TTL 缓存:
+    # 降掉每帧对 device/customer 的多次查库;设备重新绑定客户后最多 30 秒生效。
+    import time as _t
+    now = _t.time()
+    entry = _dev_route_cache.get(phone)
+    if entry and now < entry[3]:
+        org_id, cid, ancestors = entry[0], entry[1], entry[2]
+    else:
+        row = db_query_one("SELECT org_id, customer_id FROM device WHERE phone=?", (phone,))
+        org_id = int(row.get('org_id') or 1) if row else 1
+        cid    = row.get('customer_id') if row else None
+        ancestors = tuple(_customer_ancestors(cid)) if cid else ()
+        _dev_route_cache[phone] = (org_id, cid, ancestors, now + _DEV_ROUTE_TTL)
     socketio.emit(event, data, room=f'org_{org_id}')   # 该组织管理员
     socketio.emit(event, data, room='broadcast')        # 超级管理员
-    # 归属客户及其上级客户
-    if cid:
-        for c in _customer_ancestors(cid):
-            socketio.emit(event, data, room=f'cust_{c}')
+    # 归属客户及其上级客户(链已随缓存,免去逐级查库)
+    for c in ancestors:
+        socketio.emit(event, data, room=f'cust_{c}')
 
 
 # ── 电子围栏：穿越检测 ────────────────────────────────────────────────────────

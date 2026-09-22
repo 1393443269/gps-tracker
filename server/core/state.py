@@ -18,6 +18,11 @@ _dev_latest    = {}                 # phone -> 设备最新状态(多次上报�
 _dev_latest_lk = threading.Lock()
 _devid_cache: dict = {}            # phone → (device_id, expire_ts);10 分钟 TTL
 _DEVID_CACHE_TTL = 600
+# 定位推送路由缓存:phone → (org_id, customer_id, ancestors_tuple, expire_ts)
+# 短 TTL(30 秒):降掉每帧对 device/customer 的重复查询;设备重新绑定客户后
+# 最多 30 秒生效(customer_id 变化会推错客户,故 TTL 短、风险窗口可控)。
+_dev_route_cache: dict = {}
+_DEV_ROUTE_TTL = 30
 _alarm_last_ts: dict = {}          # (phone, alarm_type) → last_alarm_unix_ts
 _alarm_last_ts_lock = threading.Lock()
 _ALARM_DEBOUNCE_SEC = 60           # 同类型报警至少间隔 60 秒
