@@ -28,6 +28,7 @@
           <el-button @click="play"  :disabled="!trackPoints.length || playing">播放</el-button>
           <el-button @click="pause" :disabled="!playing">暂停</el-button>
           <el-button @click="reset">重置</el-button>
+          <el-button type="success" plain :disabled="!trackPoints.length" @click="exportTrack">导出轨迹</el-button>
         </div>
 
         <el-descriptions :column="1" size="small" border>
@@ -226,6 +227,31 @@ function reset() {
   startMarker?.remove(); startMarker = null
   endMarker?.remove();   endMarker   = null
   carMarker?.remove();   carMarker   = null
+}
+
+// ── 导出轨迹为 CSV ────────────────────────────────────────────────────────────
+function exportTrack() {
+  const pts = trackPoints.value
+  if (!pts.length) { ElMessage.warning('请先加载轨迹'); return }
+  const headers = ['序号', '时间', '纬度', '经度', '速度(km/h)', '方向', '里程(km)']
+  const csvCell = (c) => {
+    let s = String(c ?? '')
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s
+    return `"${s.replace(/"/g, '""')}"`
+  }
+  const data = pts.map((p, i) => [
+    i + 1, p.gps_time || '', p.lat ?? '', p.lng ?? '',
+    p.speed != null ? (p.speed / 10).toFixed(1) : '',
+    p.direction ?? '', p.mileage ?? '',
+  ])
+  const csv = [headers, ...data].map(row => row.map(csvCell).join(',')).join('\n')
+  const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' })
+  const link = document.createElement('a')
+  link.href = URL.createObjectURL(blob)
+  link.download = `轨迹_${selectedPhone.value}_${new Date().toISOString().slice(0, 10)}.csv`
+  link.click()
+  URL.revokeObjectURL(link.href)
+  ElMessage.success(`已导出 ${pts.length} 个轨迹点`)
 }
 
 // ── 生命周期 ──────────────────────────────────────────────────────────────────

@@ -17,6 +17,7 @@
       </el-col>
       <el-col :span="15" style="text-align:right">
         <el-button :icon="Refresh" @click="load">刷新</el-button>
+        <el-button type="success" plain :icon="Download" @click="exportReport">导出报表</el-button>
       </el-col>
     </el-row>
 
@@ -133,7 +134,8 @@
 
 <script setup>
 import { ref, computed, onMounted, nextTick } from 'vue'
-import { Refresh } from '@element-plus/icons-vue'
+import { Refresh, Download } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 import { reportApi, portalApi, isAdmin } from '@/api'
 
 const loading         = ref(false)
@@ -247,6 +249,51 @@ async function load() {
   } finally {
     loading.value = false
   }
+}
+
+// ── 导出报表数据为 CSV ────────────────────────────────────────────────────────
+function exportReport() {
+  const d = data.value || {}
+  const period = dateRange.value?.[0]
+    ? `${dateRange.value[0]} 至 ${dateRange.value[1]}`
+    : `近 ${quickDays.value} 天`
+  const csvCell = (c) => {
+    let s = String(c ?? '')
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s
+    return `"${s.replace(/"/g, '""')}"`
+  }
+  const rows = [
+    ['统计周期', period],
+    ['', ''],
+    ['指标', '数值'],
+    ['设备总数', d.device?.total ?? 0],
+    ['在线设备', d.device?.online ?? 0],
+    ['本月新增设备', d.device?.new_this_month ?? 0],
+    ['已激活设备', d.device?.active ?? 0],
+    ['已停用/报废', d.device?.disabled ?? 0],
+    ['报警总数', d.alarm?.total ?? 0],
+    ['未处理报警', d.alarm?.unhandled ?? 0],
+    ['SIM卡总数', d.sim?.total ?? 0],
+    ['7天内到期', d.sim?.expiring7 ?? 0],
+    ['30天内到期', d.sim?.expiring30 ?? 0],
+    ['已过期SIM', d.sim?.expired ?? 0],
+    ['客户总数', d.customer?.total ?? 0],
+    ['本月新增客户', d.customer?.new_this_month ?? 0],
+    ['总充值(元)', (d.recharge_total ?? 0).toFixed(2)],
+    ['期间充值(元)', (d.recharge_period ?? 0).toFixed(2)],
+    ['', ''],
+    ['客户设备数排名', ''],
+    ['排名', '客户名称', '设备数'],
+    ...(d.customer?.rank ?? []).map((c, i) => [i + 1, c.name, c.device_count]),
+  ]
+  const csv = rows.map(row => row.map(csvCell).join(',')).join('\n')
+  const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' })
+  const link = document.createElement('a')
+  link.href = URL.createObjectURL(blob)
+  link.download = `平台数据报表_${new Date().toISOString().slice(0, 10)}.csv`
+  link.click()
+  URL.revokeObjectURL(link.href)
+  ElMessage.success('报表已导出')
 }
 
 onMounted(async () => {
