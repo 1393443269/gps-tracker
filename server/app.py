@@ -5010,6 +5010,29 @@ def portal_update_device_holder(phone):
     return ok()
 
 
+@app.post('/api/customer/devices/<int:did>/unbind')
+def portal_unbind_device(did):
+    """客户端解绑自己名下(子树内)的设备。严格归属校验:只能解绑 customer_id
+    在当前客户子树范围内的设备,防止越权解绑他人设备。解绑即把 customer_id 置 NULL,
+    与管理端 /api/devices/<id>/unbind_customer 语义一致。"""
+    cid = _get_portal_customer()
+    if not cid:
+        return fail('未授权', 401)
+    all_cids = _get_all_descendant_cids(cid)
+    if not all_cids:
+        return fail('无权限', 403)
+    cid_ph = ','.join('?' * len(all_cids))
+    dev = db_query_one(
+        f"SELECT id, phone FROM device WHERE id=? AND customer_id IN ({cid_ph})",
+        [did] + all_cids)
+    if not dev:
+        return fail('设备不存在或不在您名下', 404)
+    db_exec("UPDATE device SET customer_id=NULL, updated_at=? WHERE id=?",
+            (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), did))
+    add_op_log('客户设备解绑', f'客户#{cid} 解绑设备 {dev["phone"]}')
+    return ok()
+
+
 @app.put('/api/customer/alarms/<int:aid>/handle')
 def portal_handle_alarm(aid):
     cid = _get_portal_customer()

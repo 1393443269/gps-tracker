@@ -236,6 +236,7 @@ export const portalApi = {
   devices:        ()              => portalHttp.get('/devices'),
   updateDevice:   (phone, data)   => portalHttp.put(`/devices/${phone}/update`, data),
   updateDeviceHolder: (phone, data) => portalHttp.put(`/devices/${phone}/holder`, data),
+  unbindDevice:   (id)            => portalHttp.post(`/devices/${id}/unbind`),
   summary:        ()              => portalHttp.get('/summary'),
   reportSummary:  (params)        => portalHttp.get('/report/summary', { params }),
   // 位置

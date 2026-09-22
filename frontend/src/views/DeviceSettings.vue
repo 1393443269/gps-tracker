@@ -606,12 +606,8 @@ async function doUnbind(row) {
   if (isAdmin()) {
     await deviceApi.unbindCustomer(row.id)
   } else {
-    // 客户端:把设备从所属子账号收回自己名下 —— 取该子账号现有设备,剔除本台后全量重提交
-    const sid = row.customer_id
-    const cur = await portalApi.subCustomers.getDevices(sid)
-    const rows = cur.data?.records || cur.data || []
-    const keep = rows.filter(x => x.customer_id === sid && x.phone !== row.phone).map(x => x.phone)
-    await portalApi.subCustomers.assignDevices(sid, keep)
+    // 客户端:直接解绑自己名下(子树内)的设备,后端做归属校验
+    await portalApi.unbindDevice(row.id)
   }
   ElMessage.success('解绑成功')
   loadData()
@@ -685,14 +681,9 @@ async function doBatchUnbind() {
     await deviceApi.batchUnbind(ids)
     ElMessage.success(`已解绑 ${ids.length} 台设备`)
   } else {
-    // 客户端:按所属子账号分组,逐个子账号剔除选中设备后重提交
-    const bySid = {}
-    selected.value.forEach(x => { if (x.customer_id) { (bySid[x.customer_id] ||= new Set()).add(x.phone) } })
-    for (const sid of Object.keys(bySid)) {
-      const cur = await portalApi.subCustomers.getDevices(Number(sid))
-      const rows = cur.data?.records || cur.data || []
-      const keep = rows.filter(x => x.customer_id === Number(sid) && !bySid[sid].has(x.phone)).map(x => x.phone)
-      await portalApi.subCustomers.assignDevices(Number(sid), keep)
+    // 客户端:逐台直接解绑自己名下设备,后端做归属校验
+    for (const d of selected.value) {
+      await portalApi.unbindDevice(d.id)
     }
     ElMessage.success(`已解绑 ${selected.value.length} 台设备`)
   }
