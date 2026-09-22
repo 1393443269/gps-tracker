@@ -4,7 +4,7 @@ WORKDIR /app
 
 # 安装依赖（独立层，代码变动时不重新安装）
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn --timeout 60 --retries 5
 
 # 创建非特权用户，避免容器以 root 运行
 RUN useradd -r -u 1001 -s /sbin/nologin appuser \
