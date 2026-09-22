@@ -675,6 +675,19 @@ def init_db():
         except Exception:
             pass
 
+    # ── 平台设置：收款信息（收款码 + 账户）────────────────────────────────────────
+    for _col in ["payment_enabled    INTEGER DEFAULT 0",   # 是否向客户展示收款信息
+                 "payment_qrcode_url TEXT DEFAULT ''",     # 收款二维码图片 URL（走 /uploads/）
+                 "payment_payee      TEXT DEFAULT ''",     # 收款人 / 户名
+                 "payment_account    TEXT DEFAULT ''",     # 收款账号
+                 "payment_bank       TEXT DEFAULT ''",     # 开户行 / 渠道
+                 "payment_note       TEXT DEFAULT ''"]:    # 收款说明
+        try:
+            conn.execute(f"ALTER TABLE platform_setting ADD COLUMN {_col}")
+            conn.commit()
+        except Exception:
+            pass
+
     # ── 设备生命周期 ──────────────────────────────────────────────────────────────
     # lifecycle: 0=未激活 1=已激活 2=已停用 3=已报废
     for _col in ["lifecycle   INTEGER DEFAULT 1",
@@ -2412,8 +2425,10 @@ def get_platform_setting():
     if cid:
         brand = _resolve_branding(cid)
         base  = _get_platform_setting(1)
-        # 运营配置沿用全站值（客户端不显示，仅避免字段缺失）
-        for k in ['enable_batch_cmd', 'sms_enabled', 'sms_total', 'sms_used']:
+        # 运营配置 + 收款信息沿用全站值
+        for k in ['enable_batch_cmd', 'sms_enabled', 'sms_total', 'sms_used',
+                  'payment_enabled', 'payment_qrcode_url', 'payment_payee',
+                  'payment_account', 'payment_bank', 'payment_note']:
             brand[k] = base.get(k)
         return ok(brand)
     return ok(_get_platform_setting(1))
@@ -2446,12 +2461,18 @@ def update_platform_setting():
     db_exec(
         "UPDATE platform_setting SET bigscreen_title=?,account_title=?,unit_name=?,"
         "contact_phone=?,email=?,address=?,logo_url=?,enable_batch_cmd=?,"
-        "sms_enabled=?,sms_total=? WHERE org_id=1",
+        "sms_enabled=?,sms_total=?,"
+        "payment_enabled=?,payment_qrcode_url=?,payment_payee=?,"
+        "payment_account=?,payment_bank=?,payment_note=? WHERE org_id=1",
         (d.get('bigscreen_title', '资产管理平台'), d.get('account_title', '资产管理平台'),
          d.get('unit_name', ''), d.get('contact_phone', ''), d.get('email', ''),
          d.get('address', ''), d.get('logo_url', ''),
          1 if d.get('enable_batch_cmd', True) else 0,
-         1 if d.get('sms_enabled', False) else 0, int(d.get('sms_total', 0) or 0))
+         1 if d.get('sms_enabled', False) else 0, int(d.get('sms_total', 0) or 0),
+         1 if d.get('payment_enabled', False) else 0,
+         d.get('payment_qrcode_url', ''), d.get('payment_payee', ''),
+         d.get('payment_account', ''), d.get('payment_bank', ''),
+         d.get('payment_note', ''))
     )
     add_op_log('平台设置', '更新平台设置')
     return ok()

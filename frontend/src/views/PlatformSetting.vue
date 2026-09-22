@@ -100,6 +100,56 @@
         </div>
       </el-tab-pane>
 
+      <!-- ══ 收款设置 ══ -->
+      <el-tab-pane v-if="isAdmin()" label="收款设置" name="payment">
+        <el-form :model="setting" label-width="110px" style="max-width:640px;" v-loading="loading">
+          <el-form-item label="启用收款展示">
+            <el-switch v-model="setting.payment_enabled" active-text="开" inactive-text="关" inline-prompt />
+            <span style="margin-left:12px;font-size:12px;color:#909399;">
+              开启后，客户在充值页可看到下方收款信息
+            </span>
+          </el-form-item>
+          <el-form-item label="收款二维码">
+            <el-upload
+              :action="UPLOAD_AVATAR_URL"
+              :headers="uploadHeaders()"
+              :show-file-list="false"
+              accept="image/*"
+              :before-upload="beforeQrUpload"
+              :on-success="onQrSuccess"
+              :on-error="onLogoError">
+              <img v-if="setting.payment_qrcode_url" :src="logoSrc(setting.payment_qrcode_url)"
+                style="width:160px;height:160px;object-fit:contain;border:1px solid #eee;border-radius:6px;" />
+              <div v-else class="logo-uploader-empty" style="width:160px;height:160px;">
+                <el-icon><Plus /></el-icon>
+                <span style="font-size:12px;margin-top:4px;">上传收款码</span>
+              </div>
+            </el-upload>
+            <el-button v-if="setting.payment_qrcode_url" link type="danger" size="small"
+              style="margin-top:6px;" @click="setting.payment_qrcode_url = ''">移除</el-button>
+            <div style="font-size:12px;color:#909399;margin-top:4px;">
+              支付宝/微信收款码或对公收款码，建议 ≤ {{ QR_MAX_MB }}MB
+            </div>
+          </el-form-item>
+          <el-form-item label="收款人/户名">
+            <el-input v-model="setting.payment_payee" placeholder="如 XX科技有限公司" maxlength="50" />
+          </el-form-item>
+          <el-form-item label="收款账号">
+            <el-input v-model="setting.payment_account" placeholder="银行卡号 / 支付宝账号" maxlength="50" />
+          </el-form-item>
+          <el-form-item label="开户行/渠道">
+            <el-input v-model="setting.payment_bank" placeholder="如 工商银行XX支行（可选）" maxlength="50" />
+          </el-form-item>
+          <el-form-item label="收款说明">
+            <el-input v-model="setting.payment_note" type="textarea" :rows="2"
+              placeholder="如：转账后请备注设备IMEI号" maxlength="200" show-word-limit />
+          </el-form-item>
+          <el-form-item>
+            <el-button type="primary" @click="saveSetting" :loading="saving">保存</el-button>
+          </el-form-item>
+        </el-form>
+      </el-tab-pane>
+
       <!-- ══ 操作日志 ══ -->
       <el-tab-pane v-if="isAdmin()" label="操作日志" name="log">
         <el-table :data="logs" v-loading="logLoading" stripe border size="small">
@@ -177,10 +227,32 @@ function onLogoError() {
   ElMessage.error('上传失败，请重试')
 }
 
+// ── 收款二维码 上传回调 ──
+const QR_MAX_MB = 2          // 收款码 ≤ 2MB
+function beforeQrUpload(file) {
+  if (!file.type.startsWith('image/')) {
+    ElMessage.error('只能上传图片'); return false
+  }
+  if (file.size / 1024 / 1024 >= QR_MAX_MB) {
+    ElMessage.error(`图片不能超过 ${QR_MAX_MB}MB`); return false
+  }
+  return true
+}
+function onQrSuccess(res) {
+  if (res?.code === 200 && res.data?.url) {
+    setting.payment_qrcode_url = res.data.url
+    ElMessage.success('收款码已上传，别忘了点保存')
+  } else {
+    ElMessage.error(res?.msg || '上传失败')
+  }
+}
+
 const setting = reactive({
   bigscreen_title: '应急物资管理系统', account_title: '应急物资管理系统',
   unit_name: '', contact_phone: '', email: '', address: '', logo_url: '',
   enable_batch_cmd: true, sms_enabled: false, sms_total: 0, sms_used: 0,
+  payment_enabled: false, payment_qrcode_url: '', payment_payee: '',
+  payment_account: '', payment_bank: '', payment_note: '',
 })
 
 const remaining = computed(() => Math.max(0, (setting.sms_total || 0) - (setting.sms_used || 0)))
@@ -202,6 +274,12 @@ async function loadSetting() {
       sms_enabled:     !!d.sms_enabled,
       sms_total:       d.sms_total       || 0,
       sms_used:        d.sms_used        || 0,
+      payment_enabled:    !!d.payment_enabled,
+      payment_qrcode_url: d.payment_qrcode_url || '',
+      payment_payee:      d.payment_payee      || '',
+      payment_account:    d.payment_account    || '',
+      payment_bank:       d.payment_bank       || '',
+      payment_note:       d.payment_note       || '',
     })
   } finally {
     loading.value = false

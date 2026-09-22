@@ -53,6 +53,26 @@
 
     <!-- 新建充值弹窗 -->
     <el-dialog v-model="modalVisible" title="新建充值记录" width="480px">
+      <!-- 收款信息展示区（管理员在平台设置里配置并开启后显示） -->
+      <div v-if="pay.payment_enabled" class="pay-box">
+        <div class="pay-title">收款信息</div>
+        <div class="pay-body">
+          <el-image
+            v-if="pay.payment_qrcode_url"
+            :src="qrSrc(pay.payment_qrcode_url)"
+            :preview-src-list="[qrSrc(pay.payment_qrcode_url)]"
+            fit="contain"
+            style="width:130px;height:130px;border:1px solid #eee;border-radius:6px;flex-shrink:0;" />
+          <div class="pay-info">
+            <div v-if="pay.payment_payee"><span class="pay-label">收款人：</span>{{ pay.payment_payee }}</div>
+            <div v-if="pay.payment_account"><span class="pay-label">账号：</span>{{ pay.payment_account }}</div>
+            <div v-if="pay.payment_bank"><span class="pay-label">开户行：</span>{{ pay.payment_bank }}</div>
+            <div v-if="pay.payment_note" class="pay-note">{{ pay.payment_note }}</div>
+          </div>
+        </div>
+        <div class="pay-tip">请扫码或转账付款后，填写下方金额并提交，工作人员核对到账后完成充值。</div>
+      </div>
+
       <el-form :model="form" label-width="90px">
         <el-form-item label="SIM卡" required>
           <el-select v-model="form.sim_id" placeholder="选择SIM卡" filterable style="width:100%;">
@@ -88,7 +108,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { Plus } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { rechargeApi, simApi, portalApi, isAdmin } from '@/api'
+import { rechargeApi, simApi, portalApi, platformApi, isAdmin } from '@/api'
 
 const admin = isAdmin()
 
@@ -104,6 +124,30 @@ const totalAmount = computed(() => list.value.reduce((s, r) => s + Number(r.amou
 
 const modalVisible = ref(false)
 const form = ref({ sim_id: null, amount: 100, method: '支付宝', plan: '', remark: '' })
+
+// 收款信息（来自平台设置）
+const pay = ref({
+  payment_enabled: false, payment_qrcode_url: '', payment_payee: '',
+  payment_account: '', payment_bank: '', payment_note: '',
+})
+function qrSrc(url) {
+  if (!url) return ''
+  return /^https?:\/\//.test(url) ? url : (window.location.origin + url)
+}
+async function loadPaySetting() {
+  try {
+    const res = await platformApi.get()
+    const d = res.data || {}
+    pay.value = {
+      payment_enabled:    !!d.payment_enabled,
+      payment_qrcode_url: d.payment_qrcode_url || '',
+      payment_payee:      d.payment_payee      || '',
+      payment_account:    d.payment_account    || '',
+      payment_bank:       d.payment_bank       || '',
+      payment_note:       d.payment_note       || '',
+    }
+  } catch {}
+}
 
 async function loadSims() {
   try {
@@ -150,5 +194,44 @@ async function save() {
   } catch {}
 }
 
-onMounted(() => { loadSims(); load() })
+onMounted(() => { loadSims(); load(); loadPaySetting() })
 </script>
+
+<style scoped>
+.pay-box {
+  border: 1px solid #ebeef5;
+  background: #fafafa;
+  border-radius: 6px;
+  padding: 12px 14px;
+  margin-bottom: 16px;
+}
+.pay-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #303133;
+  margin-bottom: 10px;
+}
+.pay-body {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+}
+.pay-info {
+  font-size: 13px;
+  color: #606266;
+  line-height: 1.9;
+}
+.pay-label {
+  color: #909399;
+}
+.pay-note {
+  color: #e6a23c;
+  margin-top: 4px;
+}
+.pay-tip {
+  font-size: 12px;
+  color: #909399;
+  margin-top: 10px;
+  line-height: 1.5;
+}
+</style>
