@@ -182,8 +182,12 @@ export const simApi = {
 
 // ── 充值 ─────────────────────────────────────────────────────────────────────
 export const rechargeApi = {
-  list:   (params) => http.get('/recharges', { params }),
-  create: (data)   => http.post('/recharges', data),
+  list:    (params) => http.get('/recharges', { params }),
+  create:  (data)   => http.post('/recharges', data),
+  // 充值申请审核（管理员）
+  pending: ()       => http.get('/recharges/pending'),
+  confirm: (id)     => http.post(`/recharges/${id}/confirm`),
+  reject:  (id)     => http.post(`/recharges/${id}/reject`),
 }
 
 // ── 客户 ─────────────────────────────────────────────────────────────────────

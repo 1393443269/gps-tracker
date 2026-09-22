@@ -6,9 +6,16 @@
           <el-option v-for="s in simList" :key="s.id" :label="s.iccid" :value="s.id" />
         </el-select>
       </el-col>
-      <el-col :span="12" />
+      <el-col :span="12" style="text-align:right;">
+        <!-- 管理员：待确认充值申请入口，带角标 -->
+        <el-badge v-if="admin && pendingCount > 0" :value="pendingCount" class="pending-badge">
+          <el-button type="warning" plain @click="openPending()">待确认申请</el-button>
+        </el-badge>
+      </el-col>
       <el-col :span="6" style="text-align:right;">
-        <el-button type="primary" :icon="Plus" @click="openModal()">新建充值记录</el-button>
+        <el-button type="primary" :icon="Plus" @click="openModal()">
+          {{ admin ? '新建充值记录' : '申请充值' }}
+        </el-button>
       </el-col>
     </el-row>
 
@@ -36,7 +43,13 @@
         </template>
       </el-table-column>
       <el-table-column prop="method"     label="支付方式"  width="100" />
-      <el-table-column prop="plan"       label="套餐"      width="120" />
+      <el-table-column label="状态" width="100">
+        <template #default="{ row }">
+          <el-tag v-if="row.status === '待确认'" type="warning" size="small">待确认</el-tag>
+          <el-tag v-else-if="row.status === '已驳回'" type="danger" size="small">已驳回</el-tag>
+          <el-tag v-else type="success" size="small">已确认</el-tag>
+        </template>
+      </el-table-column>
       <el-table-column prop="operator"   label="操作员"    width="100" />
       <el-table-column prop="remark"     label="备注" min-width="120" show-overflow-tooltip />
       <el-table-column prop="created_at" label="时间"      min-width="160" />
@@ -52,7 +65,7 @@
     />
 
     <!-- 新建充值弹窗 -->
-    <el-dialog v-model="modalVisible" title="新建充值记录" width="480px">
+    <el-dialog v-model="modalVisible" :title="admin ? '新建充值记录' : '申请充值'" width="480px">
       <!-- 收款信息展示区（管理员在平台设置里配置并开启后显示） -->
       <div v-if="pay.payment_enabled" class="pay-box">
         <div class="pay-title">收款信息</div>
@@ -70,7 +83,7 @@
             <div v-if="pay.payment_note" class="pay-note">{{ pay.payment_note }}</div>
           </div>
         </div>
-        <div class="pay-tip">请扫码或转账付款后，填写下方金额并提交，工作人员核对到账后完成充值。</div>
+        <div class="pay-tip">请扫码或转账付款后，填写下方金额并提交申请，工作人员核对到账后完成充值。</div>
       </div>
 
       <el-form :model="form" label-width="90px">
@@ -98,8 +111,31 @@
       </el-form>
       <template #footer>
         <el-button @click="modalVisible = false">取消</el-button>
-        <el-button type="primary" @click="save">确认充值</el-button>
+        <el-button type="primary" @click="save">{{ admin ? '确认充值' : '提交申请' }}</el-button>
       </template>
+    </el-dialog>
+
+    <!-- 管理员：待确认充值申请审核弹窗 -->
+    <el-dialog v-model="pendingVisible" title="待确认充值申请" width="720px">
+      <el-table :data="pendingList" border stripe v-loading="pendingLoading" max-height="420">
+        <el-table-column prop="iccid" label="ICCID" min-width="180" />
+        <el-table-column label="金额" width="110">
+          <template #default="{ row }">
+            <span style="color:#67c23a;font-weight:600;">¥{{ Number(row.amount).toFixed(2) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="operator" label="申请人" width="110" />
+        <el-table-column prop="created_at" label="申请时间" min-width="150" />
+        <el-table-column label="操作" width="150" fixed="right">
+          <template #default="{ row }">
+            <el-button type="success" size="small" @click="doConfirm(row)">确认到账</el-button>
+            <el-button type="danger" size="small" plain @click="doReject(row)">驳回</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <div v-if="!pendingLoading && pendingList.length === 0" style="text-align:center;color:#909399;padding:20px;">
+        暂无待确认的充值申请
+      </div>
     </el-dialog>
   </div>
 </template>
@@ -107,7 +143,7 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { Plus } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { rechargeApi, simApi, portalApi, platformApi, isAdmin } from '@/api'
 
 const admin = isAdmin()
@@ -124,6 +160,12 @@ const totalAmount = computed(() => list.value.reduce((s, r) => s + Number(r.amou
 
 const modalVisible = ref(false)
 const form = ref({ sim_id: null, amount: 100, method: '支付宝', plan: '', remark: '' })
+
+// 管理员：待确认申请
+const pendingVisible = ref(false)
+const pendingList = ref([])
+const pendingLoading = ref(false)
+const pendingCount = ref(0)
 
 // 收款信息（来自平台设置）
 const pay = ref({
@@ -184,17 +226,67 @@ async function save() {
   try {
     if (admin) {
       await rechargeApi.create(form.value)
+      ElMessage.success('充值成功')
     } else {
       await portalApi.recharges.create(form.value)
+      ElMessage.success('充值申请已提交，请等待工作人员核对到账')
     }
-    ElMessage.success('充值成功')
     modalVisible.value = false
+    load()
+    loadSims()
+    if (admin) loadPendingCount()
+  } catch {}
+}
+
+// 管理员：加载待确认数量（角标）
+async function loadPendingCount() {
+  if (!admin) return
+  try {
+    const res = await rechargeApi.pending()
+    pendingCount.value = res.data?.total || 0
+  } catch {}
+}
+
+async function openPending() {
+  pendingVisible.value = true
+  pendingLoading.value = true
+  try {
+    const res = await rechargeApi.pending()
+    pendingList.value = res.data?.records || []
+    pendingCount.value = res.data?.total || 0
+  } finally {
+    pendingLoading.value = false
+  }
+}
+
+async function doConfirm(row) {
+  try {
+    await ElMessageBox.confirm(
+      `确认这笔 ¥${Number(row.amount).toFixed(2)} 的充值已真实到账？确认后余额将立即到账。`,
+      '确认到账', { type: 'warning' }
+    )
+    await rechargeApi.confirm(row.id)
+    ElMessage.success('已确认到账')
+    openPending()
     load()
     loadSims()
   } catch {}
 }
 
-onMounted(() => { loadSims(); load(); loadPaySetting() })
+async function doReject(row) {
+  try {
+    await ElMessageBox.confirm('确定驳回这笔充值申请？余额不会变动。', '驳回申请', { type: 'warning' })
+    await rechargeApi.reject(row.id)
+    ElMessage.success('已驳回')
+    openPending()
+    load()
+  } catch {}
+}
+
+onMounted(() => {
+  loadSims(); load(); loadPaySetting()
+  if (admin) loadPendingCount()
+})
 </script>
 
 <style scoped>

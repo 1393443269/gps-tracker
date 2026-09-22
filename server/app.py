@@ -688,6 +688,17 @@ def init_db():
         except Exception:
             pass
 
+    # ── 充值申请制：充值记录状态字段 ──────────────────────────────────────────────
+    for _col in ["status      TEXT DEFAULT '已确认'",   # 待确认/已确认/已驳回(老数据默认已确认,不影响历史)
+                 "proof_url   TEXT DEFAULT ''",         # 付款截图 URL(客户选填)
+                 "reviewed_by TEXT DEFAULT ''",         # 审核管理员
+                 "reviewed_at TEXT DEFAULT ''"]:        # 审核时间
+        try:
+            conn.execute(f"ALTER TABLE recharge ADD COLUMN {_col}")
+            conn.commit()
+        except Exception:
+            pass
+
     # ── 设备生命周期 ──────────────────────────────────────────────────────────────
     # lifecycle: 0=未激活 1=已激活 2=已停用 3=已报废
     for _col in ["lifecycle   INTEGER DEFAULT 1",
@@ -3138,6 +3149,74 @@ def create_recharge():
     return ok({'new_balance': new_balance})
 
 
+# ── 充值申请审核(管理员)──────────────────────────────────────────────────────
+@app.get('/api/recharges/pending')
+def list_pending_recharges():
+    """待确认充值申请列表(管理员)。"""
+    conds, params = ["status='待确认'"], []
+    conds, params = _org_scope_conds(conds, params)
+    where = "WHERE " + " AND ".join(conds)
+    total = db_scalar(f"SELECT COUNT(*) FROM recharge {where}", params)
+    records = db_query(f"SELECT * FROM recharge {where} ORDER BY created_at DESC", params)
+    return ok({'records': records, 'total': total})
+
+
+@app.post('/api/recharges/<int:rid>/confirm')
+def confirm_recharge(rid):
+    """确认充值申请:此时才真正加余额(原子),并置为已确认。幂等:非待确认状态不重复加钱。"""
+    admin = '管理员'
+    with _db_lock:
+        conn = get_db()
+        try:
+            rc = conn.execute("SELECT * FROM recharge WHERE id=?", (rid,)).fetchone()
+            if not rc:
+                conn.close()
+                return fail('充值申请不存在', 404)
+            if rc['status'] != '待确认':
+                conn.close()
+                return fail(f"该申请状态为{rc['status']},无法重复确认", 400)
+            sim_id = rc['sim_id']
+            amount = float(rc['amount'] or 0)
+            # 原子加余额 + 欠费转正常(与 create_recharge 同一套写法)
+            conn.execute(
+                "UPDATE sim_card SET balance = ROUND(balance + ?, 2), "
+                "status = CASE WHEN status='欠费' AND (balance + ?) >= 0 THEN '正常' ELSE status END "
+                "WHERE id=?",
+                (amount, amount, sim_id)
+            )
+            conn.execute(
+                "UPDATE recharge SET status='已确认', reviewed_by=?, "
+                "reviewed_at=strftime('%Y-%m-%d %H:%M:%S','now','localtime') WHERE id=?",
+                (admin, rid)
+            )
+            new_balance_row = conn.execute("SELECT balance FROM sim_card WHERE id=?", (sim_id,)).fetchone()
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    new_balance = float(new_balance_row['balance']) if new_balance_row else 0.0
+    add_op_log('充值', f'确认充值申请 #{rid} ¥{amount:.2f}')
+    return ok({'new_balance': new_balance})
+
+
+@app.post('/api/recharges/<int:rid>/reject')
+def reject_recharge(rid):
+    """驳回充值申请:只标记状态,不加余额。"""
+    admin = '管理员'
+    rc = db_query_one("SELECT status FROM recharge WHERE id=?", (rid,))
+    if not rc:
+        return fail('充值申请不存在', 404)
+    if rc['status'] != '待确认':
+        return fail(f"该申请状态为{rc['status']},无法驳回", 400)
+    db_exec("UPDATE recharge SET status='已驳回', reviewed_by=?, "
+            "reviewed_at=strftime('%Y-%m-%d %H:%M:%S','now','localtime') WHERE id=?",
+            (admin, rid))
+    add_op_log('充值', f'驳回充值申请 #{rid}')
+    return ok()
+
+
 # ── 客户管理接口 ───────────────────────────────────────────────────────────────
 
 @app.get('/api/customers')
@@ -5519,22 +5598,14 @@ def portal_recharge_sim(sid):
     amount = float(d.get('amount', 0))
     if amount <= 0:
         return fail('充值金额必须大于 0', 400)
-    # 原子 UPDATE：消除余额读写竞态
-    db_exec(
-        "UPDATE sim_card SET balance = ROUND(balance + ?, 2), "
-        "status = CASE WHEN status='欠费' AND (balance + ?) >= 0 THEN '正常' ELSE status END "
-        "WHERE id=?",
-        (amount, amount, sid)
-    )
-    updated = db_query_one("SELECT balance FROM sim_card WHERE id=?", (sid,))
-    new_balance = float(updated['balance']) if updated else 0.0
+    # 充值申请制：客户提交只生成待确认申请，余额不动，管理员确认后才到账
     cust = db_query_one("SELECT name FROM customer WHERE id=?", (cid,))
-    db_exec("INSERT INTO recharge (sim_id, iccid, amount, method, plan, remark, operator, customer_id) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+    db_exec("INSERT INTO recharge (sim_id, iccid, amount, method, plan, remark, operator, customer_id, status, proof_url) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (sid, sim['iccid'], amount, d.get('method', '支付宝'),
              d.get('plan', ''), d.get('remark', ''),
-             cust['name'] if cust else '客户', cid))
-    return ok({'new_balance': new_balance})
+             cust['name'] if cust else '客户', cid, '待确认', d.get('proof_url', '')))
+    return ok({'status': '待确认', 'message': '充值申请已提交,请等待管理员确认到账'})
 
 
 # ── 客户门户：充值记录（仅自己名下SIM的记录） ────────────────────────────────────
@@ -5586,22 +5657,14 @@ def portal_create_recharge():
     amount = float(d.get('amount', 0) or 0)
     if amount <= 0:
         return fail('充值金额必须大于 0', 400)
-    # 原子 UPDATE：消除余额读写竞态
-    db_exec(
-        "UPDATE sim_card SET balance = ROUND(balance + ?, 2), "
-        "status = CASE WHEN status='欠费' AND (balance + ?) >= 0 THEN '正常' ELSE status END "
-        "WHERE id=?",
-        (amount, amount, sim_id)
-    )
-    updated = db_query_one("SELECT balance FROM sim_card WHERE id=?", (sim_id,))
-    new_balance = float(updated['balance']) if updated else 0.0
+    # 充值申请制：客户提交只生成待确认申请，余额不动，管理员确认后才到账
     cust = db_query_one("SELECT name FROM customer WHERE id=?", (cid,))
-    db_exec("INSERT INTO recharge (sim_id, iccid, amount, method, plan, remark, operator, customer_id) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+    db_exec("INSERT INTO recharge (sim_id, iccid, amount, method, plan, remark, operator, customer_id, status, proof_url) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (sim_id, sim['iccid'], amount, d.get('method', '支付宝'),
              d.get('plan', ''), d.get('remark', ''),
-             cust['name'] if cust else '客户', cid))
-    return ok({'new_balance': new_balance})
+             cust['name'] if cust else '客户', cid, '待确认', d.get('proof_url', '')))
+    return ok({'status': '待确认', 'message': '充值申请已提交,请等待管理员确认到账'})
 
 
 # ── 管理端：给客户设置账号密码 / 分配设备 ─────────────────────────────────────
@@ -6769,7 +6832,7 @@ def _settle_profit(period):
     if not period or len(period) != 7 or period[4] != '-':
         raise ValueError('period 格式应为 YYYY-MM')
     recs = db_query(
-        "SELECT id, customer_id, amount FROM recharge WHERE substr(created_at,1,7)=?",
+        "SELECT id, customer_id, amount FROM recharge WHERE substr(created_at,1,7)=? AND status='已确认'",
         (period,))
     created = 0
     skipped = 0
