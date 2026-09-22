@@ -125,7 +125,7 @@ def _do_db_write(rows, dev_snapshot):
     _write_ok = False
     for _attempt in range(3):   # 最多重试 3 次,防止瞬时数据库抖动丢弃位置数据
         try:
-            with _db_lock:
+            with _db_lock if DB_BACKEND == 'sqlite' else _NullCtx():
                 conn = get_db()
                 try:
                     if rows:

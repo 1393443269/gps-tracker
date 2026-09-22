@@ -31,6 +31,7 @@ import base64
 import time as _time_mod
 
 from datetime import datetime
+from contextlib import nullcontext as _nullcontext  # PG 后端各连接独立无需全局写锁，用它统一 with 语法
 from flask import Flask, request, jsonify, send_file as _send_abs
 import re as _re
 from flask_socketio import SocketIO, join_room
@@ -1235,7 +1236,7 @@ def import_devices():
                 try:
                     _cust_name = _contact or str(r.get('name', '') or '') or ('设备' + phone[-6:])
                     _cid = None
-                    with _db_lock:
+                    with (_db_lock if DB_BACKEND == 'sqlite' else _nullcontext()):
                         _conn = get_db()
                         try:
                             _cur = _conn.execute(
@@ -1677,7 +1678,7 @@ def batch_bind_devices_by_imei():
                     login_name = f"{base_login}{suffix}"
                 raw_pw = _gen_pw()
                 _cid = None
-                with _db_lock:
+                with (_db_lock if DB_BACKEND == 'sqlite' else _nullcontext()):
                     conn = get_db()
                     try:
                         cur = conn.execute(
@@ -1800,7 +1801,7 @@ def portal_batch_bind_by_imei():
                     login_name = f"{base_login}{suffix}"
                 raw_pw = _gen_pw()
                 _newcid = None
-                with _db_lock:
+                with (_db_lock if DB_BACKEND == 'sqlite' else _nullcontext()):
                     conn = get_db()
                     try:
                         cur = conn.execute(
@@ -3193,7 +3194,7 @@ def create_recharge():
     # 避免先 SELECT 再计算再 UPDATE 之间的余额竞态。
     # 扣费 UPDATE 与充值记录 INSERT 放到同一连接的事务里，避免二者不一致
     # （参考 create_customer 的事务写法：_db_lock + get_db + 一次 commit）
-    with _db_lock:
+    with (_db_lock if DB_BACKEND == 'sqlite' else _nullcontext()):
         conn = get_db()
         try:
             # ROUND 第二参数需 numeric，PostgreSQL 无 ROUND(double precision,int)，故 CAST
@@ -3233,13 +3234,18 @@ def list_pending_recharges():
 def confirm_recharge(rid):
     """确认充值申请:此时才真正加余额(原子),并置为已确认。幂等:非待确认状态不重复加钱。"""
     admin = '管理员'
-    with _db_lock:
+    with (_db_lock if DB_BACKEND == 'sqlite' else _nullcontext()):
         conn = get_db()
         try:
             rc = conn.execute("SELECT * FROM recharge WHERE id=?", (rid,)).fetchone()
             if not rc:
                 conn.close()
                 return fail('充值申请不存在', 404)
+            # 组织隔离：超管(sids=None)可确认全部；普通管理员只能确认本组织范围内的申请
+            _sids = _org_scope_ids(request)
+            if _sids is not None and (rc['org_id'] not in _sids):
+                conn.close()
+                return fail('无权操作该充值申请', 403)
             if rc['status'] != '待确认':
                 conn.close()
                 return fail(f"该申请状态为{rc['status']},无法重复确认", 400)
@@ -3275,9 +3281,13 @@ def confirm_recharge(rid):
 def reject_recharge(rid):
     """驳回充值申请:只标记状态,不加余额。"""
     admin = '管理员'
-    rc = db_query_one("SELECT status FROM recharge WHERE id=?", (rid,))
+    rc = db_query_one("SELECT status, org_id FROM recharge WHERE id=?", (rid,))
     if not rc:
         return fail('充值申请不存在', 404)
+    # 组织隔离：超管(sids=None)可驳回全部；普通管理员只能驳回本组织范围内的申请
+    _sids = _org_scope_ids(request)
+    if _sids is not None and (rc['org_id'] not in _sids):
+        return fail('无权操作该充值申请', 403)
     if rc['status'] != '待确认':
         return fail(f"该申请状态为{rc['status']},无法驳回", 400)
     db_exec("UPDATE recharge SET status='已驳回', reviewed_by=?, "
@@ -3361,7 +3371,7 @@ def create_customer():
         dup = db_query_one("SELECT id FROM customer WHERE login_name=?", (login_name,))
         if dup:
             return fail('登录账号已被占用', 400)
-    with _db_lock:
+    with (_db_lock if DB_BACKEND == 'sqlite' else _nullcontext()):
         conn = get_db()
         try:
             cur = conn.execute(
@@ -3638,7 +3648,7 @@ def create_fence():
 
     # 单连接内插入围栏并同步 fence_device：拿到 lastrowid 后在同一 conn(同一锁)双写，
     # 保证 devices 串与关联表原子对齐，不会出现只写其一的中间态。
-    with _db_lock:
+    with (_db_lock if DB_BACKEND == 'sqlite' else _nullcontext()):
         conn = get_db()
         try:
             new_id = conn.execute(ins_sql, ins_params).lastrowid
@@ -5219,7 +5229,7 @@ def portal_create_sub_customer():
             return fail('登录账号已被占用', 400)
     pw_hash = _hash_pw(password) if password else None
     now     = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    with _db_lock:
+    with (_db_lock if DB_BACKEND == 'sqlite' else _nullcontext()):
         conn = get_db()
         try:
             cur = conn.execute(
@@ -5369,7 +5379,7 @@ def portal_create_fence():
                       _json.dumps(d.get('coordinates', [])), color, devices_str, cid, now)
     else:
         return fail('未知围栏类型', 400)
-    with _db_lock:
+    with (_db_lock if DB_BACKEND == 'sqlite' else _nullcontext()):
         conn = get_db()
         try:
             new_id = conn.execute(ins_sql, ins_params).lastrowid
@@ -5718,6 +5728,7 @@ def portal_recharge_sim(sid):
             (sid, sim['iccid'], amount, d.get('method', '支付宝'),
              d.get('plan', ''), d.get('remark', ''),
              cust['name'] if cust else '客户', cid, '待确认', d.get('proof_url', '')))
+    add_op_log('充值申请', f'客户提交充值申请 SIM卡{sim["iccid"]} ¥{amount:.2f}')
     return ok({'status': '待确认', 'message': '充值申请已提交,请等待管理员确认到账'})
 
 
@@ -5777,6 +5788,7 @@ def portal_create_recharge():
             (sim_id, sim['iccid'], amount, d.get('method', '支付宝'),
              d.get('plan', ''), d.get('remark', ''),
              cust['name'] if cust else '客户', cid, '待确认', d.get('proof_url', '')))
+    add_op_log('充值申请', f'客户提交充值申请 SIM卡{sim["iccid"]} ¥{amount:.2f}')
     return ok({'status': '待确认', 'message': '充值申请已提交,请等待管理员确认到账'})
 
 
@@ -5961,7 +5973,7 @@ def create_org():
     else:
         parent, org_level = None, 1
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    with _db_lock:
+    with (_db_lock if DB_BACKEND == 'sqlite' else _nullcontext()):
         conn = get_db()
         try:
             cur = conn.execute(
@@ -6298,7 +6310,7 @@ def save_org_module_auth(org_id):
     enabled_codes = set(d.get('enabledCodes', []))
     mods          = db_query("SELECT module_code FROM sys_module WHERE deleted=0")
     now           = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    with _db_lock:
+    with (_db_lock if DB_BACKEND == 'sqlite' else _nullcontext()):
         conn = get_db()
         try:
             for m in mods:
@@ -6330,8 +6342,13 @@ _DIST = os.path.normpath(os.path.join(BASE_DIR, '..', 'frontend', 'dist'))
 # ── 开放API与数据推送 管理接口(管理员，走 /api/* 守卫) ────────────────────────
 @app.get('/api/openapi/keys')
 def list_api_keys():
-    rows = db_query("SELECT id, app_name, api_key, api_secret, customer_id, org_id, status, "
-                    "remark, last_used_at, created_at FROM api_key ORDER BY id DESC")
+    # 列表不返回 api_secret（签名密钥），仅在 create_api_key 创建时一次性返回，防泄露
+    # 组织隔离：超管(sids=None)看全部，普通管理员只看本组织范围内的 ApiKey
+    conds, params = _org_scope_conds([], [])
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    rows = db_query("SELECT id, app_name, api_key, customer_id, org_id, status, "
+                    f"remark, last_used_at, created_at FROM api_key {where} ORDER BY id DESC",
+                    params)
     return ok({'records': rows, 'total': len(rows)})
 
 @app.post('/api/openapi/keys')
@@ -6950,7 +6967,7 @@ def _settle_profit(period):
     created = 0
     skipped = 0
     unlinked = 0
-    with _db_lock:
+    with (_db_lock if DB_BACKEND == 'sqlite' else _nullcontext()):
         conn = get_db()
         try:
             for rc in recs:
@@ -7026,18 +7043,24 @@ def api_profit_records():
     bid = request.args.get('beneficiary_customer_id')
     if bid:
         conds.append("pr.beneficiary_customer_id=?"); params.append(int(bid))
+    # 组织隔离：profit_record 无 org_id，经 recharge_id 关联 recharge 表取归属 org。
+    # 超管(sids=None)不限制；普通管理员只看本组织范围内充值产生的分润。
+    conds, params = _org_scope_conds(conds, params, col='rch.org_id')
     where = ('WHERE ' + ' AND '.join(conds)) if conds else ''
+    # 用于 COUNT/SUM 的最小连接：仅在需要 org 过滤时也保持连接，简化 SQL 拼接
+    _join = "LEFT JOIN recharge rch ON rch.id=pr.recharge_id"
     try:
         page = max(1, int(request.args.get('page', 1)))
         page_size = min(200, max(1, int(request.args.get('page_size', 20))))
     except ValueError:
         page, page_size = 1, 20
-    total = db_scalar(f"SELECT COUNT(*) FROM profit_record pr {where}", params)
-    sum_profit = db_scalar(f"SELECT COALESCE(SUM(profit),0) FROM profit_record pr {where}", params)
+    total = db_scalar(f"SELECT COUNT(*) FROM profit_record pr {_join} {where}", params)
+    sum_profit = db_scalar(f"SELECT COALESCE(SUM(pr.profit),0) FROM profit_record pr {_join} {where}", params)
     records = db_query(
         f"SELECT pr.*, "
         f"  bc.name AS beneficiary_name, sc.name AS source_name "
         f"FROM profit_record pr "
+        f"{_join} "
         f"LEFT JOIN customer bc ON bc.id=pr.beneficiary_customer_id "
         f"LEFT JOIN customer sc ON sc.id=pr.source_customer_id "
         f"{where} ORDER BY pr.period DESC, pr.id DESC LIMIT ? OFFSET ?",
@@ -7049,9 +7072,16 @@ def api_profit_records():
 @app.post('/api/profit/records/<int:rid>/pay')
 def api_profit_mark_paid(rid):
     """标记某条分润记录为已付。"""
-    row = db_query_one("SELECT id, status FROM profit_record WHERE id=?", (rid,))
+    # 组织隔离：profit_record 无 org_id，经 recharge_id 关联 recharge 取归属 org 校验。
+    row = db_query_one(
+        "SELECT pr.id, pr.status, rch.org_id AS org_id "
+        "FROM profit_record pr LEFT JOIN recharge rch ON rch.id=pr.recharge_id "
+        "WHERE pr.id=?", (rid,))
     if not row:
         return fail('记录不存在', 404)
+    _sids = _org_scope_ids(request)
+    if _sids is not None and (row.get('org_id') not in _sids):
+        return fail('无权操作该分润记录', 403)
     db_exec("UPDATE profit_record SET status='已付' WHERE id=?", (rid,))
     add_op_log('分润', f'分润记录 #{rid} 标记已付')
     return ok({'id': rid, 'status': '已付'})
