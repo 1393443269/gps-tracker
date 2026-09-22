@@ -157,6 +157,10 @@ export const healthApi = {
 export const platformApi = {
   get:    ()          => http.get('/platform-setting'),
   update: (data)      => http.put('/platform-setting', data),
+  // 邮件通知
+  notifyStatus:  ()     => http.get('/notify/status'),
+  notifyTest:    (data) => http.post('/notify/test', data),
+  notifyScanNow: ()     => http.post('/notify/scan-now'),
 }
 
 // ── 指令下发 ─────────────────────────────────────────────────────────────────

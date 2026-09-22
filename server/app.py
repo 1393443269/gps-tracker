@@ -664,6 +664,18 @@ def init_db():
         org_id       INTEGER DEFAULT 1  -- 组织隔离(与平台其它表一致)
     );
     CREATE INDEX IF NOT EXISTS idx_sensor_device_ts ON sensor_data(device_phone, ts);
+
+    -- 通知发送记录:防重复发送。每成功发一封记一条,同一 (类型,对象,周期) 只发一次。
+    CREATE TABLE IF NOT EXISTS notify_log (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        notify_type TEXT NOT NULL,      -- 'sim_expire' / 'sim_balance'
+        target_key  TEXT NOT NULL,      -- 通知对象标识(此处用 iccid)
+        period_key  TEXT NOT NULL,      -- 去重周期键:到期用 expire_date;余额用 'balance_'+当天日期
+        to_email    TEXT,               -- 实际收件邮箱(客户或兜底管理员)
+        sent_at     TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
+    );
+    -- 唯一索引:同一类型+对象+周期只允许一条,数据库层兜底防重复
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_notify_dedup ON notify_log(notify_type, target_key, period_key);
     """)
     conn.commit()
 
@@ -683,6 +695,17 @@ def init_db():
                  "payment_account    TEXT DEFAULT ''",     # 收款账号
                  "payment_bank       TEXT DEFAULT ''",     # 开户行 / 渠道
                  "payment_note       TEXT DEFAULT ''"]:    # 收款说明
+        try:
+            conn.execute(f"ALTER TABLE platform_setting ADD COLUMN {_col}")
+            conn.commit()
+        except Exception:
+            pass
+
+    # ── 平台设置：主动邮件通知配置（SIM 到期 / 余额不足）─────────────────────────
+    for _col in ["notify_email_enabled INTEGER DEFAULT 0",   # 邮件通知总开关(0=关 1=开)
+                 "notify_admin_email   TEXT DEFAULT ''",      # 管理员统一收件箱(兜底/汇总)
+                 "notify_expire_days   INTEGER DEFAULT 7",    # SIM 到期提前几天提醒
+                 "notify_balance_min   REAL DEFAULT 10"]:     # 余额低于此值提醒(元)
         try:
             conn.execute(f"ALTER TABLE platform_setting ADD COLUMN {_col}")
             conn.commit()
@@ -2542,7 +2565,9 @@ def update_platform_setting():
         "contact_phone=?,email=?,address=?,logo_url=?,enable_batch_cmd=?,"
         "sms_enabled=?,sms_total=?,"
         "payment_enabled=?,payment_qrcode_url=?,payment_payee=?,"
-        "payment_account=?,payment_bank=?,payment_note=? WHERE org_id=1",
+        "payment_account=?,payment_bank=?,payment_note=?,"
+        "notify_email_enabled=?,notify_admin_email=?,notify_expire_days=?,notify_balance_min=? "
+        "WHERE org_id=1",
         (d.get('bigscreen_title', '资产管理平台'), d.get('account_title', '资产管理平台'),
          d.get('unit_name', ''), d.get('contact_phone', ''), d.get('email', ''),
          d.get('address', ''), d.get('logo_url', ''),
@@ -2551,7 +2576,11 @@ def update_platform_setting():
          1 if d.get('payment_enabled', False) else 0,
          d.get('payment_qrcode_url', ''), d.get('payment_payee', ''),
          d.get('payment_account', ''), d.get('payment_bank', ''),
-         d.get('payment_note', ''))
+         d.get('payment_note', ''),
+         1 if d.get('notify_email_enabled', False) else 0,
+         d.get('notify_admin_email', ''),
+         int(d.get('notify_expire_days', 7) or 7),
+         float(d.get('notify_balance_min', 10) or 10))
     )
     add_op_log('平台设置', '更新平台设置')
     return ok()
@@ -7184,6 +7213,296 @@ def start_profit_scheduler():
     log.info("[分润月结] 定时线程已启动(每月 1 号自动结算上月)")
 
 
+# ── 主动邮件通知:SIM 到期 / 余额不足 ─────────────────────────────────────────
+# 语义说明:系统当前无自动扣费,余额是手工维护的,故"余额不足"实为"余额低于阈值,
+# 提醒联系管理员充值",不涉及任何资金扣减/核心账务改动。
+# 收件人查找链(关键坐标,人复核重点):
+#   sim_card.device_phone == device.phone(软删除 COALESCE(deleted,0)=0)
+#     → device.customer_id → customer.email
+#   查到客户邮箱发客户;查不到发 notify_admin_email 兜底;两者皆无则跳过。
+# 去重(防轰炸):notify_log(notify_type,target_key,period_key) 唯一索引 + 发送前查存。
+#   到期类 period_key = 该卡 expire_date(同一到期日只发一次)
+#   余额类 period_key = 'balance_' + 当天日期(同一卡同一天只发一次)
+import mailer as _mailer
+
+
+def _notify_recipient_for_sim(sim_row, admin_email):
+    """按收件人查找链解析一张 SIM 的收件邮箱。
+    返回 (email, kind):kind ∈ 'customer'(客户) / 'admin'(兜底) / '';
+    email 为 '' 表示无处可发(跳过)。"""
+    device_phone = (sim_row.get('device_phone') or '').strip()
+    if device_phone:
+        # device_phone → device(未软删除) → customer_id → customer.email
+        dev = db_query_one(
+            "SELECT customer_id FROM device "
+            "WHERE phone=? AND COALESCE(deleted,0)=0 "
+            "ORDER BY id ASC LIMIT 1",
+            (device_phone,))
+        if dev and dev.get('customer_id'):
+            cust = db_query_one(
+                "SELECT email FROM customer WHERE id=?",
+                (dev.get('customer_id'),))
+            if cust:
+                cemail = (cust.get('email') or '').strip()
+                if cemail:
+                    return (cemail, 'customer')
+    # 兜底:管理员统一收件箱
+    admin_email = (admin_email or '').strip()
+    if admin_email:
+        return (admin_email, 'admin')
+    return ('', '')
+
+
+def _notify_already_sent(notify_type, target_key, period_key):
+    """去重:该 (类型,对象,周期) 是否已发过。"""
+    try:
+        row = db_query_one(
+            "SELECT id FROM notify_log "
+            "WHERE notify_type=? AND target_key=? AND period_key=? LIMIT 1",
+            (notify_type, target_key, period_key))
+        return bool(row)
+    except Exception:
+        # 查询异常时保守视为"未发"会有重发风险;这里选择保守跳过以防轰炸
+        return True
+
+
+def _notify_record_sent(notify_type, target_key, period_key, to_email):
+    """记录一次成功发送(唯一索引兜底防并发重复)。"""
+    try:
+        db_exec(
+            "INSERT INTO notify_log (notify_type, target_key, period_key, to_email) "
+            "VALUES (?,?,?,?)",
+            (notify_type, target_key, period_key, to_email))
+    except Exception as _e:
+        # 唯一冲突(并发/重启)等:说明已记过,忽略即可
+        log.info("[邮件通知] 写 notify_log 跳过(可能已存在): %s", _e)
+
+
+def scan_and_notify_once():
+    """扫描 SIM 到期 / 余额不足并发通知。整体 try/except,异常只 log 不崩溃。
+    返回统计 dict:{scanned, sent, skipped, disabled, error}。"""
+    stat = {'scanned': 0, 'sent': 0, 'skipped': 0, 'disabled': False, 'error': None}
+    try:
+        # 未启用 或 SMTP 未配齐 → 直接不扫
+        setting = db_query_one("SELECT * FROM platform_setting WHERE org_id=1", ()) or {}
+        if int(setting.get('notify_email_enabled') or 0) != 1:
+            stat['disabled'] = True
+            return stat
+        if not _mailer.smtp_configured():
+            stat['disabled'] = True
+            stat['error'] = 'SMTP 未配置齐全,缺少: ' + ','.join(_mailer.missing_config())
+            log.info("[邮件通知] 跳过:%s", stat['error'])
+            return stat
+
+        try:
+            expire_days = int(setting.get('notify_expire_days') or 7)
+        except (ValueError, TypeError):
+            expire_days = 7
+        try:
+            balance_min = float(setting.get('notify_balance_min') or 10)
+        except (ValueError, TypeError):
+            balance_min = 10.0
+        admin_email = (setting.get('notify_admin_email') or setting.get('email') or '').strip()
+
+        from datetime import date as _date, timedelta as _td
+        today = _date.today()
+        today_str = today.isoformat()
+        upper_str = (today + _td(days=max(0, expire_days))).isoformat()
+
+        # ── 1) SIM 到期扫描 ──────────────────────────────────────────────────
+        # 覆盖:已过期(< today) 或 today..today+expire_days 之间到期。status 正常。
+        try:
+            exp_rows = db_query(
+                "SELECT * FROM sim_card "
+                "WHERE status='正常' AND expire_date IS NOT NULL AND expire_date<>'' "
+                "AND expire_date <= ? "
+                "ORDER BY expire_date ASC",
+                (upper_str,))
+        except Exception as _e:
+            exp_rows = []
+            log.warning("[邮件通知] 查到期 SIM 失败: %s", _e)
+
+        for r in exp_rows:
+            stat['scanned'] += 1
+            iccid = (r.get('iccid') or '').strip()
+            expire_date = (r.get('expire_date') or '').strip()
+            if not iccid or not expire_date:
+                stat['skipped'] += 1
+                continue
+            period_key = expire_date  # 同一到期日只发一次
+            if _notify_already_sent('sim_expire', iccid, period_key):
+                stat['skipped'] += 1
+                continue
+            to_email, kind = _notify_recipient_for_sim(r, admin_email)
+            if not to_email:
+                stat['skipped'] += 1
+                log.info("[邮件通知] SIM %s 到期:无收件人(无客户邮箱且无兜底管理员邮箱),跳过", iccid)
+                continue
+            dev_name = (r.get('name') or r.get('device_phone') or iccid)
+            days_left = _sim_days_left(expire_date)
+            if days_left is None:
+                when_txt = "到期日 %s" % expire_date
+            elif days_left < 0:
+                when_txt = "已于 %s 到期(逾期 %d 天)" % (expire_date, -days_left)
+            elif days_left == 0:
+                when_txt = "今日(%s)到期" % expire_date
+            else:
+                when_txt = "将于 %s 到期(还剩 %d 天)" % (expire_date, days_left)
+            subject = "【GPS追踪平台】SIM卡到期提醒:%s" % dev_name
+            body = (
+                "您好,\n\n"
+                "您名下的 SIM 卡即将到期,请及时联系管理员续费,以免影响设备定位服务。\n\n"
+                "  设备/名称:%s\n"
+                "  ICCID:%s\n"
+                "  到期情况:%s\n\n"
+                "如已续费请忽略本邮件。\n\n"
+                "—— GPS追踪平台 自动通知"
+            ) % (dev_name, iccid, when_txt)
+            ok_send, msg = _mailer.send_mail(to_email, subject, body)
+            if ok_send:
+                _notify_record_sent('sim_expire', iccid, period_key, to_email)
+                stat['sent'] += 1
+                log.info("[邮件通知] SIM %s 到期 → %s (%s) 已发", iccid, to_email, kind)
+            else:
+                stat['skipped'] += 1
+                log.warning("[邮件通知] SIM %s 到期发送失败(不记录,下轮重试): %s", iccid, msg)
+
+        # ── 2) 余额不足扫描 ──────────────────────────────────────────────────
+        # 语义:余额低于阈值 → 提醒充值(非自动扣费)。status 正常。
+        try:
+            bal_rows = db_query(
+                "SELECT * FROM sim_card "
+                "WHERE status='正常' AND balance IS NOT NULL AND balance < ? "
+                "ORDER BY balance ASC",
+                (balance_min,))
+        except Exception as _e:
+            bal_rows = []
+            log.warning("[邮件通知] 查低余额 SIM 失败: %s", _e)
+
+        for r in bal_rows:
+            stat['scanned'] += 1
+            iccid = (r.get('iccid') or '').strip()
+            if not iccid:
+                stat['skipped'] += 1
+                continue
+            period_key = 'balance_' + today_str  # 同一卡同一天只发一次
+            if _notify_already_sent('sim_balance', iccid, period_key):
+                stat['skipped'] += 1
+                continue
+            to_email, kind = _notify_recipient_for_sim(r, admin_email)
+            if not to_email:
+                stat['skipped'] += 1
+                log.info("[邮件通知] SIM %s 低余额:无收件人,跳过", iccid)
+                continue
+            dev_name = (r.get('name') or r.get('device_phone') or iccid)
+            try:
+                bal_val = float(r.get('balance') or 0)
+            except (ValueError, TypeError):
+                bal_val = 0.0
+            subject = "【GPS追踪平台】SIM卡余额不足提醒:%s" % dev_name
+            body = (
+                "您好,\n\n"
+                "您名下 SIM 卡的余额已低于提醒阈值,请及时联系管理员充值,以免欠费停机影响定位服务。\n\n"
+                "  设备/名称:%s\n"
+                "  ICCID:%s\n"
+                "  当前余额:%.2f 元(提醒阈值 %.2f 元)\n\n"
+                "如已充值请忽略本邮件。\n\n"
+                "—— GPS追踪平台 自动通知"
+            ) % (dev_name, iccid, bal_val, balance_min)
+            ok_send, msg = _mailer.send_mail(to_email, subject, body)
+            if ok_send:
+                _notify_record_sent('sim_balance', iccid, period_key, to_email)
+                stat['sent'] += 1
+                log.info("[邮件通知] SIM %s 低余额 → %s (%s) 已发", iccid, to_email, kind)
+            else:
+                stat['skipped'] += 1
+                log.warning("[邮件通知] SIM %s 低余额发送失败(不记录,下轮重试): %s", iccid, msg)
+
+        log.info("[邮件通知] 本轮完成:扫描 %d 张,发送 %d 封,跳过 %d 封",
+                 stat['scanned'], stat['sent'], stat['skipped'])
+        return stat
+
+    except Exception as e:
+        # 任何异常只 log 不崩溃,绝不影响主服务/扫描线程
+        stat['error'] = str(e)
+        log.warning("[邮件通知] scan_and_notify_once 异常: %s", e)
+        return stat
+
+
+# 每隔 NOTIFY_SCAN_INTERVAL_SEC 秒扫一次(默认 6 小时)。参照 _profit_scheduler_loop。
+NOTIFY_SCAN_INTERVAL_SEC = int(os.environ.get('NOTIFY_SCAN_INTERVAL_SEC', '21600') or '21600')
+_notify_scheduler_started = False  # 进程内单次启动守卫,防重复起线程
+
+
+def _notify_scanner_loop():
+    import time
+    # 启动后稍等再首扫,避开 init_db/建表与其它启动线程的抢占
+    time.sleep(60)
+    while True:
+        try:
+            scan_and_notify_once()
+        except Exception as e:
+            log.warning("[邮件通知] 定时扫描异常: %s", e)
+        time.sleep(max(60, NOTIFY_SCAN_INTERVAL_SEC))
+
+
+def start_notify_scheduler():
+    """启动主动邮件通知定时线程(gunicorn post_fork 调用 / __main__ 调用)。
+    单进程模型下用 _notify_scheduler_started 守卫保证只起一次。"""
+    global _notify_scheduler_started
+    if _notify_scheduler_started:
+        return
+    _notify_scheduler_started = True
+    import threading as _t
+    _t.Thread(target=_notify_scanner_loop, daemon=True, name='notify-scanner').start()
+    log.info("[邮件通知] 定时线程已启动(每 %d 秒扫描一次)", NOTIFY_SCAN_INTERVAL_SEC)
+
+
+# ── 主动邮件通知:管理员接口(/api/* 自动受 before_request 鉴权保护)──────────────
+@app.post('/api/notify/test')
+def api_notify_test():
+    """管理员测试发信:body {to_email}。用于配好授权码后验证 SMTP。"""
+    d = request.get_json(silent=True) or {}
+    to_email = (d.get('to_email') or '').strip()
+    if not to_email:
+        return fail('请提供 to_email', 400)
+    if not _mailer.smtp_configured():
+        return fail('SMTP 未配置齐全,缺少: ' + ','.join(_mailer.missing_config()), 400)
+    subject = "【GPS追踪平台】邮件通知测试"
+    body = ("这是一封来自 GPS追踪平台 的测试邮件。\n"
+            "若您收到本邮件,说明 SMTP 配置正确,主动通知功能可正常发信。\n\n"
+            "—— GPS追踪平台 自动通知")
+    ok_send, msg = _mailer.send_mail(to_email, subject, body)
+    add_op_log('邮件通知', '测试发信 → %s : %s' % (to_email, '成功' if ok_send else '失败'))
+    if ok_send:
+        return ok({'sent': True, 'msg': msg})
+    return fail('发送失败: ' + msg, 500)
+
+
+@app.post('/api/notify/scan-now')
+def api_notify_scan_now():
+    """管理员手动触发一次扫描通知,返回统计。便于测试不用等定时。"""
+    stat = scan_and_notify_once()
+    add_op_log('邮件通知', '手动触发扫描:扫描 %s / 发送 %s / 跳过 %s'
+               % (stat.get('scanned'), stat.get('sent'), stat.get('skipped')))
+    return ok(stat)
+
+
+@app.get('/api/notify/status')
+def api_notify_status():
+    """返回 SMTP 配置状态与通知开关。不返回任何密钥/配置值,只报是否配齐+缺哪些变量名。"""
+    setting = db_query_one("SELECT * FROM platform_setting WHERE org_id=1", ()) or {}
+    return ok({
+        'smtp_configured': _mailer.smtp_configured(),
+        'missing_config': _mailer.missing_config(),   # 仅变量名,不含值
+        'notify_email_enabled': int(setting.get('notify_email_enabled') or 0),
+        'notify_admin_email': (setting.get('notify_admin_email') or setting.get('email') or ''),
+        'notify_expire_days': int(setting.get('notify_expire_days') or 7),
+        'notify_balance_min': float(setting.get('notify_balance_min') or 10),
+        'scan_interval_sec': NOTIFY_SCAN_INTERVAL_SEC,
+    })
+
+
 if __name__ == '__main__':
     init_db()
     _setup_pg_partitions()      # PG：location_record 转分区表 + 预建未来月份（SQLite 跳过）
@@ -7191,6 +7510,9 @@ if __name__ == '__main__':
 
     # 启动位置异步批量落库线程（削减 SQLite 写锁争用）
     start_batch_writer()
+
+    # 启动主动邮件通知定时线程(SIM 到期 / 余额不足)
+    start_notify_scheduler()
 
     # 后台启动 808 TCP 服务线程
     tcp_thread = threading.Thread(target=start_tcp_server, daemon=True)

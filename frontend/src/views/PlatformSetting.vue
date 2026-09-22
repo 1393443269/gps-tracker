@@ -150,6 +150,42 @@
         </el-form>
       </el-tab-pane>
 
+      <!-- ══ 邮件通知 ══ -->
+      <el-tab-pane v-if="isAdmin()" label="邮件通知" name="notify">
+        <el-form label-width="140px" style="max-width:640px;">
+          <el-alert type="info" :closable="false" show-icon style="margin-bottom:16px;"
+            title="SIM 卡到期、余额不足时自动发邮件提醒。优先发给设备所属客户的邮箱，查不到时发给下方管理员邮箱。发件邮箱需由技术人员在服务器配置授权码后生效。" />
+          <el-form-item label="启用邮件通知">
+            <el-switch v-model="setting.notify_email_enabled" active-text="开" inactive-text="关" inline-prompt />
+          </el-form-item>
+          <el-form-item label="管理员收件邮箱">
+            <el-input v-model="setting.notify_admin_email" placeholder="兜底/汇总收件邮箱，如 admin@company.com" style="max-width:360px;" />
+          </el-form-item>
+          <el-form-item label="到期提前提醒">
+            <el-input-number v-model="setting.notify_expire_days" :min="1" :max="90" /> <span style="margin-left:8px;color:#909399;">天（SIM 卡到期前多少天开始提醒）</span>
+          </el-form-item>
+          <el-form-item label="余额提醒阈值">
+            <el-input-number v-model="setting.notify_balance_min" :min="0" :precision="2" :step="10" /> <span style="margin-left:8px;color:#909399;">元（余额低于此值提醒充值）</span>
+          </el-form-item>
+          <el-form-item>
+            <el-button type="primary" @click="saveSetting" :loading="saving">保存</el-button>
+          </el-form-item>
+          <el-divider />
+          <el-form-item label="配置状态">
+            <el-tag v-if="notifyStatus.smtp_configured" type="success">发件邮箱已配置</el-tag>
+            <el-tag v-else type="warning">发件邮箱未配置{{ notifyStatus.missing && notifyStatus.missing.length ? '（缺：' + notifyStatus.missing.join('、') + '）' : '' }}</el-tag>
+          </el-form-item>
+          <el-form-item label="测试发送">
+            <el-input v-model="testEmail" placeholder="收测试邮件的邮箱" style="max-width:300px;margin-right:10px;" />
+            <el-button @click="doTestMail" :loading="testing">发测试邮件</el-button>
+          </el-form-item>
+          <el-form-item label="立即扫描">
+            <el-button @click="doScanNow" :loading="scanning">手动扫描并发送</el-button>
+            <span style="margin-left:10px;color:#909399;">不等定时，立即扫一次到期/低余额</span>
+          </el-form-item>
+        </el-form>
+      </el-tab-pane>
+
       <!-- ══ 操作日志 ══ -->
       <el-tab-pane v-if="isAdmin()" label="操作日志" name="log">
         <el-table :data="logs" v-loading="logLoading" stripe border size="small">
@@ -253,6 +289,8 @@ const setting = reactive({
   enable_batch_cmd: true, sms_enabled: false, sms_total: 0, sms_used: 0,
   payment_enabled: false, payment_qrcode_url: '', payment_payee: '',
   payment_account: '', payment_bank: '', payment_note: '',
+  notify_email_enabled: false, notify_admin_email: '',
+  notify_expire_days: 7, notify_balance_min: 10,
 })
 
 const remaining = computed(() => Math.max(0, (setting.sms_total || 0) - (setting.sms_used || 0)))
@@ -280,6 +318,10 @@ async function loadSetting() {
       payment_account:    d.payment_account    || '',
       payment_bank:       d.payment_bank       || '',
       payment_note:       d.payment_note       || '',
+      notify_email_enabled: !!d.notify_email_enabled,
+      notify_admin_email:   d.notify_admin_email || '',
+      notify_expire_days:   d.notify_expire_days ?? 7,
+      notify_balance_min:   d.notify_balance_min ?? 10,
     })
   } finally {
     loading.value = false
@@ -291,8 +333,51 @@ async function saveSetting() {
   try {
     await platformApi.update({ ...setting })
     ElMessage.success('保存成功')
+    if (activeTab.value === 'notify') loadNotifyStatus()
   } finally {
     saving.value = false
+  }
+}
+
+// ── 邮件通知 ──
+const notifyStatus = reactive({ smtp_configured: false, missing: [] })
+const testEmail = ref('')
+const testing = ref(false)
+const scanning = ref(false)
+
+async function loadNotifyStatus() {
+  try {
+    const res = await platformApi.notifyStatus()
+    const d = res.data || {}
+    notifyStatus.smtp_configured = !!d.smtp_configured
+    notifyStatus.missing = d.missing || []
+  } catch {}
+}
+
+async function doTestMail() {
+  if (!testEmail.value.trim()) { ElMessage.warning('请输入收测试邮件的邮箱'); return }
+  testing.value = true
+  try {
+    const res = await platformApi.notifyTest({ to_email: testEmail.value.trim() })
+    if (res.data?.ok) ElMessage.success('测试邮件已发送，请查收')
+    else ElMessage.error('发送失败：' + (res.data?.msg || '请检查发件邮箱配置'))
+  } catch (e) {
+    ElMessage.error('发送失败：' + (e.message || '请检查发件邮箱配置'))
+  } finally {
+    testing.value = false
+  }
+}
+
+async function doScanNow() {
+  scanning.value = true
+  try {
+    const res = await platformApi.notifyScanNow()
+    const d = res.data || {}
+    ElMessage.success(`扫描完成：检查 ${d.scanned ?? 0} 项，发送 ${d.sent ?? 0} 封，跳过 ${d.skipped ?? 0} 项`)
+  } catch (e) {
+    ElMessage.error('扫描失败：' + (e.message || '请稍后重试'))
+  } finally {
+    scanning.value = false
   }
 }
 
@@ -318,6 +403,7 @@ async function loadLogs(p = logPage.value) {
 // 首次切到日志 Tab 时加载
 watch(activeTab, (v) => {
   if (v === 'log' && !logs.value.length) loadLogs(1)
+  if (v === 'notify') loadNotifyStatus()
 })
 
 onMounted(() => loadSetting())
