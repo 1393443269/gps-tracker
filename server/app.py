@@ -3129,8 +3129,9 @@ def create_recharge():
     with _db_lock:
         conn = get_db()
         try:
+            # ROUND 第二参数需 numeric，PostgreSQL 无 ROUND(double precision,int)，故 CAST
             conn.execute(
-                "UPDATE sim_card SET balance = ROUND(balance + ?, 2), "
+                "UPDATE sim_card SET balance = ROUND(CAST(balance + ? AS numeric), 2), "
                 "status = CASE WHEN status='欠费' AND (balance + ?) >= 0 THEN '正常' ELSE status END "
                 "WHERE id=?",
                 (amount, amount, sim_id)
@@ -3178,8 +3179,10 @@ def confirm_recharge(rid):
             sim_id = rc['sim_id']
             amount = float(rc['amount'] or 0)
             # 原子加余额 + 欠费转正常(与 create_recharge 同一套写法)
+            # 注：ROUND 第二参数需 numeric，PostgreSQL 无 ROUND(double precision,int)，
+            # 故对 balance+? 显式 CAST 为 numeric（SQLite 亦兼容）
             conn.execute(
-                "UPDATE sim_card SET balance = ROUND(balance + ?, 2), "
+                "UPDATE sim_card SET balance = ROUND(CAST(balance + ? AS numeric), 2), "
                 "status = CASE WHEN status='欠费' AND (balance + ?) >= 0 THEN '正常' ELSE status END "
                 "WHERE id=?",
                 (amount, amount, sim_id)
