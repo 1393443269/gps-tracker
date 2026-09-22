@@ -746,6 +746,16 @@ def init_db():
         except Exception:
             pass
 
+    # ── 设备软删除标记 ──
+    for _col in ["deleted     INTEGER DEFAULT 0",       # 0=正常 1=已删除(软删除)
+                 "deleted_at  TEXT DEFAULT ''",         # 删除时间
+                 "deleted_by  TEXT DEFAULT ''"]:        # 删除操作管理员
+        try:
+            conn.execute(f"ALTER TABLE device ADD COLUMN {_col}")
+            conn.commit()
+        except Exception:
+            pass
+
     # 默认管理员 admin（已存在则跳过）。初始密码优先取环境变量 INIT_ADMIN_PASSWORD；
     # 未设置则兜底 admin123 以保证开箱可用，但启动时打 WARNING 强烈提示立即修改。
     try:
@@ -1023,6 +1033,7 @@ def device_summary():
     if sids is not None and not sids:
         return ok({'total': 0, 'online': 0, 'offline': 0, 'alarm': 0})
     base_conds, base_params = _org_where(sids)
+    base_conds = base_conds + ["COALESCE(deleted,0)=0"]   # 软删除设备不计入统计
     def _count(extra_cond=None, extra_params=None):
         conds  = base_conds + ([extra_cond] if extra_cond else [])
         params = base_params + (extra_params or [])
@@ -1069,6 +1080,7 @@ def list_devices():
             pass
     # org 过滤用带表名的列，避免 JOIN 后 org_id 歧义
     conds, params = _org_where(sids, conds, params, col='device.org_id')
+    conds.append("COALESCE(device.deleted,0)=0")   # 软删除设备从列表消失
 
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     # JOIN 角色表，带出角色颜色/形状供地图与列表按角色渲染
@@ -1097,9 +1109,24 @@ def create_device():
         return fail('设备号不能为空')
     if not imei:
         return fail('IMEI 为必填项')   # 手动新增设备时 IMEI 必填
-    if db_query_one("SELECT id FROM device WHERE phone=?", (phone,)):
-        return fail('设备号已存在')
+    # 查重时连 deleted 一起取：未删除→拒绝；已软删除→复活；不存在→新建
+    _exist = db_query_one("SELECT id, COALESCE(deleted,0) AS deleted FROM device WHERE phone=?", (phone,))
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if _exist and _exist['deleted'] == 0:
+        return fail('设备号已存在')
+    if _exist and _exist['deleted'] == 1:
+        # 复活旧记录：清除软删除标记，并更新本次录入字段（对应 INSERT 写入的可录入列）。
+        # 复活视同全新录入：status/lifecycle 重置为 0（与 INSERT 新建一致）；
+        # 历史表按 phone 关联，phone 不变即自然接续。
+        db_exec(
+            "UPDATE device SET deleted=0, deleted_at='', status=0, lifecycle=0, name=?, plate_no=?, manufacturer=?, "
+            "terminal_model=?, imei=?, terminal_id=?, org_id=?, remark=?, updated_at=? WHERE id=?",
+            (data.get('name',''), data.get('plateNo',''), data.get('manufacturer',''),
+             data.get('terminalModel',''), imei, data.get('terminalId',''),
+             _admin_org_id(), data.get('remark',''), now, _exist['id'])
+        )
+        add_op_log('设备新增', f'手动新增设备 {phone}（复活已删除记录）')
+        return ok({'message': '创建成功'})
     db_exec(
         "INSERT INTO device (phone,name,plate_no,manufacturer,terminal_model,imei,"
         "terminal_id,plate_color,auth_code,status,org_id,lifecycle,remark,created_at,updated_at)"
@@ -1159,10 +1186,15 @@ def import_devices():
             details.append({'row': rownum, 'phone': phone, 'status': 'skipped', 'reason': '文件内重复'})
             continue
         seen_in_batch.add(phone)
-        if db_query_one("SELECT id FROM device WHERE phone=?", (phone,)):
-            skipped += 1
-            details.append({'row': rownum, 'phone': phone, 'status': 'skipped', 'reason': '设备号/IMEI 已存在'})
-            continue
+        # 查重连 deleted 一起取：未删除→skip；已软删除→复活(UPDATE)；不存在→新建(INSERT)
+        _exist = db_query_one("SELECT id, COALESCE(deleted,0) AS deleted FROM device WHERE phone=?", (phone,))
+        _revive_id = None
+        if _exist:
+            if _exist['deleted'] == 0:
+                skipped += 1
+                details.append({'row': rownum, 'phone': phone, 'status': 'skipped', 'reason': '设备号/IMEI 已存在'})
+                continue
+            _revive_id = _exist['id']   # deleted=1 → 走复活分支
 
         # 人员信息:姓名/性别/年龄/联系方式/联系地址任一非空则视为需建客户承载
         _contact = str(r.get('contact') or r.get('realName') or r.get('holderName') or '').strip()
@@ -1178,14 +1210,26 @@ def import_devices():
         _dev_remark = str(r.get('remark', '') or '')
 
         try:
-            db_exec(
-                "INSERT INTO device (phone,name,plate_no,manufacturer,terminal_model,"
-                "terminal_id,imei,plate_color,auth_code,status,org_id,lifecycle,remark,created_at,updated_at)"
-                " VALUES (?,?,?,?,?,?,?,1,'DEFAULT',0,?,0,?,?,?)",
-                (phone, str(r.get('name', '') or ''), str(r.get('plateNo', '') or ''),
-                 str(r.get('manufacturer', '') or ''), str(r.get('terminalModel', '') or ''),
-                 dev_no, imei, admin_org_id, _dev_remark, now, now)
-            )
+            if _revive_id is not None:
+                # 复活旧记录：清除软删除标记 + 更新本次录入字段（对应 INSERT 写入的可录入列）。
+                # 复活视同全新录入：status/lifecycle 重置为 0（与 INSERT 新建一致）；
+                # phone 不变，历史表按 phone 关联自然接续。
+                db_exec(
+                    "UPDATE device SET deleted=0, deleted_at='', status=0, lifecycle=0, name=?, plate_no=?, manufacturer=?, "
+                    "terminal_model=?, terminal_id=?, imei=?, org_id=?, remark=?, updated_at=? WHERE id=?",
+                    (str(r.get('name', '') or ''), str(r.get('plateNo', '') or ''),
+                     str(r.get('manufacturer', '') or ''), str(r.get('terminalModel', '') or ''),
+                     dev_no, imei, admin_org_id, _dev_remark, now, _revive_id)
+                )
+            else:
+                db_exec(
+                    "INSERT INTO device (phone,name,plate_no,manufacturer,terminal_model,"
+                    "terminal_id,imei,plate_color,auth_code,status,org_id,lifecycle,remark,created_at,updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,1,'DEFAULT',0,?,0,?,?,?)",
+                    (phone, str(r.get('name', '') or ''), str(r.get('plateNo', '') or ''),
+                     str(r.get('manufacturer', '') or ''), str(r.get('terminalModel', '') or ''),
+                     dev_no, imei, admin_org_id, _dev_remark, now, now)
+                )
             # 有人员信息:建客户并绑定到该设备
             if _has_person:
                 try:
@@ -1409,6 +1453,7 @@ def devices_with_customer():
             except ValueError:
                 pass
     conds, params = _org_where(sids, conds, params, col='d.org_id')
+    conds.append("COALESCE(d.deleted,0)=0")   # 软删除设备从列表消失
 
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     count_sql = (
@@ -1492,6 +1537,27 @@ def unbind_device_customer(did):
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     db_exec("UPDATE device SET customer_id=NULL,updated_at=? WHERE id=?", (now, did))
     add_op_log('设备解绑', f'设备 {dev["phone"]} 已解绑')
+    return ok()
+
+
+@app.delete('/api/devices/<int:did>')
+def delete_device(did):
+    """软删除设备：标记 deleted=1，从所有列表消失，历史数据保留。仅管理员。"""
+    sids = _org_scope_ids(request)
+    if sids is not None and not sids:
+        return fail('无权限', 403)
+    if sids is not None:
+        scope_ph = ','.join('?' * len(sids))
+        dev = db_query_one(
+            f"SELECT id, phone FROM device WHERE id=? AND org_id IN ({scope_ph}) AND COALESCE(deleted,0)=0",
+            [did] + list(sids))
+    else:
+        dev = db_query_one("SELECT id, phone FROM device WHERE id=? AND COALESCE(deleted,0)=0", (did,))
+    if not dev:
+        return fail('设备不存在或无权限', 404)
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    db_exec("UPDATE device SET deleted=1, deleted_at=?, updated_at=? WHERE id=?", (now, now, did))
+    add_op_log('设备删除', f'设备 {dev["phone"]} 已删除(软删除)')
     return ok()
 
 
@@ -1903,6 +1969,7 @@ def export_devices():
     """导出所有设备（含客户/角色信息）为 JSON，前端转 CSV。不分页。"""
     sids = _org_scope_ids(request)
     conds, params = _org_where(sids, col='d.org_id')
+    conds.append("COALESCE(d.deleted,0)=0")   # 软删除设备不导出
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     rows = db_query(
         "SELECT d.phone, d.name, d.terminal_model, d.status, d.lifecycle, "
@@ -1929,7 +1996,7 @@ def list_roles():
     # 带设备数统计
     sql = (
         "SELECT r.*, "
-        "(SELECT COUNT(*) FROM device d WHERE d.role_id = r.id) as device_count "
+        "(SELECT COUNT(*) FROM device d WHERE d.role_id = r.id AND COALESCE(d.deleted,0)=0) as device_count "
         "FROM device_role r " + where +
         " ORDER BY r.created_at ASC"
     )
@@ -2017,7 +2084,7 @@ def assign_role_devices(rid):
             return fail('无权限', 403)
         dev_ph = ','.join('?' * len(sids))
         allowed = {r['phone'] for r in db_query(
-            f"SELECT phone FROM device WHERE org_id IN ({dev_ph})", sids)}
+            f"SELECT phone FROM device WHERE org_id IN ({dev_ph}) AND COALESCE(deleted,0)=0", sids)}
         phones = [p for p in phones if p in allowed]
     # 先清除该角色下已分配设备（重新赋值语义）
     db_exec("UPDATE device SET role_id=NULL WHERE role_id=?", (rid,))
@@ -3818,6 +3885,9 @@ def report_summary():
     sids = _org_scope_ids(request)
 
     def _scoped(tbl, extra=''):
+        # device 表统计需排除软删除设备
+        if tbl == 'device':
+            extra = "AND COALESCE(deleted,0)=0 " + extra
         if sids is None:
             return f"FROM {tbl} WHERE 1=1 {extra}"
         if not sids:
@@ -3906,12 +3976,12 @@ def report_summary():
     # 客户排名（按名下设备数）
     customer_rank = db_query(
         "SELECT c.name, COUNT(d.id) as device_count "
-        "FROM customer c LEFT JOIN device d ON d.customer_id=c.id "
+        "FROM customer c LEFT JOIN device d ON d.customer_id=c.id AND COALESCE(d.deleted,0)=0 "
         "GROUP BY c.id ORDER BY device_count DESC LIMIT 10"
     )
 
     # 本月新增设备 / 新增客户
-    new_devices   = db_scalar("SELECT COUNT(*) FROM device WHERE date(created_at) >= date('now','start of month')")
+    new_devices   = db_scalar("SELECT COUNT(*) FROM device WHERE COALESCE(deleted,0)=0 AND date(created_at) >= date('now','start of month')")
     new_customers = db_scalar("SELECT COUNT(*) FROM customer WHERE date(created_at) >= date('now','start of month')")
 
     return ok({
@@ -4247,7 +4317,7 @@ def portal_devices():
         f"d.last_battery, d.last_voltage, d.last_battery_time, "
         f"d.terminal_id, d.imei, d.terminal_model, c.name AS customer_name "
         f"FROM device d LEFT JOIN customer c ON d.customer_id = c.id "
-        f"WHERE d.customer_id IN ({cid_ph})",
+        f"WHERE d.customer_id IN ({cid_ph}) AND COALESCE(d.deleted,0)=0",
         all_cids
     )
     return ok(records)
@@ -4693,12 +4763,12 @@ def portal_report_summary():
     ph       = ','.join('?' * len(phones)) if phones else '0'
 
     # 设备统计：按 customer_id 过滤到客户子树
-    device_total    = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph})", all_cids)
-    device_online   = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND status=1", all_cids)
-    device_alarm    = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND status=2", all_cids)
-    device_active   = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND lifecycle=1", all_cids)
-    device_inactive = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND lifecycle=0", all_cids)
-    device_disabled = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND lifecycle IN (2,3)", all_cids)
+    device_total    = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND COALESCE(deleted,0)=0", all_cids)
+    device_online   = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND COALESCE(deleted,0)=0 AND status=1", all_cids)
+    device_alarm    = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND COALESCE(deleted,0)=0 AND status=2", all_cids)
+    device_active   = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND COALESCE(deleted,0)=0 AND lifecycle=1", all_cids)
+    device_inactive = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND COALESCE(deleted,0)=0 AND lifecycle=0", all_cids)
+    device_disabled = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) AND COALESCE(deleted,0)=0 AND lifecycle IN (2,3)", all_cids)
 
     # 报警统计：alarm_record 按 phone 关联子树设备
     if phones:
@@ -4787,7 +4857,7 @@ def portal_report_summary():
     # 客户排名（按名下设备数）：限定子树内客户
     customer_rank = db_query(
         f"SELECT c.name, COUNT(d.id) as device_count "
-        f"FROM customer c LEFT JOIN device d ON d.customer_id=c.id "
+        f"FROM customer c LEFT JOIN device d ON d.customer_id=c.id AND COALESCE(d.deleted,0)=0 "
         f"WHERE c.id IN ({cid_ph}) "
         f"GROUP BY c.id ORDER BY device_count DESC LIMIT 10",
         all_cids
@@ -4795,7 +4865,7 @@ def portal_report_summary():
 
     # 本月新增设备 / 新增客户（限定子树）
     new_devices   = db_scalar(f"SELECT COUNT(*) FROM device WHERE customer_id IN ({cid_ph}) "
-                              f"AND date(created_at) >= date('now','start of month')", all_cids)
+                              f"AND COALESCE(deleted,0)=0 AND date(created_at) >= date('now','start of month')", all_cids)
     new_customers = db_scalar(f"SELECT COUNT(*) FROM customer WHERE id IN ({cid_ph}) "
                               f"AND date(created_at) >= date('now','start of month')", all_cids)
 
@@ -4863,7 +4933,7 @@ def portal_device_list():
     else:
         scope_cids = all_cids
     cid_ph = ','.join('?' * len(scope_cids))
-    conds  = [f"device.customer_id IN ({cid_ph})"]
+    conds  = [f"device.customer_id IN ({cid_ph})", "COALESCE(device.deleted,0)=0"]
     params = list(scope_cids)
     if keyword:
         conds.append("(device.name LIKE ? OR device.phone LIKE ?)")
@@ -4937,19 +5007,36 @@ def portal_import_devices():
             details.append({'row': rownum, 'phone': phone, 'status': 'skipped', 'reason': '文件内重复'})
             continue
         seen_in_batch.add(phone)
-        if db_query_one("SELECT id FROM device WHERE phone=?", (phone,)):
-            skipped += 1
-            details.append({'row': rownum, 'phone': phone, 'status': 'skipped', 'reason': '设备号/IMEI 已存在'})
-            continue
+        # 查重连 deleted 一起取：未删除→skip；已软删除→复活(UPDATE)；不存在→新建(INSERT)
+        _exist = db_query_one("SELECT id, COALESCE(deleted,0) AS deleted FROM device WHERE phone=?", (phone,))
+        _revive_id = None
+        if _exist:
+            if _exist['deleted'] == 0:
+                skipped += 1
+                details.append({'row': rownum, 'phone': phone, 'status': 'skipped', 'reason': '设备号/IMEI 已存在'})
+                continue
+            _revive_id = _exist['id']   # deleted=1 → 走复活分支
         try:
-            db_exec(
-                "INSERT INTO device (phone,name,plate_no,manufacturer,terminal_model,"
-                "terminal_id,imei,customer_id,plate_color,auth_code,status,org_id,lifecycle,remark,created_at,updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,1,'DEFAULT',0,?,0,?,?,?)",
-                (phone, str(r.get('name', '') or ''), str(r.get('plateNo', '') or ''),
-                 str(r.get('manufacturer', '') or ''), str(r.get('terminalModel', '') or ''),
-                 dev_no, imei, cid, org_id, str(r.get('remark', '') or ''), now, now)
-            )
+            if _revive_id is not None:
+                # 复活旧记录：清除软删除标记 + 更新本次录入字段，并强制归到当前客户(防越权)。
+                # 复活视同全新录入：status/lifecycle 重置为 0（与 INSERT 新建一致）；
+                # phone 不变，历史表按 phone 关联自然接续。
+                db_exec(
+                    "UPDATE device SET deleted=0, deleted_at='', status=0, lifecycle=0, name=?, plate_no=?, manufacturer=?, "
+                    "terminal_model=?, terminal_id=?, imei=?, customer_id=?, org_id=?, remark=?, updated_at=? WHERE id=?",
+                    (str(r.get('name', '') or ''), str(r.get('plateNo', '') or ''),
+                     str(r.get('manufacturer', '') or ''), str(r.get('terminalModel', '') or ''),
+                     dev_no, imei, cid, org_id, str(r.get('remark', '') or ''), now, _revive_id)
+                )
+            else:
+                db_exec(
+                    "INSERT INTO device (phone,name,plate_no,manufacturer,terminal_model,"
+                    "terminal_id,imei,customer_id,plate_color,auth_code,status,org_id,lifecycle,remark,created_at,updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,1,'DEFAULT',0,?,0,?,?,?)",
+                    (phone, str(r.get('name', '') or ''), str(r.get('plateNo', '') or ''),
+                     str(r.get('manufacturer', '') or ''), str(r.get('terminalModel', '') or ''),
+                     dev_no, imei, cid, org_id, str(r.get('remark', '') or ''), now, now)
+                )
             created += 1
             details.append({'row': rownum, 'phone': phone, 'status': 'created', 'reason': ''})
         except Exception as e:
@@ -5068,7 +5155,7 @@ def portal_list_sub_customers():
         sub_ids = [r['id'] for r in rows]
         ph = ','.join(['?'] * len(sub_ids))
         dc_rows = db_query(
-            f"SELECT customer_id, COUNT(*) AS cnt FROM device WHERE customer_id IN ({ph}) GROUP BY customer_id",
+            f"SELECT customer_id, COUNT(*) AS cnt FROM device WHERE customer_id IN ({ph}) AND COALESCE(deleted,0)=0 GROUP BY customer_id",
             sub_ids)
         dc_map = {row['customer_id']: row['cnt'] for row in dc_rows}
         ch_rows = db_query(
@@ -5193,7 +5280,7 @@ def portal_sub_customer_devices(sid):
     if not db_query_one("SELECT id FROM customer WHERE id=? AND parent_id=?", (sid, cid)):
         return fail('无权限或不存在', 404)
     records = db_query(
-        "SELECT id,phone,name,status,last_lat,last_lng,last_location_time FROM device WHERE customer_id=?", (sid,)
+        "SELECT id,phone,name,status,last_lat,last_lng,last_location_time FROM device WHERE customer_id=? AND COALESCE(deleted,0)=0", (sid,)
     )
     return ok(records)
 
@@ -5210,7 +5297,7 @@ def portal_assign_sub_customer_devices(sid):
     # 只能操作「父客户直属」或「该子客户直属」的设备（allowed 集合）。
     # allowed 之外的设备（如该子客户自己的下级持有的设备）绝不动，避免误伤更深层级。
     allowed = {r['phone'] for r in db_query(
-        "SELECT phone FROM device WHERE customer_id=? OR customer_id=?", (cid, sid)
+        "SELECT phone FROM device WHERE (customer_id=? OR customer_id=?) AND COALESCE(deleted,0)=0", (cid, sid)
     )}
     target = [p for p in phones if p in allowed]           # 本次要归属到 sid 的设备
     target_set = set(target)
@@ -5365,7 +5452,7 @@ def portal_pool_devices():
         f"c.name AS holder_name "
         f"FROM device d "
         f"LEFT JOIN customer c ON d.customer_id = c.id "
-        f"WHERE d.customer_id IN ({ph}) "
+        f"WHERE d.customer_id IN ({ph}) AND COALESCE(d.deleted,0)=0 "
         f"ORDER BY d.id",
         all_ids
     )
@@ -5382,7 +5469,7 @@ def portal_list_roles():
         return fail('未授权', 401)
     records = db_query(
         "SELECT r.*, "
-        "(SELECT COUNT(*) FROM device d WHERE d.role_id = r.id) as device_count "
+        "(SELECT COUNT(*) FROM device d WHERE d.role_id = r.id AND COALESCE(d.deleted,0)=0) as device_count "
         "FROM device_role r WHERE r.customer_id=? ORDER BY r.created_at ASC", (cid,))
     return ok({'records': records, 'total': len(records)})
 
@@ -5559,7 +5646,7 @@ def _get_subtree_phones(cid):
     if not all_cids:
         return []
     ph = ','.join('?' * len(all_cids))
-    return [r['phone'] for r in db_query(f"SELECT phone FROM device WHERE customer_id IN ({ph})", all_cids)]
+    return [r['phone'] for r in db_query(f"SELECT phone FROM device WHERE customer_id IN ({ph}) AND COALESCE(deleted,0)=0", all_cids)]
 
 
 def _portal_sim_phones(cid):
@@ -5741,7 +5828,7 @@ def list_customer_devices(cid):
         if not cust:
             return fail('客户不存在或无权限', 403)
     records = db_query(
-        "SELECT id, phone, name, status, last_lat, last_lng, last_location_time FROM device WHERE customer_id=?",
+        "SELECT id, phone, name, status, last_lat, last_lng, last_location_time FROM device WHERE customer_id=? AND COALESCE(deleted,0)=0",
         (cid,)
     )
     return ok(records)
@@ -5768,7 +5855,7 @@ def assign_customer_devices(cid):
         scope_ph = ','.join(['?'] * len(sids))
         ph_q     = ','.join(['?'] * len(phones))
         valid = db_query(
-            f"SELECT phone FROM device WHERE phone IN ({ph_q}) AND org_id IN ({scope_ph})",
+            f"SELECT phone FROM device WHERE phone IN ({ph_q}) AND org_id IN ({scope_ph}) AND COALESCE(deleted,0)=0",
             list(phones) + list(sids))
         valid_phones = {r['phone'] for r in valid}
         phones = [p for p in phones if p in valid_phones]  # 只分配有权限的设备
@@ -6523,7 +6610,7 @@ def openapi_devices():
         rows = db_query(
             "SELECT phone, name, imei, terminal_id, terminal_model, status, "
             "last_lat, last_lng, last_location_time, presence_state "
-            "FROM device WHERE org_id=? ORDER BY id DESC LIMIT 2000",
+            "FROM device WHERE org_id=? AND COALESCE(deleted,0)=0 ORDER BY id DESC LIMIT 2000",
             (key_row.get('org_id') or 1,))
     elif not scope:
         rows = []
@@ -6532,7 +6619,7 @@ def openapi_devices():
         rows = db_query(
             f"SELECT phone, name, imei, terminal_id, terminal_model, status, "
             f"last_lat, last_lng, last_location_time, presence_state "
-            f"FROM device WHERE customer_id IN ({ph}) ORDER BY id DESC LIMIT 2000",
+            f"FROM device WHERE customer_id IN ({ph}) AND COALESCE(deleted,0)=0 ORDER BY id DESC LIMIT 2000",
             scope)
     return ok({'records': rows, 'total': len(rows)})
 

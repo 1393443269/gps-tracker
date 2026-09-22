@@ -90,7 +90,7 @@
       <el-table-column prop="activated_at" label="激活时间" min-width="165">
         <template #default="{ row }">{{ row.activated_at || '—' }}</template>
       </el-table-column>
-      <el-table-column label="操作" fixed="right" width="120" align="center">
+      <el-table-column label="操作" fixed="right" width="180" align="center">
         <template #default="{ row }">
           <el-button v-if="row.customer_id"
             size="small" type="danger" plain
@@ -98,6 +98,9 @@
           <el-button v-else
             size="small" type="primary" plain
             :icon="Link" @click="openBind(row)">绑定</el-button>
+          <el-button v-if="isAdmin()"
+            size="small" type="danger"
+            :icon="Delete" @click="doDelete(row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -262,7 +265,7 @@
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import { Search, Minus, Link, ArrowDown, Download, Upload } from '@element-plus/icons-vue'
+import { Search, Minus, Link, ArrowDown, Download, Upload, Delete } from '@element-plus/icons-vue'
 import * as XLSX from 'xlsx' 
 import { deviceApi, customerApi, portalApi, isAdmin } from '@/api'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -610,6 +613,19 @@ async function doUnbind(row) {
     await portalApi.unbindDevice(row.id)
   }
   ElMessage.success('解绑成功')
+  loadData()
+}
+
+// ── 删除设备(仅管理员，软删除) ──
+async function doDelete(row) {
+  try {
+    await ElMessageBox.confirm(
+      `确认删除设备 ${row.phone}？删除后将从列表移除，历史轨迹与报警记录仍会保留。`,
+      '删除设备', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
+    )
+  } catch { return }
+  await deviceApi.remove(row.id)
+  ElMessage.success('设备已删除')
   loadData()
 }
 
