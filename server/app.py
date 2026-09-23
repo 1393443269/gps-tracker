@@ -7586,6 +7586,152 @@ def api_notify_status():
     })
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 自动计费扣费:按到期日扣月租
+# 规则(经业务确认):
+#   - 每天扫一遍:expire_date <= 今天 且 monthly_fee > 0 的 SIM 卡。
+#   - 余额够   → 扣一个月月租(原子,CAST numeric),expire_date 顺延一个月,
+#                记一条负向 recharge 流水(status='扣费流水'),审计。
+#   - 余额不足 → 不扣,把卡状态置'欠费',expire_date 不变(下次继续尝试),
+#                可触发邮件提醒(复用 notify)。
+#   - expire_date 为空 → 永不扣费(视为免费/未配置,跳过)。
+#   - 卡状态为 停用/报废/欠费 → 跳过(欠费卡等客户充值,由充值确认转回正常)。
+# 日期"加一个月"在 Python 里算(避免 SQLite/PG 日期函数方言不兼容)。
+# ══════════════════════════════════════════════════════════════════════════════
+BILLING_SCAN_INTERVAL_SEC = int(os.environ.get('BILLING_SCAN_INTERVAL_SEC', '86400'))  # 默认每天
+_billing_scheduler_started = False
+
+
+def _add_one_month(date_str):
+    """把 'YYYY-MM-DD' 顺延一个月,处理跨年与月末(如 1/31 → 2/28)。返回新字符串。"""
+    from datetime import date as _date
+    try:
+        s = (date_str or '').strip()[:10]
+        y, m, d = int(s[0:4]), int(s[5:7]), int(s[8:10])
+    except (ValueError, IndexError):
+        return date_str
+    m += 1
+    if m > 12:
+        y, m = y + 1, 1
+    # 处理目标月没有该"日"(如 1/31 → 2月):退到该月最后一天
+    for _dd in (d, 30, 29, 28):
+        try:
+            return _date(y, m, min(d, _dd)).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    return _date(y, m, 28).strftime('%Y-%m-%d')
+
+
+def scan_and_bill_once():
+    """扫描到期卡并扣月租。返回统计 dict。异常自处理,不向上抛。"""
+    from datetime import date as _date
+    today = _date.today().strftime('%Y-%m-%d')
+    charged = 0        # 成功扣费笔数
+    overdue = 0        # 余额不足置欠费笔数
+    skipped = 0        # 跳过(状态不符等)
+    total_amount = 0.0
+    try:
+        # 到期(expire_date <= 今天,非空)且有月租的卡;expire_date 为空的天然不入选
+        # 注:sim_card 无 customer_id 列(SIM 经 device_phone 关联客户),扣费流水 customer_id 留空
+        # 注:PG 里 expire_date 是 date 类型,不能与 '' 比较(会报错);SQLite 里是文本。
+        # 用 IS NOT NULL + <= ?(参数化,PG 自动把字符串转 date)兼容两库。
+        rows = db_query(
+            "SELECT id, iccid, balance, monthly_fee, expire_date, status, org_id "
+            "FROM sim_card WHERE expire_date IS NOT NULL "
+            "AND expire_date <= ? AND COALESCE(monthly_fee,0) > 0",
+            (today,))
+        for r in rows:
+            sid = r['id']
+            fee = float(r['monthly_fee'] or 0)
+            cur_status = r['status'] or ''
+            # 停用/报废/已欠费的卡不扣(欠费卡等充值确认转回正常)
+            if cur_status in ('停用', '报废', '欠费'):
+                skipped += 1
+                continue
+            bal = float(r['balance'] or 0)
+            with (_db_lock if DB_BACKEND == 'sqlite' else _nullcontext()):
+                conn = get_db()
+                try:
+                    # 重新读一次余额+到期日(防并发),并再判定一次(幂等)
+                    row2 = conn.execute(
+                        "SELECT balance, expire_date, status, monthly_fee FROM sim_card WHERE id=?",
+                        (sid,)).fetchone()
+                    if not row2:
+                        conn.close(); skipped += 1; continue
+                    bal = float(row2['balance'] or 0)
+                    fee = float(row2['monthly_fee'] or 0)
+                    # PG 返回 date 对象,SQLite 返回文本;统一转成 'YYYY-MM-DD' 字符串再比较/处理
+                    _exp_raw = row2['expire_date']
+                    exp = _exp_raw.strftime('%Y-%m-%d') if hasattr(_exp_raw, 'strftime') else (str(_exp_raw)[:10] if _exp_raw else '')
+                    st2 = row2['status'] or ''
+                    if fee <= 0 or not exp or exp > today or st2 in ('停用', '报废', '欠费'):
+                        conn.close(); skipped += 1; continue
+                    if bal >= fee:
+                        # 余额够:扣费 + 到期日顺延一月
+                        new_exp = _add_one_month(exp)
+                        conn.execute(
+                            "UPDATE sim_card SET balance = ROUND(CAST(balance - ? AS numeric), 2), "  # noqa: shitpile 扣费余额变动,与充值/冲正同属资金操作,待统一入口重构时一并收敛
+                            "expire_date=? WHERE id=?",
+                            (fee, new_exp, sid))
+                        # 负向流水(扣费)
+                        conn.execute(
+                            "INSERT INTO recharge (sim_id,iccid,amount,method,plan,remark,operator,org_id,status) "
+                            "VALUES (?,?,?,?,?,?,?,?,?)",
+                            (sid, r['iccid'], -fee, '系统扣费', '', f'月租扣费(到期{exp}→{new_exp})',
+                             '系统', r['org_id'], '扣费流水'))
+                        conn.commit()
+                        charged += 1
+                        total_amount += fee
+                    else:
+                        # 余额不足:不扣,置欠费(到期日不变,下次继续尝试)
+                        conn.execute("UPDATE sim_card SET status='欠费' WHERE id=?", (sid,))
+                        conn.commit()
+                        overdue += 1
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        if charged or overdue:
+            add_op_log('自动扣费', f'扣费扫描:成功{charged}笔共¥{total_amount:.2f},欠费{overdue}笔,跳过{skipped}笔')
+        log.info("[自动扣费] 完成:成功 %d 笔(¥%.2f),欠费 %d 笔,跳过 %d 笔",
+                 charged, total_amount, overdue, skipped)
+        return {'charged': charged, 'overdue': overdue, 'skipped': skipped,
+                'total_amount': round(total_amount, 2)}
+    except Exception as e:
+        log.warning("[自动扣费] 扫描异常: %s", e)
+        return {'error': str(e), 'charged': charged, 'overdue': overdue, 'skipped': skipped}
+
+
+def _billing_scanner_loop():
+    import time
+    time.sleep(90)   # 启动后稍等,避开建表与其它启动线程
+    while True:
+        try:
+            scan_and_bill_once()
+        except Exception as e:
+            log.warning("[自动扣费] 定时扫描异常: %s", e)
+        time.sleep(max(3600, BILLING_SCAN_INTERVAL_SEC))
+
+
+def start_billing_scheduler():
+    """启动自动扣费定时线程(gunicorn post_fork / __main__ 调用)。守卫保证只起一次。"""
+    global _billing_scheduler_started
+    if _billing_scheduler_started:
+        return
+    _billing_scheduler_started = True
+    import threading as _t
+    _t.Thread(target=_billing_scanner_loop, daemon=True, name='billing-scanner').start()
+    log.info("[自动扣费] 定时线程已启动(每 %d 秒扫描一次)", BILLING_SCAN_INTERVAL_SEC)
+
+
+@app.post('/api/billing/scan-now')
+def api_billing_scan_now():
+    """管理员手动触发一次扣费扫描(不等定时)。返回统计。"""
+    res = scan_and_bill_once()
+    return ok(res)
+
+
 if __name__ == '__main__':
     init_db()
     _setup_pg_partitions()      # PG：location_record 转分区表 + 预建未来月份（SQLite 跳过）
@@ -7596,6 +7742,9 @@ if __name__ == '__main__':
 
     # 启动主动邮件通知定时线程(SIM 到期 / 余额不足)
     start_notify_scheduler()
+
+    # 启动自动扣费定时线程(按到期日扣月租)
+    start_billing_scheduler()
 
     # 后台启动 808 TCP 服务线程
     tcp_thread = threading.Thread(target=start_tcp_server, daemon=True)

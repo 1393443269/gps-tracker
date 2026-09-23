@@ -34,7 +34,7 @@ def post_fork(server, worker):
     import threading
     from app import (init_db, start_batch_writer, start_tcp_server, start_mqtt_subscriber,
                      _setup_pg_partitions, start_partition_maintainer, start_push_worker,
-                     start_profit_scheduler, start_notify_scheduler)
+                     start_profit_scheduler, start_notify_scheduler, start_billing_scheduler)
     from core.ingest import start_location_cleaner, start_offline_scanner, _load_fence_state
 
     init_db()
@@ -47,6 +47,7 @@ def post_fork(server, worker):
     start_push_worker()
     start_profit_scheduler()      # 分润:每月 1 号自动结算上月            # 数据推送:报警增量轮询推送到第三方回调      # 超时未上报设备置离线线程(关机报警之外的失联/关机/迁走兜底)
     start_notify_scheduler()      # 主动邮件通知:定时扫描 SIM 到期/余额不足并发邮件
+    start_billing_scheduler()     # 自动扣费:每天按到期日扣月租(余额不足置欠费)
 
     threading.Thread(target=start_tcp_server,      daemon=True, name='tcp-808').start()
     threading.Thread(target=start_mqtt_subscriber, daemon=True, name='mqtt-sub').start()
