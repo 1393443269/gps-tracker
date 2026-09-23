@@ -3067,6 +3067,34 @@ def _org_scope_conds(conds, params, col='org_id'):
     return conds, params
 
 
+def _scope_where(table=None, alias=None, base_conds=None, base_params=None):
+    """统一查询过滤入口:一次性内建「软删除 + 组织范围」两件套,消除各处手写漏项。
+
+    - table='device' 时自动追加 COALESCE(deleted,0)=0(软删除设备不出现在列表/统计)。
+      alias 指定表别名(如 'd'),软删除列会写成 alias.deleted。
+    - 组织范围:复用 _org_scope_conds 的既有语义(超管不限、空范围 1=0、否则 org_id IN(...))。
+      alias 存在时组织列写成 alias.org_id。
+    - 可传入已有 base_conds/base_params(业务自身条件),本函数在其上追加过滤。
+
+    返回 (where_sql, params):where_sql 形如 "WHERE a AND b"(无条件时为空串),
+    params 为对应参数列表。业务层:db_query(f"SELECT ... FROM device d {where}", params)。
+
+    设计原则:纯追加、不改变 _org_scope_conds 的行为,现有调用不受影响;
+    新查询统一走这里,避免"漏加软删除/组织过滤"这类横切 bug。
+    """
+    conds = list(base_conds) if base_conds else []
+    params = list(base_params) if base_params else []
+    # 1) 软删除(仅 device 表有 deleted 列)
+    if table == 'device':
+        _dcol = (alias + '.deleted') if alias else 'deleted'
+        conds.append(f"COALESCE({_dcol},0)=0")
+    # 2) 组织范围(复用既有 helper 的语义,支持别名)
+    _org_col = (alias + '.org_id') if alias else 'org_id'
+    conds, params = _org_scope_conds(conds, params, col=_org_col)
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    return where, params
+
+
 def _row_org_ok(table, rid):
     """校验某表某行是否在当前管理员组织范围内(update/delete 前调用)。"""
     sids = _org_scope_ids(request)
