@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# 防屎山提交前检查钩子。调用 .githooks/check_conventions.py 扫本次暂存改动的新增行。
+# 只拦【新增的】铁律违规,存量不报。误报可在该行加 # noqa: shitpile,
+# 应急可用 git commit --no-verify 整体跳过。
+set -e
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "[防屎山检查] 未找到 python,跳过检查(不拦截提交)。"
+  exit 0
+fi
+exec "$PY" "$HOOK_DIR/check_conventions.py"
